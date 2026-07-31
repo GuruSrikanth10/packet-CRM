@@ -1,0 +1,10 @@
+[
+  {
+    "name": "InvestigatorAgent",
+    "skills": "Agents/InvestigatorAgent.md",
+    "tools": [
+      "lookup_resident_database",
+      "lookup_error_code"
+    ]
+  }
+]

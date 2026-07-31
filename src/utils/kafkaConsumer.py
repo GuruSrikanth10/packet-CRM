@@ -1,0 +1,53 @@
+import json
+import logging
+import requests
+from kafka import KafkaConsumer
+from .env import get_required_env
+
+logger = logging.getLogger(__name__)
+
+kafkaConsumerBrokers = [
+    b.strip() for b in get_required_env("KAFKA_CONSUMER_BROKERS", "localhost:9092").split(",") if b.strip()
+]
+kafkaConsumerTopicName = get_required_env("KAFKA_CONSUMER_TOPIC_NAME", "rejections")
+kafkaConsumerGroupId = get_required_env("KAFKA_CONSUMER_GROUP_ID", "rejection-agents-group")
+kafkaConsumerInternalEndpoint = get_required_env("KAFKA_CONSUMER_INTERNAL_ENDPOINT", "http://localhost:8000/process-rejection")
+kafkaConsumerInternalTimeoutSec = float(get_required_env("KAFKA_CONSUMER_INTERNAL_TIMEOUT_SEC", "300"))
+
+consumer = KafkaConsumer(
+    kafkaConsumerTopicName,
+    group_id=kafkaConsumerGroupId,
+    bootstrap_servers=kafkaConsumerBrokers,
+    auto_offset_reset="earliest",
+    enable_auto_commit=True,
+)
+
+def forward_signal_to_internal_endpoint(signal: dict):
+    response = requests.post(
+        kafkaConsumerInternalEndpoint,
+        json=signal,
+        proxies={"http": None, "https": None},
+        timeout=kafkaConsumerInternalTimeoutSec,
+    )
+    response.raise_for_status()
+    return response
+
+def consume_forever():
+    logger.info("Listening on topic=%s", kafkaConsumerTopicName)
+    print("Kafka consumer starting...")
+    for msg in consumer:
+        try:
+            payload = msg.value.decode("utf-8", errors="replace")
+            signal = json.loads(payload)
+            
+            # Check packetStatus if it's REJECTED
+            summary = signal.get("packetExecutionSummary", {})
+            if summary.get("packetStatus") != "REJECTED":
+                print(f"Skipping non-rejected packet {signal.get('eventId')}")
+                continue
+            
+            logger.info("Received event %s", signal.get("eventId"))
+            response = forward_signal_to_internal_endpoint(signal)
+            logger.info("Forwarded event %s to internal endpoint status=%s", signal.get("eventId"), response.status_code)
+        except Exception:
+            logger.exception("Error processing Kafka message")
