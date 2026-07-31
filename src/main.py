@@ -4,9 +4,13 @@ from faststream import FastStream
 from faststream.kafka import KafkaBroker
 from pydantic import BaseModel, Field
 
+import os
+import json
 from .config import settings
-from .s3_service import check_casesheet_exists, upload_casesheet
 from .agent.graph import run_investigation
+
+LOCAL_CASESHEETS_DIR = os.path.join(os.getcwd(), "local_casesheets")
+os.makedirs(LOCAL_CASESHEETS_DIR, exist_ok=True)
 
 broker = KafkaBroker(settings.kafka_brokers)
 app = FastStream(broker)
@@ -34,9 +38,10 @@ async def process_message(msg: MessagePayload):
         
     print(f"Processing rejection packet: {msg.eventId}")
     
-    # 2. Check if casesheet already exists in S3
-    if check_casesheet_exists(msg.eventId):
-        print(f"Casesheet for {msg.eventId} already exists in S3. Skipping investigation.")
+    # 2. Check if casesheet already exists locally
+    local_file_path = os.path.join(LOCAL_CASESHEETS_DIR, f"{msg.eventId}.json")
+    if os.path.exists(local_file_path):
+        print(f"Casesheet for {msg.eventId} already exists locally. Skipping investigation.")
         return
         
     # 3. Run the LangGraph investigation agent
@@ -45,12 +50,10 @@ async def process_message(msg: MessagePayload):
         casesheet = run_investigation(msg.eventId, msg.model_dump())
         print(f"Agent investigation complete for {msg.eventId}.")
         
-        # 4. Upload the generated casesheet to S3
-        success = upload_casesheet(msg.eventId, casesheet)
-        if success:
-            print(f"Successfully uploaded casesheet for {msg.eventId} to S3.")
-        else:
-            print(f"Failed to upload casesheet for {msg.eventId}.")
+        # 4. Write the generated casesheet to local file
+        with open(local_file_path, "w", encoding="utf-8") as f:
+            json.dump(casesheet, f, indent=2)
+        print(f"Successfully wrote casesheet for {msg.eventId} to {local_file_path}.")
             
     except Exception as e:
         print(f"Error during agent investigation for {msg.eventId}: {e}")
