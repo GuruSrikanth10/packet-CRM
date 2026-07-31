@@ -1,0 +1,9 @@
+faststream[kafka]
+boto3
+langgraph
+langchain-community
+langchain-core
+pydantic-settings
+pandas
+openpyxl
+langchain-ollama
