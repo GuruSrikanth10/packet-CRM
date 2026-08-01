@@ -8,3 +8,5 @@ langgraph-checkpoint==4.0.2
 pandas==3.0.2
 requests==2.33.1
 uvicorn==0.46.0
+openpyxl==3.1.2
+langchain-huggingface

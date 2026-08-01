@@ -14,13 +14,8 @@ kafkaConsumerGroupId = get_required_env("KAFKA_CONSUMER_GROUP_ID", "rejection-ag
 kafkaConsumerInternalEndpoint = get_required_env("KAFKA_CONSUMER_INTERNAL_ENDPOINT", "http://localhost:8000/process-rejection")
 kafkaConsumerInternalTimeoutSec = float(get_required_env("KAFKA_CONSUMER_INTERNAL_TIMEOUT_SEC", "300"))
 
-consumer = KafkaConsumer(
-    kafkaConsumerTopicName,
-    group_id=kafkaConsumerGroupId,
-    bootstrap_servers=kafkaConsumerBrokers,
-    auto_offset_reset="earliest",
-    enable_auto_commit=True,
-)
+# Consumer will be instantiated lazily in consume_forever
+consumer = None
 
 def forward_signal_to_internal_endpoint(signal: dict):
     response = requests.post(
@@ -33,6 +28,15 @@ def forward_signal_to_internal_endpoint(signal: dict):
     return response
 
 def consume_forever():
+    global consumer
+    if consumer is None:
+        consumer = KafkaConsumer(
+            kafkaConsumerTopicName,
+            group_id=kafkaConsumerGroupId,
+            bootstrap_servers=kafkaConsumerBrokers,
+            auto_offset_reset="earliest",
+            enable_auto_commit=True,
+        )
     logger.info("Listening on topic=%s", kafkaConsumerTopicName)
     print("Kafka consumer starting...")
     for msg in consumer:
@@ -49,5 +53,6 @@ def consume_forever():
             logger.info("Received event %s", signal.get("eventId"))
             response = forward_signal_to_internal_endpoint(signal)
             logger.info("Forwarded event %s to internal endpoint status=%s", signal.get("eventId"), response.status_code)
-        except Exception:
-            logger.exception("Error processing Kafka message")
+        except Exception as e:
+            payload_sample = payload[:500] if 'payload' in locals() else 'Decode failed'
+            logger.exception(f"Error processing Kafka message. Raw payload: {payload_sample}")

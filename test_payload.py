@@ -1,5 +1,8 @@
 import json
-from src.main import MessagePayload
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+from src.models.schemas import MessagePayload
 
 reject_json = """{
 	"eventId": "0d6254d3-b951-46eb-8662-5162c9111981",
