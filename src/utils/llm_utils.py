@@ -17,7 +17,7 @@ def get_llm(tier: str = "complex"):
         if tier == "complex":
             model_id = os.environ.get("HF_MODEL_COMPLEX", "THUDM/glm-4-9b-chat")
         else:
-            model_id = os.environ.get("HF_MODEL_SIMPLE", "Qwen/Qwen2.5-72B-Instruct")
+            model_id = os.environ.get("HF_MODEL_SIMPLE", "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8")
             
         hf_token = os.environ.get("HF_TOKEN")
         if not hf_token:

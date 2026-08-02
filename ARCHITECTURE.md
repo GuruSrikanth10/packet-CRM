@@ -130,8 +130,13 @@ This clean data structure is immediately ready for downstream analytical engines
    ```
    *Note: This starts both the FastAPI server on port 8000 and the daemon Kafka consumer.*
 
+### 4.2 API Documentation (Swagger UI)
+Because the application is built on FastAPI with populated metadata, interactive API documentation is automatically generated.
+- Navigate to `http://localhost:8000/docs` to view the Swagger UI.
+- Here you can see the fully expanded `MessagePayload` schema (including optional fields like `flowMetaData`, `resubmissionSummary`, etc.) and test the `/process-rejection` endpoint directly from your browser.
+
 4. **Testing Pipeline (No Kafka Required):**
    ```bash
    python3 test_payload.py
    ```
-   *This statically parses a mock Kafka payload through the Pydantic models to ensure validation logic is intact.*
+   *This statically parses a mock Kafka payload through the expanded Pydantic models to ensure validation logic is intact.*

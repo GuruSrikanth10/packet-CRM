@@ -13,7 +13,12 @@ async def lifespan(app: FastAPI):
     yield
     # Any teardown logic here (like stopping the consumer if needed)
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Packet-CRM API",
+    description="AI-driven, self-learning service to ingest, analyze, and resolve rejected biometric packets within the UIDAI ecosystem.",
+    version="1.0.0",
+    lifespan=lifespan
+)
 app.include_router(api_router)
 
 if __name__ == "__main__":
