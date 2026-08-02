@@ -7,7 +7,8 @@ from src.core.agent_orchestrator import get_agent
 
 router = APIRouter()
 
-LOCAL_CASESHEETS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "local_casesheets")
+# Fix: 3 dirname levels to reach project root because routes.py is inside src/api/
+LOCAL_CASESHEETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "local_casesheets")
 
 @router.post("/process-rejection")
 def process_rejection(signal: MessagePayload):
@@ -34,7 +35,8 @@ def process_rejection(signal: MessagePayload):
     final_message = result["messages"][-1].content
     
     try:
-        fenced_match = re.search(r"```(?:json)?\s*(\{.*?})\s*```", final_message, re.DOTALL)
+        # Fix: support matching both JSON objects {} and arrays []
+        fenced_match = re.search(r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```", final_message, re.DOTALL)
         if fenced_match:
             investigation_result = json.loads(fenced_match.group(1))
         else:

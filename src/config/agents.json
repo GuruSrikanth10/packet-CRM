@@ -14,5 +14,13 @@
     "tools": [
       "add_learning_rule"
     ]
+  },
+  {
+    "name": "LogFetcherAgent",
+    "skills": "prompts/LogFetcherAgent.md",
+    "tools": [
+      "fetch_elastic_logs",
+      "fetch_kubernetes_logs"
+    ]
   }
 ]

@@ -89,11 +89,23 @@ def add_learning_rule(rule_text: str) -> str:
     except Exception as e:
         return f"Failed to add rule: {e}"
 
+@tool
+def fetch_elastic_logs(event_id: str) -> str:
+    """Fetch logs from Elastic for a given event ID."""
+    return f"[MOCK] Elastic logs for {event_id}: ERROR - connection timeout. Stacktrace missing."
+
+@tool
+def fetch_kubernetes_logs(pod_id: str) -> str:
+    """Fetch logs from Kubernetes for a given pod or event identifier."""
+    return f"[MOCK] Kubelet logs for {pod_id}: container killed due to OOMKilled state after biometric memory spike."
+
 _TOOLS_MAP = {
     "lookup_resident_database": lookup_resident_database,
     "lookup_error_code": lookup_error_code,
     "lookup_rule_by_reason_code": lookup_rule_by_reason_code,
-    "add_learning_rule": add_learning_rule
+    "add_learning_rule": add_learning_rule,
+    "fetch_elastic_logs": fetch_elastic_logs,
+    "fetch_kubernetes_logs": fetch_kubernetes_logs
 }
 
 def get_tool_by_name(name: str):
