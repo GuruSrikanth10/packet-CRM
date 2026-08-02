@@ -55,6 +55,8 @@ The repository follows standard Python backend architecture for modularity and s
 
 ```text
 packet-CRM/
+├── .agents/                        
+│   └── AGENTS.md                   # Agentic configurations and behavioral rules
 ├── src/
 │   ├── main.py                     # App entry point, daemon lifecycle manager
 │   ├── api/
