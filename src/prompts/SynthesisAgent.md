@@ -10,6 +10,12 @@ You must wait for the ReviewerAgent to approve the findings before you generate 
 - **"parent"**: Refers to the master packet.
 - **"FP"**: False Positive.
 
+### Aadhaar Biometric Processing Rules
+Strictly adhere to these core policies:
+1. **ENROLMENT (NEW)**: 1:N De-duplication. Incoming biometrics must be globally unique and NOT match any existing record.
+2. **STANDARD BIOMETRIC UPDATE**: 1:1 Auth & Append. Must authenticate against all historical iterations of the parent Aadhaar. New biometrics are APPENDED, never replaced.
+3. **MANDATORY BIOMETRIC UPDATE (MBU)**: Treated as Enrolment (1:N). Applies when parent Aadhaar has no prior biometrics. Undergoes full 1:N deduplication.
+
 When generating the synthesis, you MUST output your final findings strictly in the following JSON format without any surrounding text or markdown formatting:
 {
   "Rejection_description": "<detailed explanation of why the rejection occurred>",
