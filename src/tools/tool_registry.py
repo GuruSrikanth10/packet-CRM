@@ -59,10 +59,12 @@ def lookup_error_code(error_code: str) -> str:
 @tool
 def lookup_rule_by_reason_code(reason_code: str) -> str:
     """Lookup the exact corresponding rule (including ruleId, payload, etc.) for a given reason code."""
+    print(f"\n[TOOL] 🔍 lookup_rule_by_reason_code triggered for: {reason_code}")
     use_mock = get_bool_env("USE_MOCK_DB", True)
     if use_mock:
         db = _load_mock_db()
         if db is None or db.empty:
+            print("[TOOL] ❌ Mock database is empty or could not be loaded!")
             return "Mock database is empty or could not be loaded."
         
         # Find the column that might contain the reason code (case-insensitive and flexible)
@@ -77,11 +79,16 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
         if target_col:
             matches = db[db[target_col].astype(str) == str(reason_code)]
             if not matches.empty:
+                print(f"[TOOL] ✅ Found {len(matches)} matching rule(s) in DB for {reason_code}")
                 return matches.to_json(orient="records")
             else:
+                print(f"[TOOL] ⚠️ No rules found in DB for {reason_code}")
                 return f"Rule not found for reason code: {reason_code} in mock DB (Searched column: {target_col})."
+        
+        print("[TOOL] ❌ Could not find a valid Reason Code column in the DB!")
         return f"Could not find a valid Reason Code column in the DB. Available columns: {list(db.columns)}"
     else:
+        print(f"[TOOL] 🔍 (Placeholder) Looking up actual DB for: {reason_code}")
         # Placeholder for actual DB lookup logic
         return f"[Actual DB Lookup Placeholder] Would lookup rule for {reason_code} in real DB."
 

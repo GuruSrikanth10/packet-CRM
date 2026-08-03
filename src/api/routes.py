@@ -26,16 +26,19 @@ def process_rejection(signal: MessagePayload):
     investigation_dir = LOCAL_CASESHEETS_DIR / f"casebook_{event_id}"
     investigation_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"Triggering RejectionManagerAgent for {event_id}...")
+    print(f"\n[API] ⚙️ Processing Rejection for Event ID: {event_id}")
+    print(f"[API] 🧠 Initializing LangGraph Agent Ecosystem...")
     
     agent = get_agent()
     
     # Run the agent
+    print(f"[API] 🚀 Dispatching payload to RejectionManagerAgent for analysis...")
     result = agent.invoke(
         {"messages": [{"role": "user", "content": f"Investigate this rejected packet: {json.dumps(signal_dict)}"}]},
         config={"configurable": {"thread_id": event_id}}
     )
     
+    print(f"[API] ✅ Agent investigation complete! Extracting Synthesis...")
     final_message = result["messages"][-1].content
     
     try:
@@ -103,6 +106,6 @@ def process_rejection(signal: MessagePayload):
     with open(casebook_file, "w") as f:
         json.dump(casebook_data, f, indent=4)
         
-    print(f"Saved investigation to {casebook_file}")
+    print(f"[API] 💾 Successfully saved finalized Casebook to: {casebook_file}")
     
     return {"status": "processed", "casebook_path": str(casebook_file)}

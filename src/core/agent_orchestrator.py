@@ -10,8 +10,10 @@ _agent = None
 def get_agent():
     global _agent
     if _agent is not None:
+        print("[ORCHESTRATOR] ⚡ Returning cached DeepAgents instance.")
         return _agent
 
+    print("[ORCHESTRATOR] 🏗️ Building DeepAgents graph from scratch...")
     base_dir = os.path.dirname(os.path.dirname(__file__))
     
     # Pre-register tools
@@ -65,4 +67,5 @@ def get_agent():
         checkpointer=checkpointer
     )
     
+    print("[ORCHESTRATOR] ✅ DeepAgents graph successfully constructed!")
     return _agent

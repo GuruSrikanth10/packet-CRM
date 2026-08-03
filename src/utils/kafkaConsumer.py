@@ -42,7 +42,11 @@ def consume_forever():
             enable_auto_commit=True,
         )
     logger.info("Listening on topic=%s", kafkaConsumerTopicName)
-    print("Kafka consumer starting...")
+    print("\n" + "="*50)
+    print(f"🚀 KAFKA CONSUMER STARTED")
+    print(f"📡 Brokers: {kafkaConsumerBrokers}")
+    print(f"📬 Topic: {kafkaConsumerTopicName}")
+    print("="*50 + "\n")
     for msg in consumer:
         try:
             payload = msg.value.decode("utf-8", errors="replace")
@@ -54,8 +58,11 @@ def consume_forever():
                 print(f"Skipping non-rejected packet {signal.get('eventId')}")
                 continue
             
+            print(f"\n[KAFKA] 📥 Received REJECTED packet with Event ID: {signal.get('eventId')}")
+            print(f"[KAFKA] 🔄 Forwarding to FastAPI backend for agentic analysis...")
             logger.info("Received event %s", signal.get("eventId"))
             response = forward_signal_to_internal_endpoint(signal)
+            print(f"[KAFKA] ✅ Successfully forwarded Event ID: {signal.get('eventId')} (HTTP {response.status_code})")
             logger.info("Forwarded event %s to internal endpoint status=%s", signal.get("eventId"), response.status_code)
         except Exception as e:
             payload_sample = payload[:500] if 'payload' in locals() else 'Decode failed'
