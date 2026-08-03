@@ -24,7 +24,7 @@ def process_rejection(signal: MessagePayload):
     event_id = str(signal.eventId).strip()
     
     investigation_dir = LOCAL_CASESHEETS_DIR / f"casebook_{event_id}"
-    investigation_dir.mkdir(parents=True, exist_ok=True)
+    os.makedirs(str(investigation_dir), exist_ok=True)
     
     print(f"\n[API] ⚙️ Processing Rejection for Event ID: {event_id}")
     print(f"[API] 🧠 Initializing LangGraph Agent Ecosystem...")
