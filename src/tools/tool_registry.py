@@ -101,8 +101,8 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
             engine = create_engine(f"mysql+pymysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}")
             
             # Using pandas to query and format identically to the mock DB approach
-            query = f"SELECT * FROM rules WHERE reject_reason_code = '{reason_code}'"
-            matches = pd.read_sql(query, engine)
+            query = "SELECT * FROM rules WHERE reject_reason_code = %s"
+            matches = pd.read_sql(query, engine, params=(reason_code,))
             
             if not matches.empty:
                 print(f"[TOOL] ✅ Found {len(matches)} matching rule(s) in Live DB for {reason_code}")
