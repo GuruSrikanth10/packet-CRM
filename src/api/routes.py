@@ -4,6 +4,7 @@ import re
 from fastapi import APIRouter
 from src.models.schemas import MessagePayload
 from src.core.agent_orchestrator import get_agent
+from src.utils.s3_uploader import upload_logs_to_s3
 
 router = APIRouter()
 
@@ -68,6 +69,21 @@ def process_rejection(signal: MessagePayload):
     if not isinstance(investigation_result, dict):
         investigation_result = {"Rejection_description": str(investigation_result)}
     
+    # Handle Rejection_logs logic
+    # The original logs fetch string is in result.get("logs") if we passed it back, 
+    # but the orchestrator state keeps it inside the graph state memory.
+    # To get it, we need to extract from `result`. Wait, `agent.invoke` returns the final state dict!
+    raw_logs = result.get("logs", "")
+    processed_logs = None
+    
+    if not raw_logs or raw_logs == "Log fetching disabled." or raw_logs.startswith("Failed to query"):
+        processed_logs = None
+    elif len(raw_logs) > 5000:
+        print("[API] 📦 Logs are too large for JSON, uploading to S3...")
+        processed_logs = upload_logs_to_s3(event_id, raw_logs)
+    else:
+        processed_logs = raw_logs
+        
     casebook_data = {
         "Metadata - Packet Details": {
             "SRN": packet_meta.get("srn"),
@@ -90,7 +106,7 @@ def process_rejection(signal: MessagePayload):
             "Rejection Data": {
                 "Rejection_code": rejection_code,
                 "Rejection_description": investigation_result.get("Rejection_description"),
-                "Rejection_logs": investigation_result.get("Rejection_logs"),
+                "Rejection_logs": processed_logs,
                 "Artifact_design": investigation_result.get("Artifact_design")
             }
         },
@@ -103,8 +119,8 @@ def process_rejection(signal: MessagePayload):
     }
     
     casebook_file = investigation_dir / "casebook.json"
-    with open(casebook_file, "w") as f:
-        json.dump(casebook_data, f, indent=4)
+    with open(casebook_file, "w", encoding="utf-8") as f:
+        json.dump(casebook_data, f, indent=4, ensure_ascii=False)
         
     print(f"[API] 💾 Successfully saved finalized Casebook to: {casebook_file}")
     

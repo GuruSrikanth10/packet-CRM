@@ -13,6 +13,7 @@ from src.tools.tool_registry import get_tool_by_name
 class GraphState(TypedDict):
     payload: dict
     logs: str
+    db_rule: str
     investigation: str
     reviewer_feedback: str
     synthesis: str
@@ -62,20 +63,38 @@ def get_agent():
         payload = state.get("payload", {})
         logs = state.get("logs", "")
         feedback = state.get("reviewer_feedback", "")
+        db_rule = state.get("db_rule", "")
+        
+        # Optimize DB Calls: Fetch rule in Python if not already fetched
+        if not db_rule:
+            exec_summary = payload.get("packetExecutionSummary") or {}
+            error_data = exec_summary.get("errorData") or []
+            reason_code = None
+            for err in error_data:
+                if err and err.get("errorReasonCode"):
+                    reason_code = err.get("errorReasonCode")
+                    break
+            
+            if reason_code:
+                rule_tool = get_tool_by_name("lookup_rule_by_reason_code")
+                db_rule = rule_tool.invoke(reason_code)
+            else:
+                db_rule = "No errorReasonCode found in payload."
         
         prompt = f"Kafka Payload: {json.dumps(payload)}\n\n"
         if logs and logs != "Log fetching disabled.":
             prompt += f"Elasticsearch Logs: {logs}\n\n"
+        prompt += f"Database Rule Configuration:\n{db_rule}\n\n"
         if feedback:
             prompt += f"Reviewer Feedback (You MUST fix your previous analysis): {feedback}\n\n"
             
-        investigator_agent = create_react_agent(llm, tools=[get_tool_by_name("lookup_rule_by_reason_code")])
+        investigator_agent = create_react_agent(llm, tools=[])
         res = investigator_agent.invoke({"messages": [
             SystemMessage(content=investigator_prompt),
             HumanMessage(content=prompt)
         ]})
         print("   ✅ Investigator finished analysis!")
-        return {"investigation": res["messages"][-1].content}
+        return {"investigation": res["messages"][-1].content, "db_rule": db_rule}
 
     def reviewer_node(state: GraphState):
         print("\n" + "="*50)
