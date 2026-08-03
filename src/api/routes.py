@@ -48,10 +48,55 @@ def process_rejection(signal: MessagePayload):
     except Exception:
         investigation_result = final_message
     
+    # Extract metadata safely
+    packet_meta = signal_dict.get("packetMetaData") or {}
+    flow_meta = signal_dict.get("flowMetaData") or {}
+    exec_summary = signal_dict.get("packetExecutionSummary") or {}
+    
+    # Extract rejection code safely
+    error_data = exec_summary.get("errorData") or []
+    rejection_code = None
+    for err in error_data:
+        if err and err.get("errorReasonCode"):
+            rejection_code = err.get("errorReasonCode")
+            break
+            
+    # Handle investigation result defaults if it's not a dict
+    if not isinstance(investigation_result, dict):
+        investigation_result = {"Rejection_description": str(investigation_result)}
+    
     casebook_data = {
-        "event_id": event_id,
-        "original_signal": signal_dict,
-        "investigation_result": investigation_result
+        "Metadata - Packet Details": {
+            "SRN": packet_meta.get("srn"),
+            "EID": event_id,
+            "REFID": packet_meta.get("refId"),
+            "SOURCE": signal_dict.get("sourceTopic"),
+            "PACKET_TYPE": packet_meta.get("enrolmentType"),
+            "MBU": None,  # MBU mapping not immediately available in payload
+            "Update_type": None,  # B/D mapping not immediately available
+            "is_child": None,  # Age determination not immediately available
+            "Created_at": signal_dict.get("eventTimestamp"),
+            "Uploaded_at": signal_dict.get("eventTimestamp")
+        },
+        "Packet Status": {
+            "Status": exec_summary.get("packetStatus"),
+            "Service": flow_meta.get("stage"),
+            "sub_service": flow_meta.get("subStage"),
+            "last_updated": None,
+            "Inprocess": False if exec_summary.get("packetStatus") == "REJECTED" else None,
+            "Rejection Data": {
+                "Rejection_code": rejection_code,
+                "Rejection_description": investigation_result.get("Rejection_description"),
+                "Rejection_logs": investigation_result.get("Rejection_logs"),
+                "Artifact_design": investigation_result.get("Artifact_design")
+            }
+        },
+        "Resolution": {
+            "Synthesis": investigation_result.get("Synthesis"),
+            "Action": investigation_result.get("Action"),
+            "Resident_action": investigation_result.get("Resident_action"),
+            "UIDAI_ACTION": investigation_result.get("UIDAI_ACTION")
+        }
     }
     
     casebook_file = investigation_dir / "casebook.json"
