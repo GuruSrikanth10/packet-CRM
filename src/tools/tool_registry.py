@@ -4,6 +4,8 @@ from langchain_core.tools import tool
 from sqlalchemy import create_engine
 import pymysql
 from src.utils.env import get_bool_env, get_required_env
+from src.utils.resilience import retry_transient, db_breaker, es_breaker
+import pybreaker
 
 _DB_CACHE = None
 
@@ -59,6 +61,8 @@ def lookup_error_code(error_code: str) -> str:
 
 # Registry mimicking agentic-fms
 @tool
+@db_breaker
+@retry_transient
 def lookup_rule_by_reason_code(reason_code: str) -> str:
     """Lookup the exact corresponding rule (including ruleId, payload, etc.) for a given reason code."""
     print(f"\n[TOOL] 🔍 lookup_rule_by_reason_code triggered for: {reason_code}")
@@ -115,22 +119,10 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
             print(f"[TOOL] ❌ Live DB connection or query failed: {e}")
             return f"Failed to query live DB: {e}"
 
-@tool
-def add_learning_rule(rule_text: str) -> str:
-    """Appends a new permanent rule to the InvestigatorAgent's prompt file to correct mistakes."""
-    target_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts", "InvestigatorAgent.md")
-    
-    # Ensure directory and file exist
-    os.makedirs(os.path.dirname(target_file), exist_ok=True)
-    
-    try:
-        with open(target_file, "a", encoding="utf-8") as f:
-            f.write(f"\n- CRITICAL RULE: {rule_text}\n")
-        return f"Successfully added rule to InvestigatorAgent: {rule_text}"
-    except Exception as e:
-        return f"Failed to add rule: {e}"
 
 @tool
+@es_breaker
+@retry_transient
 def fetch_elastic_logs(event_id: str) -> str:
     """Fetch logs from Elastic for a given event ID using pagination to capture the full trace."""
     print(f"\n[TOOL] 🔍 fetch_elastic_logs triggered for: {event_id}")
@@ -229,6 +221,9 @@ def fetch_elastic_logs(event_id: str) -> str:
         llm_context.append(f"--- End of Trace ({total_fetched} logs total) ---")
         return "\n".join(llm_context)
         
+    except pybreaker.CircuitBreakerError:
+        print("[TOOL] ⚠️ ES Circuit breaker is OPEN. Failing fast.")
+        return f"Failed to query Elastic: Circuit Breaker Open"
     except Exception as e:
         print(f"[TOOL] ❌ Failed to fetch Elastic logs: {e}")
         return f"Failed to query Elastic: {e}"
@@ -242,7 +237,6 @@ _TOOLS_MAP = {
     "lookup_resident_database": lookup_resident_database,
     "lookup_error_code": lookup_error_code,
     "lookup_rule_by_reason_code": lookup_rule_by_reason_code,
-    "add_learning_rule": add_learning_rule,
     "fetch_elastic_logs": fetch_elastic_logs,
     "fetch_kubernetes_logs": fetch_kubernetes_logs
 }

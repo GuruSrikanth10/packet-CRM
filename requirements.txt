@@ -15,3 +15,9 @@ PyMySQL
 SQLAlchemy
 elasticsearch
 langgraph
+
+filelock
+tenacity
+pybreaker
+structlog
+langgraph-checkpoint-sqlite

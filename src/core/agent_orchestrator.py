@@ -2,13 +2,18 @@ import os
 import json
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 
 from src.utils.llm_utils import get_llm
 from src.utils.env import get_bool_env
 from src.tools.tool_registry import get_tool_by_name
+from src.utils.resilience import retry_transient, llm_breaker
+from src.utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 class GraphState(TypedDict):
     payload: dict
@@ -18,6 +23,7 @@ class GraphState(TypedDict):
     reviewer_feedback: str
     synthesis: str
     messages: list
+    retry_count: int
 
 _agent = None
 
@@ -89,10 +95,16 @@ def get_agent():
             prompt += f"Reviewer Feedback (You MUST fix your previous analysis): {feedback}\n\n"
             
         investigator_agent = create_react_agent(llm, tools=[])
-        res = investigator_agent.invoke({"messages": [
-            SystemMessage(content=investigator_prompt),
-            HumanMessage(content=prompt)
-        ]})
+        
+        @llm_breaker
+        @retry_transient
+        def invoke_investigator():
+            return investigator_agent.invoke({"messages": [
+                SystemMessage(content=investigator_prompt),
+                HumanMessage(content=prompt)
+            ]})
+            
+        res = invoke_investigator()
         print("   ✅ Investigator finished analysis!")
         return {"investigation": res["messages"][-1].content, "db_rule": db_rule}
 
@@ -102,25 +114,87 @@ def get_agent():
         print("="*50)
         print("   🧐 LLM is critically reviewing the Investigator's technical findings...")
         investigation = state.get("investigation", "")
+        event_id = state.get("payload", {}).get("eventId", "unknown")
+        
+        from langchain_core.tools import tool
+        from datetime import datetime
+        from filelock import FileLock
+        
+        @tool
+        def add_learning_rule(rule_text: str, reasoning: str) -> str:
+            """Propose a new permanent rule to fix Investigator mistakes."""
+            target_file = os.path.join(base_dir, "prompts", "pending_rules.jsonl")
+            lock_file = target_file + ".lock"
+            
+            entry = {
+                "eventId": event_id,
+                "timestamp": datetime.now().isoformat(),
+                "proposed_rule": rule_text,
+                "reviewer_reasoning": reasoning,
+                "investigator_original_output": investigation
+            }
+            try:
+                with FileLock(lock_file, timeout=10):
+                    with open(target_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(entry) + "\n")
+                return f"Successfully queued rule for human review: {rule_text}"
+            except Exception as e:
+                return f"Failed to queue rule: {e}"
+        
         prompt = f"Validate this investigation:\n{investigation}\n\nIf it's perfect, reply with exactly 'APPROVED'. If not, explain what is wrong."
-        reviewer_agent = create_react_agent(llm, tools=[get_tool_by_name("add_learning_rule")])
-        res = reviewer_agent.invoke({"messages": [
-            SystemMessage(content=reviewer_prompt),
-            HumanMessage(content=prompt)
-        ]})
+        reviewer_agent = create_react_agent(llm, tools=[add_learning_rule])
+        
+        @llm_breaker
+        @retry_transient
+        def invoke_reviewer():
+            return reviewer_agent.invoke({"messages": [
+                SystemMessage(content=reviewer_prompt),
+                HumanMessage(content=prompt)
+            ]})
+            
+        res = invoke_reviewer()
         feedback = res["messages"][-1].content
         print("   ✅ Reviewer finished assessment!")
-        return {"reviewer_feedback": feedback}
+        return {"reviewer_feedback": feedback, "retry_count": state.get("retry_count", 0) + 1}
 
     def check_approval(state: GraphState):
         feedback = state.get("reviewer_feedback", "").upper()
-        print("\n   🚦 ROUTING DECISION:")
+        retry_count = state.get("retry_count", 0)
+        max_retries = int(os.environ.get("MAX_INVESTIGATION_RETRIES", 3))
+        event_id = state.get("payload", {}).get("eventId", "unknown")
+        log = logger.bind(event_id=event_id, retry_count=retry_count)
+        
         if "APPROVED" in feedback:
-            print("   🟢 PASSED: Reviewer APPROVED the findings. Proceeding to Synthesis...")
+            log.info("Reviewer APPROVED findings", transition="synthesis")
             return "synthesis"
+        elif retry_count >= max_retries:
+            log.warning("Maximum retries reached", max_retries=max_retries, transition="escalate", state="NEEDS_MANUAL_REVIEW")
+            return "escalate"
         else:
-            print("   🔴 FAILED: Reviewer REJECTED the findings. Looping back to Investigator for corrections!")
+            log.info("Reviewer REJECTED findings", transition="investigator", state="RETRYING")
             return "investigator"
+
+    def escalate_node(state: GraphState):
+        print("\n" + "="*50)
+        print("📍 [STEP 4] ESCALATION NODE (NEEDS MANUAL REVIEW)")
+        print("="*50)
+        print("   ⚠️ Generating escalation casebook...")
+        
+        # We manually construct a fake synthesis payload that forces the routes.py to mark it NEEDS_MANUAL_REVIEW
+        investigation = state.get("investigation", "")
+        feedback = state.get("reviewer_feedback", "")
+        
+        # We format it to match the expected JSON structure so routes.py parses it
+        escalation_result = {
+            "Rejection_description": f"ESCALATED: The automated agents could not agree on a resolution after multiple attempts.\nLast Investigation:\n{investigation}\n\nLast Reviewer Feedback:\n{feedback}",
+            "Synthesis": "ESCALATED TO HUMAN REVIEW. The system encountered a complex edge case and exceeded the maximum allowed retries for agentic resolution.",
+            "Action": "MANUAL_REVIEW",
+            "Resident_action": "PENDING",
+            "UIDAI_ACTION": "ESCALATE_TO_L2",
+            "Artifact_design": "manual_escalation"
+        }
+        # Dump to JSON so routes.py can parse it
+        return {"synthesis": json.dumps(escalation_result)}
 
     def synthesis_node(state: GraphState):
         print("\n" + "="*50)
@@ -131,10 +205,16 @@ def get_agent():
         prompt = f"Create the final JSON casebook based strictly on this approved investigation:\n{investigation}"
         
         synthesis_agent = create_react_agent(llm, tools=[])
-        res = synthesis_agent.invoke({"messages": [
-            SystemMessage(content=synthesis_prompt),
-            HumanMessage(content=prompt)
-        ]})
+        
+        @llm_breaker
+        @retry_transient
+        def invoke_synthesis():
+            return synthesis_agent.invoke({"messages": [
+                SystemMessage(content=synthesis_prompt),
+                HumanMessage(content=prompt)
+            ]})
+            
+        res = invoke_synthesis()
         return {"synthesis": res["messages"][-1].content, "messages": res["messages"]}
 
     # Build Graph
@@ -143,14 +223,18 @@ def get_agent():
     workflow.add_node("investigate", investigator_node)
     workflow.add_node("review", reviewer_node)
     workflow.add_node("synthesize", synthesis_node)
+    workflow.add_node("escalate", escalate_node)
     
     workflow.add_edge(START, "fetch_logs")
     workflow.add_edge("fetch_logs", "investigate")
     workflow.add_edge("investigate", "review")
-    workflow.add_conditional_edges("review", check_approval, {"synthesis": "synthesize", "investigator": "investigate"})
+    workflow.add_conditional_edges("review", check_approval, {"synthesis": "synthesize", "investigator": "investigate", "escalate": "escalate"})
     workflow.add_edge("synthesize", END)
+    workflow.add_edge("escalate", END)
     
-    checkpointer = MemorySaver()
+    db_path = os.path.join(base_dir, "checkpoints.db")
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
     _agent = workflow.compile(checkpointer=checkpointer)
     
     print("[ORCHESTRATOR] ✅ Deterministic Graph successfully constructed!")
