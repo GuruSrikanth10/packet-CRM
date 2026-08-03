@@ -1,4 +1,8 @@
 import os
+from dotenv import load_dotenv
+
+# Automatically load the .env file if it exists
+load_dotenv()
 
 def get_required_env(var_name: str, default=None) -> str:
     value = os.environ.get(var_name, default)

@@ -84,7 +84,12 @@ packet-CRM/
 
 ## 3. Core Components Deep Dive
 
-### 3.1 Environment & Local LLM Integration (`llm_utils.py`)
+### 3.1 Environment Configuration (`.env`)
+The system manages all operational feature flags, LLM credentials, and Kafka connectivity settings via a strictly typed `.env` file (loaded via `python-dotenv` in `src/utils/env.py`).
+- **Template:** A reference file containing all placeholders is available at `.env.example`.
+- **Security:** The actual `.env` file is excluded via `.gitignore` to prevent secret leakage.
+
+### 3.2 Environment & Local LLM Integration (`llm_utils.py`)
 Unlike generic AI projects bound to OpenAI, `packet-CRM` is designed for on-premise, secure environments. 
 The `get_llm(tier="complex")` factory dynamic routes requests to custom, locally hosted models via `LLM_BASE_URL_COMPLEX` (e.g., `http://localhost:8000/v1`). 
 Additionally, it provides a seamless fallback to free Hugging Face endpoints by simply toggling the `USE_HF=true` environment variable.
