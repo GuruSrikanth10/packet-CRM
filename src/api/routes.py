@@ -32,14 +32,14 @@ def process_rejection(signal: MessagePayload):
     agent = get_agent()
     
     # Run the agent
-    print(f"[API] 🚀 Dispatching payload to RejectionManagerAgent for analysis...")
+    print(f"[API] 🚀 Dispatching payload to Deterministic Graph for analysis...")
     result = agent.invoke(
-        {"messages": [{"role": "user", "content": f"Investigate this rejected packet: {json.dumps(signal_dict)}"}]},
+        {"payload": signal_dict},
         config={"configurable": {"thread_id": event_id}}
     )
     
     print(f"[API] ✅ Agent investigation complete! Extracting Synthesis...")
-    final_message = result["messages"][-1].content
+    final_message = result.get("synthesis", "{}")
     
     try:
         # Fix: support matching both JSON objects {} and arrays []

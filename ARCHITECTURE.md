@@ -101,8 +101,14 @@ Unlike generic AI projects bound to OpenAI, `packet-CRM` is designed for on-prem
 The `get_llm(tier="complex")` factory dynamic routes requests to custom, locally hosted models via `LLM_BASE_URL_COMPLEX` (e.g., `http://localhost:8000/v1`). 
 Additionally, it provides a seamless fallback to free Hugging Face endpoints by simply toggling the `USE_HF=true` environment variable.
 
-### 3.2 The Pipeline (`agent_orchestrator.py` & `routes.py`)
-Incoming payloads are rigorously validated using Pydantic schemas in `routes.py`. Once parsed, the `agent_orchestrator` dynamically initializes the LangGraph graph using the `deepagents` SDK. The orchestrator maps the `agents.json` configuration to physical markdown files in the `prompts/` directory.
+### 2.2 Core Pipeline (Deterministic StateGraph)
+Instead of relying on an unpredictable LLM to orchestrate the subagents, the system uses a highly robust, strictly deterministic Python `StateGraph` (via `langgraph`) in `src/core/agent_orchestrator.py`. This ensures the exact sequential execution of every step.
+
+1. **Log Fetcher Node**: (If `ENABLE_LOG_FETCHING=true`) Automatically triggers the `fetch_elastic_logs` tool to pull relevant Kibana traces using the `eventId`.
+2. **Investigator Node**: A React agent equipped with `lookup_rule_by_reason_code` that receives the raw Kafka payload, the Elastic logs, and the database rule configuration to deduce exactly why the failure occurred.
+3. **Reviewer Node**: A distinct React agent that acts as a strict QC validator. It evaluates the Investigator's technical analysis.
+4. **Conditional Router**: A pure Python control edge that checks the Reviewer's output. If the Reviewer rejects the findings, it forcefully loops back to the Investigator Node with the critique appended. If approved, it routes to Synthesis.
+5. **Synthesis Node**: The final agent that takes the approved, heavily vetted technical diagnosis and translates it into a human-readable JSON `Casebook`.
 
 ### 3.3 The Agent Ecosystem
 The intelligence of the system relies on a multi-agent hierarchy:
