@@ -39,19 +39,26 @@ def get_agent():
     synthesis_prompt = load_prompt("SynthesisAgent.md")
     
     def fetch_logs_node(state: GraphState):
+        print("\n" + "="*50)
+        print("📍 [STEP 1] LOG FETCHER NODE")
+        print("="*50)
         enable_log_fetching = get_bool_env("ENABLE_LOG_FETCHING", False)
         if not enable_log_fetching:
-            print("[NODE] ⏭️ Log fetching is disabled.")
+            print("   ⏩ Skipped: Log fetching is disabled via .env")
             return {"logs": "Log fetching disabled."}
             
-        print("[NODE] 🔄 Fetching Elastic Logs...")
         event_id = state.get("payload", {}).get("eventId", "")
+        print(f"   🔍 Fetching Elasticsearch traces for Event ID: {event_id}...")
         tool = get_tool_by_name("fetch_elastic_logs")
         logs = tool.invoke(event_id)
+        print("   ✅ Logs successfully retrieved!")
         return {"logs": logs}
         
     def investigator_node(state: GraphState):
-        print("[NODE] 🔍 Investigator analyzing packet...")
+        print("\n" + "="*50)
+        print("📍 [STEP 2] INVESTIGATOR NODE")
+        print("="*50)
+        print("   🧠 LLM is actively analyzing Kafka Payload & Rules (This may take a moment)...")
         payload = state.get("payload", {})
         logs = state.get("logs", "")
         feedback = state.get("reviewer_feedback", "")
@@ -64,28 +71,37 @@ def get_agent():
             
         investigator_agent = create_react_agent(llm, tools=[get_tool_by_name("lookup_rule_by_reason_code")], state_modifier=investigator_prompt)
         res = investigator_agent.invoke({"messages": [HumanMessage(content=prompt)]})
+        print("   ✅ Investigator finished analysis!")
         return {"investigation": res["messages"][-1].content}
 
     def reviewer_node(state: GraphState):
-        print("[NODE] 🧐 Reviewer validating findings...")
+        print("\n" + "="*50)
+        print("📍 [STEP 3] REVIEWER NODE (QUALITY CONTROL)")
+        print("="*50)
+        print("   🧐 LLM is critically reviewing the Investigator's technical findings...")
         investigation = state.get("investigation", "")
         prompt = f"Validate this investigation:\n{investigation}\n\nIf it's perfect, reply with exactly 'APPROVED'. If not, explain what is wrong."
         reviewer_agent = create_react_agent(llm, tools=[get_tool_by_name("add_learning_rule")], state_modifier=reviewer_prompt)
         res = reviewer_agent.invoke({"messages": [HumanMessage(content=prompt)]})
         feedback = res["messages"][-1].content
+        print("   ✅ Reviewer finished assessment!")
         return {"reviewer_feedback": feedback}
 
     def check_approval(state: GraphState):
         feedback = state.get("reviewer_feedback", "").upper()
+        print("\n   🚦 ROUTING DECISION:")
         if "APPROVED" in feedback:
-            print("[ROUTER] ✅ Reviewer approved. Moving to Synthesis.")
+            print("   🟢 PASSED: Reviewer APPROVED the findings. Proceeding to Synthesis...")
             return "synthesis"
         else:
-            print("[ROUTER] ❌ Reviewer rejected. Looping back to Investigator.")
+            print("   🔴 FAILED: Reviewer REJECTED the findings. Looping back to Investigator for corrections!")
             return "investigator"
 
     def synthesis_node(state: GraphState):
-        print("[NODE] ✍️ Synthesis generating final casebook...")
+        print("\n" + "="*50)
+        print("📍 [STEP 4] SYNTHESIS NODE (FINAL CASEBOOK)")
+        print("="*50)
+        print("   ✍️ LLM is compiling the final JSON resolution...")
         investigation = state.get("investigation", "")
         prompt = f"Create the final JSON casebook based strictly on this approved investigation:\n{investigation}"
         
