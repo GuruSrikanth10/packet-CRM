@@ -54,7 +54,7 @@ def process_rejection(signal: MessagePayload):
 
     storage = get_casebook_storage()
     if storage.exists(event_id, terminal_only=True):
-        print(f"\n[API] ⏭️ Skipping Event ID: {event_id}. Terminal casebook already exists.")
+        print(f"\n[API] Skipping Event ID: {event_id}. Terminal casebook already exists.")
         return {"status": "already_processed", "event_id": event_id}
 
     log = logger.bind(event_id=event_id)
@@ -123,7 +123,7 @@ def process_rejection(signal: MessagePayload):
     if not raw_logs or raw_logs == "Log fetching disabled." or raw_logs.startswith("Failed to query"):
         processed_logs = None
     elif len(raw_logs) > 5000:
-        print("[API] 📦 Logs are too large for JSON, uploading to S3...")
+        print("[API] Logs are too large for JSON, uploading to S3...")
         processed_logs = upload_logs_to_s3(event_id, raw_logs)
     else:
         processed_logs = raw_logs

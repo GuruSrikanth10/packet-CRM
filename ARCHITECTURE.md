@@ -114,7 +114,7 @@ Instead of relying on an unpredictable LLM to orchestrate the subagents, the sys
 ### 3.4 Resilience & Hardening (Testing Phase)
 The architecture incorporates several resilience mechanisms to prevent runaway costs, silent failures, and file corruption:
 - **Idempotency**: The API intercepts requests and validates against the `CasebookStorage` interface. If a terminal casebook already exists for an `eventId`, the Kafka offset is acked without processing.
-- **Decoupled Consumer & Bounded Concurrency**: `main_consumer.py` isolates the Kafka polling loop. It submits tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`). Offsets are only committed manually.
+- **Decoupled Consumer & Bounded Concurrency**: `main_consumer.py` isolates the Kafka polling loop. It submits tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`). Offsets are only committed manually. `start.py` can be used to run both `main_api.py` and `main_consumer.py` concurrently for local development.
 - **DLQ & Checkpointing**: LangGraph uses `SqliteSaver` for crash recovery. If a packet fails completely, it is published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
 - **Safe Self-Learning**: The Reviewer's `add_learning_rule` tool no longer modifies active prompts. Instead, it securely stages suggestions to `src/prompts/pending_rules.jsonl` using `filelock`. A human runs `src/tools/promote_rules.py` to approve and Git-commit the rules.
 - **External Call Resilience**: `tenacity` handles exponential backoff retries, and `pybreaker` provides circuit breakers for database, Elasticsearch, and LLM calls.

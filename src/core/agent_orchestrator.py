@@ -30,10 +30,10 @@ _agent = None
 def get_agent():
     global _agent
     if _agent is not None:
-        print("[ORCHESTRATOR] ⚡ Returning cached Deterministic Graph.")
+        print("[ORCHESTRATOR] Returning cached Deterministic Graph.")
         return _agent
 
-    print("[ORCHESTRATOR] 🏗️ Building Deterministic LangGraph from scratch...")
+    print("[ORCHESTRATOR] Building Deterministic LangGraph from scratch...")
     base_dir = os.path.dirname(os.path.dirname(__file__))
     llm = get_llm("complex")
     
@@ -55,17 +55,17 @@ def get_agent():
             return {"logs": "Log fetching disabled."}
             
         event_id = state.get("payload", {}).get("eventId", "")
-        print(f"   🔍 Fetching Elasticsearch traces for Event ID: {event_id}...")
+        print(f"   Fetching Elasticsearch traces for Event ID: {event_id}...")
         tool = get_tool_by_name("fetch_elastic_logs")
         logs = tool.invoke(event_id)
-        print("   ✅ Logs successfully retrieved!")
+        print("   Logs successfully retrieved!")
         return {"logs": logs}
         
     def investigator_node(state: GraphState):
         print("\n" + "="*50)
         print("📍 [STEP 2] INVESTIGATOR NODE")
         print("="*50)
-        print("   🧠 LLM is actively analyzing Kafka Payload & Rules (This may take a moment)...")
+        print("   LLM is actively analyzing Kafka Payload & Rules (This may take a moment)...")
         payload = state.get("payload", {})
         logs = state.get("logs", "")
         feedback = state.get("reviewer_feedback", "")
@@ -105,14 +105,14 @@ def get_agent():
             ]})
             
         res = invoke_investigator()
-        print("   ✅ Investigator finished analysis!")
+        print("   Investigator finished analysis!")
         return {"investigation": res["messages"][-1].content, "db_rule": db_rule}
 
     def reviewer_node(state: GraphState):
         print("\n" + "="*50)
         print("📍 [STEP 3] REVIEWER NODE (QUALITY CONTROL)")
         print("="*50)
-        print("   🧐 LLM is critically reviewing the Investigator's technical findings...")
+        print("   LLM is critically reviewing the Investigator's technical findings...")
         investigation = state.get("investigation", "")
         event_id = state.get("payload", {}).get("eventId", "unknown")
         
@@ -154,7 +154,7 @@ def get_agent():
             
         res = invoke_reviewer()
         feedback = res["messages"][-1].content
-        print("   ✅ Reviewer finished assessment!")
+        print("   Reviewer finished assessment!")
         return {"reviewer_feedback": feedback, "retry_count": state.get("retry_count", 0) + 1}
 
     def check_approval(state: GraphState):
@@ -178,7 +178,7 @@ def get_agent():
         print("\n" + "="*50)
         print("📍 [STEP 4] ESCALATION NODE (NEEDS MANUAL REVIEW)")
         print("="*50)
-        print("   ⚠️ Generating escalation casebook...")
+        print("   Generating escalation casebook...")
         
         # We manually construct a fake synthesis payload that forces the routes.py to mark it NEEDS_MANUAL_REVIEW
         investigation = state.get("investigation", "")
@@ -200,7 +200,7 @@ def get_agent():
         print("\n" + "="*50)
         print("📍 [STEP 4] SYNTHESIS NODE (FINAL CASEBOOK)")
         print("="*50)
-        print("   ✍️ LLM is compiling the final JSON resolution...")
+        print("   LLM is compiling the final JSON resolution...")
         investigation = state.get("investigation", "")
         prompt = f"Create the final JSON casebook based strictly on this approved investigation:\n{investigation}"
         
@@ -237,5 +237,5 @@ def get_agent():
     checkpointer = SqliteSaver(conn)
     _agent = workflow.compile(checkpointer=checkpointer)
     
-    print("[ORCHESTRATOR] ✅ Deterministic Graph successfully constructed!")
+    print("[ORCHESTRATOR] Deterministic Graph successfully constructed!")
     return _agent

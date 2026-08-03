@@ -59,9 +59,9 @@ def consume_forever():
         )
     logger.info("Listening on topic=%s", kafkaConsumerTopicName)
     print("\n" + "="*50)
-    print(f"🚀 KAFKA CONSUMER STARTED")
-    print(f"📡 Brokers: {kafkaConsumerBrokers}")
-    print(f"📬 Topic: {kafkaConsumerTopicName}")
+    print(f"KAFKA CONSUMER STARTED")
+    print(f"Brokers: {kafkaConsumerBrokers}")
+    print(f"Topic: {kafkaConsumerTopicName}")
     print("="*50 + "\n")
     for msg in consumer:
         try:
@@ -78,12 +78,12 @@ def consume_forever():
             event_id = signal.get("eventId")
             storage = get_casebook_storage()
             if storage.exists(event_id, terminal_only=True):
-                print(f"[KAFKA] ⏭️ Skipping Event ID: {event_id}. Terminal casebook already exists.")
+                print(f"[KAFKA] Skipping Event ID: {event_id}. Terminal casebook already exists.")
                 consumer.commit()
                 continue
                 
-            print(f"\n[KAFKA] 📥 Received REJECTED packet with Event ID: {event_id}")
-            print(f"[KAFKA] 🔄 Enqueueing for agentic analysis...")
+            print(f"\n[KAFKA] Received REJECTED packet with Event ID: {event_id}")
+            print(f"[KAFKA] Enqueueing for agentic analysis...")
             
             # Block if queue is full
             _queue_semaphore.acquire()
@@ -92,7 +92,7 @@ def consume_forever():
             # Since we are decoupling, we commit the offset right after enqueueing.
             # If the process crashes before completion, the DLQ / Checkpointer handles it.
             consumer.commit()
-            print(f"[KAFKA] ✅ Enqueued and committed Event ID: {event_id}")
+            print(f"[KAFKA] Enqueued and committed Event ID: {event_id}")
         except Exception as e:
             payload_sample = payload[:500] if 'payload' in locals() else 'Decode failed'
             logger.exception(f"Error processing Kafka message. Raw payload: {payload_sample}")

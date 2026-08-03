@@ -14,13 +14,19 @@ def run_local(file_path: str):
     print(f"Read packet {data.get('eventId')}. Sending to internal FastAPI endpoint...")
     
     try:
-        response = requests.post("http://localhost:8000/process-rejection", json=data)
+        # We need to pass the API key for the new security middleware
+        api_key = os.environ.get("PACKET_CRM_API_KEY", "dev-secret-key")
+        headers = {"X-API-Key": api_key}
+        
+        response = requests.post("http://localhost:8000/process-rejection", json=data, headers=headers)
         response.raise_for_status()
         print("Success! Processed successfully.")
         print(response.json())
     except Exception as e:
         print(f"Error communicating with local server: {e}")
-        print("Make sure you have started the server with `python src/main.py` first!")
+        if "response" in locals() and hasattr(response, "text"):
+            print(f"Server response: {response.text}")
+        print("Make sure you have started the server with `python src/main_api.py` first!")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

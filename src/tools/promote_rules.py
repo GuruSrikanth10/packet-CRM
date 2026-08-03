@@ -43,10 +43,10 @@ def promote_rules():
                     commit_msg = f"Add learning rule from event {entry.get('eventId')}"
                     subprocess.run(["git", "add", target_file], check=True)
                     subprocess.run(["git", "commit", "-m", commit_msg], check=True)
-                    print("✅ Rule promoted and committed!")
+                    print("Rule promoted and committed!")
                     promoted_count += 1
                 else:
-                    print("⏭️ Rule skipped.")
+                    print("Rule skipped.")
             except Exception as e:
                 print(f"Error processing rule {i+1}: {e}")
                 

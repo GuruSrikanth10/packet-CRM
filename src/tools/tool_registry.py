@@ -65,12 +65,12 @@ def lookup_error_code(error_code: str) -> str:
 @retry_transient
 def lookup_rule_by_reason_code(reason_code: str) -> str:
     """Lookup the exact corresponding rule (including ruleId, payload, etc.) for a given reason code."""
-    print(f"\n[TOOL] 🔍 lookup_rule_by_reason_code triggered for: {reason_code}")
+    print(f"\n[TOOL] lookup_rule_by_reason_code triggered for: {reason_code}")
     use_mock = get_bool_env("USE_MOCK_DB", True)
     if use_mock:
         db = _load_mock_db()
         if db is None or db.empty:
-            print("[TOOL] ❌ Mock database is empty or could not be loaded!")
+            print("[TOOL] Mock database is empty or could not be loaded!")
             return "Mock database is empty or could not be loaded."
         
         # Find the column that might contain the reason code (case-insensitive and flexible)
@@ -85,16 +85,16 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
         if target_col:
             matches = db[db[target_col].astype(str) == str(reason_code)]
             if not matches.empty:
-                print(f"[TOOL] ✅ Found {len(matches)} matching rule(s) in DB for {reason_code}")
+                print(f"[TOOL] Found {len(matches)} matching rule(s) in DB for {reason_code}")
                 return matches.to_json(orient="records")
             else:
-                print(f"[TOOL] ⚠️ No rules found in DB for {reason_code}")
+                print(f"[TOOL] No rules found in DB for {reason_code}")
                 return f"Rule not found for reason code: {reason_code} in mock DB (Searched column: {target_col})."
         
-        print("[TOOL] ❌ Could not find a valid Reason Code column in the DB!")
+        print("[TOOL] Could not find a valid Reason Code column in the DB!")
         return f"Could not find a valid Reason Code column in the DB. Available columns: {list(db.columns)}"
     else:
-        print(f"[TOOL] 🔍 Querying LIVE MySQL database for: {reason_code}")
+        print(f"[TOOL] Querying LIVE MySQL database for: {reason_code}")
         try:
             db_user = get_required_env("DB_USERNAME", "su01")
             db_pass = get_required_env("DB_PASSWORD", "su01")
@@ -109,14 +109,14 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
             matches = pd.read_sql(query, engine, params=(reason_code,))
             
             if not matches.empty:
-                print(f"[TOOL] ✅ Found {len(matches)} matching rule(s) in Live DB for {reason_code}")
+                print(f"[TOOL] Found {len(matches)} matching rule(s) in Live DB for {reason_code}")
                 return matches.to_json(orient="records")
             else:
-                print(f"[TOOL] ⚠️ No rules found in Live DB for {reason_code}")
+                print(f"[TOOL] No rules found in Live DB for {reason_code}")
                 return f"Rule not found for reason code: {reason_code} in live DB."
                 
         except Exception as e:
-            print(f"[TOOL] ❌ Live DB connection or query failed: {e}")
+            print(f"[TOOL] Live DB connection or query failed: {e}")
             return f"Failed to query live DB: {e}"
 
 
@@ -125,7 +125,7 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
 @retry_transient
 def fetch_elastic_logs(event_id: str) -> str:
     """Fetch logs from Elastic for a given event ID using pagination to capture the full trace."""
-    print(f"\n[TOOL] 🔍 fetch_elastic_logs triggered for: {event_id}")
+    print(f"\n[TOOL] fetch_elastic_logs triggered for: {event_id}")
     
     es_host = os.environ.get("ES_HOST")
     es_user = os.environ.get("ES_USERNAME")
@@ -133,7 +133,7 @@ def fetch_elastic_logs(event_id: str) -> str:
     index_pattern = os.environ.get("ES_INDEX_PATTERN", "logs-*")
     
     if not es_host:
-        print("[TOOL] ❌ ES_HOST not set. Falling back to mock response.")
+        print("[TOOL] ES_HOST not set. Falling back to mock response.")
         return f"[MOCK] Elastic logs for {event_id}: ERROR - connection timeout. Stacktrace missing."
         
     try:
@@ -213,7 +213,7 @@ def fetch_elastic_logs(event_id: str) -> str:
                 
             total_fetched += len(hits)
             
-        print(f"[TOOL] ✅ Successfully fetched {total_fetched} logs from Elastic!")
+        print(f"[TOOL] Successfully fetched {total_fetched} logs from Elastic!")
         
         if total_fetched == 0:
             return f"No logs found for ID: {event_id}"
@@ -222,10 +222,10 @@ def fetch_elastic_logs(event_id: str) -> str:
         return "\n".join(llm_context)
         
     except pybreaker.CircuitBreakerError:
-        print("[TOOL] ⚠️ ES Circuit breaker is OPEN. Failing fast.")
+        print("[TOOL] ES Circuit breaker is OPEN. Failing fast.")
         return f"Failed to query Elastic: Circuit Breaker Open"
     except Exception as e:
-        print(f"[TOOL] ❌ Failed to fetch Elastic logs: {e}")
+        print(f"[TOOL] Failed to fetch Elastic logs: {e}")
         return f"Failed to query Elastic: {e}"
 
 @tool
