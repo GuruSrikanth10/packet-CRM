@@ -91,8 +91,9 @@ packet-CRM/
 ## 3. Core Components Deep Dive
 
 ### 3.1 Environment Configuration (`.env`)
-The system manages all operational feature flags, LLM credentials, and Kafka connectivity settings via a strictly typed `.env` file (loaded via `python-dotenv` in `src/utils/env.py`).
+The system manages all operational feature flags, LLM credentials, MySQL database connections, and Kafka connectivity settings via a strictly typed `.env` file (loaded via `python-dotenv` in `src/utils/env.py`).
 - **Template:** A reference file containing all placeholders is available at `.env.example`.
+- **Database Modes:** Set `USE_MOCK_DB=true` to parse rules locally from a CSV, or `USE_MOCK_DB=false` to dynamically query the live MySQL `rules` table via SQLAlchemy/PyMySQL.
 - **Security:** The actual `.env` file is excluded via `.gitignore` to prevent secret leakage.
 
 ### 3.2 Environment & Local LLM Integration (`llm_utils.py`)
