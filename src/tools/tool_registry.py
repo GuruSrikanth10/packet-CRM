@@ -1,7 +1,9 @@
 import os
 import pandas as pd
 from langchain_core.tools import tool
-from utils.env import get_bool_env
+from sqlalchemy import create_engine
+import pymysql
+from src.utils.env import get_bool_env, get_required_env
 
 _DB_CACHE = None
 
@@ -88,9 +90,30 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
         print("[TOOL] ❌ Could not find a valid Reason Code column in the DB!")
         return f"Could not find a valid Reason Code column in the DB. Available columns: {list(db.columns)}"
     else:
-        print(f"[TOOL] 🔍 (Placeholder) Looking up actual DB for: {reason_code}")
-        # Placeholder for actual DB lookup logic
-        return f"[Actual DB Lookup Placeholder] Would lookup rule for {reason_code} in real DB."
+        print(f"[TOOL] 🔍 Querying LIVE MySQL database for: {reason_code}")
+        try:
+            db_user = get_required_env("DB_USERNAME", "su01")
+            db_pass = get_required_env("DB_PASSWORD", "su01")
+            db_host = get_required_env("DB_HOST", "localhost")
+            db_port = get_required_env("DB_PORT", "3306")
+            db_name = get_required_env("DB_NAME", "uidmasterv1_1")
+            
+            engine = create_engine(f"mysql+pymysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}")
+            
+            # Using pandas to query and format identically to the mock DB approach
+            query = f"SELECT * FROM rules WHERE reject_reason_code = '{reason_code}'"
+            matches = pd.read_sql(query, engine)
+            
+            if not matches.empty:
+                print(f"[TOOL] ✅ Found {len(matches)} matching rule(s) in Live DB for {reason_code}")
+                return matches.to_json(orient="records")
+            else:
+                print(f"[TOOL] ⚠️ No rules found in Live DB for {reason_code}")
+                return f"Rule not found for reason code: {reason_code} in live DB."
+                
+        except Exception as e:
+            print(f"[TOOL] ❌ Live DB connection or query failed: {e}")
+            return f"Failed to query live DB: {e}"
 
 @tool
 def add_learning_rule(rule_text: str) -> str:
