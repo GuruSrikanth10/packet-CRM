@@ -105,10 +105,11 @@ Additionally, it provides a seamless fallback to free Hugging Face endpoints by 
 Instead of relying on an unpredictable LLM to orchestrate the subagents, the system uses a highly robust, strictly deterministic Python `StateGraph` (via `langgraph`) in `src/core/agent_orchestrator.py`. This ensures the exact sequential execution of every step.
 
 1. **Log Fetcher Node**: (If `ENABLE_LOG_FETCHING=true`) Automatically triggers the `fetch_elastic_logs` tool to pull relevant Kibana traces using the `eventId`.
-2. **Investigator Node**: A React agent equipped with `lookup_rule_by_reason_code` that receives the raw Kafka payload, the Elastic logs, and the database rule configuration to deduce exactly why the failure occurred.
+2. **Investigator Node**: A React agent that receives the raw Kafka payload and the Elastic logs. The database rule (e.g., `lookup_rule_by_reason_code`) is pre-fetched in Python and injected into the agent's prompt to drastically optimize database calls and prevent redundant queries.
 3. **Reviewer Node**: A distinct React agent that acts as a strict QC validator. It evaluates the Investigator's technical analysis.
 4. **Conditional Router**: A pure Python control edge that checks the Reviewer's output. If the Reviewer rejects the findings, it forcefully loops back to the Investigator Node with the critique appended. If approved, it routes to Synthesis.
 5. **Synthesis Node**: The final agent that takes the approved, heavily vetted technical diagnosis and translates it into a human-readable JSON `Casebook`.
+6. **Log Processor & S3 Uploader**: After the graph completes, Python evaluates the fetched Elasticsearch logs. Traces under 5000 characters are embedded directly into the casebook `Rejection_logs` field. Massive traces are automatically uploaded to AWS S3 via `boto3` (`src/utils/s3_uploader.py`), and the resulting `s3://...` URL is embedded instead.
 
 ### 3.3 The Agent Ecosystem
 The intelligence of the system relies on a multi-agent hierarchy:
