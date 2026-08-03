@@ -132,8 +132,99 @@ def add_learning_rule(rule_text: str) -> str:
 
 @tool
 def fetch_elastic_logs(event_id: str) -> str:
-    """Fetch logs from Elastic for a given event ID."""
-    return f"[MOCK] Elastic logs for {event_id}: ERROR - connection timeout. Stacktrace missing."
+    """Fetch logs from Elastic for a given event ID using pagination to capture the full trace."""
+    print(f"\n[TOOL] 🔍 fetch_elastic_logs triggered for: {event_id}")
+    
+    es_host = os.environ.get("ES_HOST")
+    es_user = os.environ.get("ES_USERNAME")
+    es_pass = os.environ.get("ES_PASSWORD")
+    index_pattern = os.environ.get("ES_INDEX_PATTERN", "logs-*")
+    
+    if not es_host:
+        print("[TOOL] ❌ ES_HOST not set. Falling back to mock response.")
+        return f"[MOCK] Elastic logs for {event_id}: ERROR - connection timeout. Stacktrace missing."
+        
+    try:
+        from elasticsearch import Elasticsearch
+        
+        auth_args = {}
+        if es_user and es_pass:
+            auth_args["basic_auth"] = (es_user, es_pass)
+            
+        es_client = Elasticsearch(
+            es_host,
+            verify_certs=False,
+            **auth_args
+        )
+        
+        query_body = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {
+                            "query_string": {
+                                "query": f'"{event_id}"'
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+
+        sort_criteria = [
+            {"@timestamp": {"order": "asc"}},
+            {"_id": {"order": "asc"}}
+        ]
+
+        llm_context = []
+        llm_context.append(f"--- Log Trace for ID: {event_id} ---")
+        
+        search_after_values = None
+        page_size = 500
+        total_fetched = 0
+
+        while True:
+            search_kwargs = {
+                "index": index_pattern,
+                "size": page_size,
+                "sort": sort_criteria,
+                "query": query_body["query"]
+            }
+            
+            if search_after_values:
+                search_kwargs["search_after"] = search_after_values
+
+            response = es_client.search(**search_kwargs)
+            hits = response.get("hits", {}).get("hits", [])
+            
+            if not hits:
+                break
+                
+            for hit in hits:
+                source = hit["_source"]
+                timestamp = source.get("@timestamp", "UNKNOWN_TIME")
+                app_name = source.get("application_name", 
+                           source.get("kubernetes", {}).get("container", {}).get("name", 
+                           source.get("HOSTNAME", "unknown-service")))
+                level = source.get("level", "INFO")
+                log_msg = source.get("message", source.get("msg", str(source)))
+                
+                llm_context.append(f"[{timestamp}] [{app_name}] [{level}] {log_msg}")
+                search_after_values = hit["sort"]
+                
+            total_fetched += len(hits)
+            
+        print(f"[TOOL] ✅ Successfully fetched {total_fetched} logs from Elastic!")
+        
+        if total_fetched == 0:
+            return f"No logs found for ID: {event_id}"
+
+        llm_context.append(f"--- End of Trace ({total_fetched} logs total) ---")
+        return "\n".join(llm_context)
+        
+    except Exception as e:
+        print(f"[TOOL] ❌ Failed to fetch Elastic logs: {e}")
+        return f"Failed to query Elastic: {e}"
 
 @tool
 def fetch_kubernetes_logs(pod_id: str) -> str:

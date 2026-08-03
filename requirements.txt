@@ -13,3 +13,4 @@ langchain-huggingface
 python-dotenv
 PyMySQL
 SQLAlchemy
+elasticsearch
