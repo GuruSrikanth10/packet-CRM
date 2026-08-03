@@ -3,15 +3,15 @@ from pydantic import BaseModel
 
 class ErrorData(BaseModel):
     type: Optional[str] = None
-    errorReasonCode: str
+    errorReasonCode: Optional[str] = None
 
 class PacketExecutionSummary(BaseModel):
-    hasExecutionErrors: bool
-    hasValidationErrors: bool
-    packetStatus: str
+    hasExecutionErrors: Optional[bool] = None
+    hasValidationErrors: Optional[bool] = None
+    packetStatus: Optional[str] = None
     errorData: Optional[List[ErrorData]] = None
-    isExecutionSuccess: bool
-    isValidationSuccess: bool
+    isExecutionSuccess: Optional[bool] = None
+    isValidationSuccess: Optional[bool] = None
 
 class MessagePayload(BaseModel):
     eventId: str

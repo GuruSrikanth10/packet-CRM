@@ -24,7 +24,11 @@ def forward_signal_to_internal_endpoint(signal: dict):
         proxies={"http": None, "https": None},
         timeout=kafkaConsumerInternalTimeoutSec,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP Error forwarding signal: {e.response.text}")
+        raise
     return response
 
 def consume_forever():
