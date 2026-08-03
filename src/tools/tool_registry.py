@@ -65,11 +65,22 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
         if db is None or db.empty:
             return "Mock database is empty or could not be loaded."
         
-        if 'reasonCode' in db.columns:
-            matches = db[db['reasonCode'].astype(str) == str(reason_code)]
+        # Find the column that might contain the reason code (case-insensitive and flexible)
+        possible_cols = ['reasoncode', 'reason_code', 'errorcode', 'error_code', 'rejectioncode', 'rejection_code', 'code']
+        target_col = None
+        for col in db.columns:
+            clean_col = str(col).lower().replace(" ", "").replace("_", "")
+            if clean_col in possible_cols:
+                target_col = col
+                break
+                
+        if target_col:
+            matches = db[db[target_col].astype(str) == str(reason_code)]
             if not matches.empty:
                 return matches.to_json(orient="records")
-        return f"Rule not found for reason code: {reason_code} in mock DB."
+            else:
+                return f"Rule not found for reason code: {reason_code} in mock DB (Searched column: {target_col})."
+        return f"Could not find a valid Reason Code column in the DB. Available columns: {list(db.columns)}"
     else:
         # Placeholder for actual DB lookup logic
         return f"[Actual DB Lookup Placeholder] Would lookup rule for {reason_code} in real DB."
