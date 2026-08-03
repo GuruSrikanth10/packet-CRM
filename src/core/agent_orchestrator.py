@@ -69,7 +69,7 @@ def get_agent():
         if feedback:
             prompt += f"Reviewer Feedback (You MUST fix your previous analysis): {feedback}\n\n"
             
-        investigator_agent = create_react_agent(llm, tools=[get_tool_by_name("lookup_rule_by_reason_code")], state_modifier=investigator_prompt)
+        investigator_agent = create_react_agent(llm, tools=[get_tool_by_name("lookup_rule_by_reason_code")], messages_modifier=investigator_prompt)
         res = investigator_agent.invoke({"messages": [HumanMessage(content=prompt)]})
         print("   ✅ Investigator finished analysis!")
         return {"investigation": res["messages"][-1].content}
@@ -81,7 +81,7 @@ def get_agent():
         print("   🧐 LLM is critically reviewing the Investigator's technical findings...")
         investigation = state.get("investigation", "")
         prompt = f"Validate this investigation:\n{investigation}\n\nIf it's perfect, reply with exactly 'APPROVED'. If not, explain what is wrong."
-        reviewer_agent = create_react_agent(llm, tools=[get_tool_by_name("add_learning_rule")], state_modifier=reviewer_prompt)
+        reviewer_agent = create_react_agent(llm, tools=[get_tool_by_name("add_learning_rule")], messages_modifier=reviewer_prompt)
         res = reviewer_agent.invoke({"messages": [HumanMessage(content=prompt)]})
         feedback = res["messages"][-1].content
         print("   ✅ Reviewer finished assessment!")
@@ -105,7 +105,7 @@ def get_agent():
         investigation = state.get("investigation", "")
         prompt = f"Create the final JSON casebook based strictly on this approved investigation:\n{investigation}"
         
-        synthesis_agent = create_react_agent(llm, tools=[], state_modifier=synthesis_prompt)
+        synthesis_agent = create_react_agent(llm, tools=[], messages_modifier=synthesis_prompt)
         res = synthesis_agent.invoke({"messages": [HumanMessage(content=prompt)]})
         return {"synthesis": res["messages"][-1].content, "messages": res["messages"]}
 
