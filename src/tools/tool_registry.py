@@ -68,7 +68,7 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
             return "Mock database is empty or could not be loaded."
         
         # Find the column that might contain the reason code (case-insensitive and flexible)
-        possible_cols = ['reasoncode', 'reason_code', 'errorcode', 'error_code', 'rejectioncode', 'rejection_code', 'code']
+        possible_cols = ['reasoncode', 'reason_code', 'errorcode', 'error_code', 'rejectioncode', 'rejection_code', 'code', 'rejectreasoncode', 'reject_reason_code']
         target_col = None
         for col in db.columns:
             clean_col = str(col).lower().replace(" ", "").replace("_", "")
