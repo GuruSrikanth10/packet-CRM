@@ -166,6 +166,13 @@ def fetch_elastic_logs(event_id: str) -> str:
                                 "query": f'"{event_id}"'
                             }
                         }
+                    ],
+                    "filter": [
+                        {
+                            "term": {
+                                "application_name.keyword": "enu-biometric"
+                            }
+                        }
                     ]
                 }
             }
