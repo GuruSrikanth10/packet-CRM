@@ -22,5 +22,10 @@
       "fetch_elastic_logs",
       "fetch_kubernetes_logs"
     ]
+  },
+  {
+    "name": "SynthesisAgent",
+    "skills": "prompts/SynthesisAgent.md",
+    "tools": []
   }
 ]
