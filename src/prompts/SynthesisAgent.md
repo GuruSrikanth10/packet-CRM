@@ -16,6 +16,8 @@ Strictly adhere to these core policies:
 2. **STANDARD BIOMETRIC UPDATE**: 1:1 Auth & Append. Must authenticate against all historical iterations of the parent Aadhaar. New biometrics are APPENDED, never replaced.
 3. **MANDATORY BIOMETRIC UPDATE (MBU)**: Treated as Enrolment (1:N). Applies when parent Aadhaar has no prior biometrics. Undergoes full 1:N deduplication.
 
+When generating the synthesis, you MUST refer to the `agent_policy_context.md` document in the project root to correctly translate the Investigator's raw JSON conditions (like `isApplicantWhiteListed: false`) into human-readable resolutions for the operator.
+
 When generating the synthesis, you MUST output your final findings strictly in the following JSON format without any surrounding text or markdown formatting:
 {
   "Rejection_description": "<detailed explanation of why the rejection occurred>",

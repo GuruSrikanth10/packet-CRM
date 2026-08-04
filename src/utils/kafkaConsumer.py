@@ -1,3 +1,4 @@
+import os
 import json
 import logging
 import requests
@@ -24,9 +25,12 @@ _worker_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_INVESTIGATIONS)
 _queue_semaphore = threading.Semaphore(MAX_CONCURRENT_INVESTIGATIONS)
 
 def forward_signal_to_internal_endpoint(signal: dict):
+    api_key = os.environ.get("PACKET_CRM_API_KEY", "dev-secret-key")
+    headers = {"X-API-Key": api_key}
     response = requests.post(
         kafkaConsumerInternalEndpoint,
         json=signal,
+        headers=headers,
         proxies={"http": None, "https": None},
         timeout=kafkaConsumerInternalTimeoutSec,
     )

@@ -3,7 +3,7 @@
 you should also commit the `ARCHITECTURE.md` along with other changes
 
 # Git Constraints
-- **Never push without permission**: You must never execute `git push` directly after making code changes. Always wait for the user to explicitly say "commit and push" or grant permission before committing or pushing any changes to the remote repository.
+- **Never push or commit without permission**: You must never execute `git push` or `git commit` directly after making code changes. Always wait for the user to explicitly say "commit and push" or grant permission before committing or pushing any changes to the remote repository.
 
 # Coding and Output Standards
 - **No Emojis**: You must never write emojis (e.g., ✅, 🛑, 🚀, 🧠, etc.) in the project codebase, including print statements, logs, comments, or documentation. All output must be strictly text-based and professional.

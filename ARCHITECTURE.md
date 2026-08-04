@@ -63,6 +63,7 @@ The repository follows standard Python backend architecture for modularity and s
 packet-CRM/
 ├── .agents/                        
 │   └── AGENTS.md                   # Agentic configurations and behavioral rules
+├── agent_policy_context.md         # Foundational business logic & rules mapping for AI agents
 ├── src/
 │   ├── main.py                     # App entry point, daemon lifecycle manager
 │   ├── api/
@@ -122,7 +123,7 @@ The architecture incorporates several resilience mechanisms to prevent runaway c
 - **Structured Logging & Auth**: Standardized `structlog` emits JSON logs keyed by `eventId`. The FastAPI endpoints are secured via `X-API-Key` and a simple in-memory rate limiter.
 
 ### 3.3 The Agent Ecosystem
-The intelligence of the system relies on a multi-agent hierarchy:
+The intelligence of the system relies on a multi-agent hierarchy. Both the Investigator and Synthesis agents are strictly instructed to reference the business logic outlined in `agent_policy_context.md` to understand success criteria and parse deviations correctly.
 - **RejectionManagerAgent**: The conductor. It reads the payload and coordinates a strict sequential pipeline. It cannot solve problems itself.
 - **InvestigatorAgent**: The detective. It actively queries databases to correlate error codes (`reasonCode`) with internal business rules (`ruleId`) and determines the technical failure.
 - **ReviewerAgent**: The auditor. It checks the Investigator's homework to eliminate hallucinations.
