@@ -64,6 +64,7 @@ packet-CRM/
 ├── .agents/                        
 │   └── AGENTS.md                   # Agentic configurations and behavioral rules
 ├── agent_policy_context.md         # Foundational business logic & rules mapping for AI agents
+├── beginner_tech_guide.md          # Beginner-friendly guide explaining all technologies used
 ├── src/
 │   ├── main.py                     # App entry point, daemon lifecycle manager
 │   ├── api/
