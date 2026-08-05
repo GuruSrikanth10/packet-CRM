@@ -2,6 +2,15 @@
 
 This document provides the foundational business logic for analyzing rejected biometric packets. Use this to determine exactly why a packet failed and what the resident must do to fix it.
 
+## 0. Organization Terminology Glossary (CRITICAL OVERRIDES)
+- **"demo" / "DEMO"**: Refers strictly to the **face modality**. You MUST NOT interpret this as "demographic" (name, DOB, gender, address). A "demo match" means the resident's face matched. Do not mention demographics.
+- **"nonDemo"**: Refers to all biometric modalities EXCEPT face (i.e., fingerprints and iris).
+- **"TD"**: True Duplicate. This means all nonDemo modalities have matched completely.
+- **"anomalous"**: Indicates that the specific modality did not match.
+- **"parent"**: Refers to the original master Aadhaar packet.
+- **"FP"**: False Positive.
+- **"isDGN"**: Diagnostic packet flag.
+
 ## 1. What does SUCCESS look like?
 To understand a rejection, you must first understand what a successful packet looks like.
 

@@ -28,7 +28,7 @@ def main():
         consumer_process.terminate()
         api_process.wait()
         consumer_process.wait()
-        print("Goodbye!")
+        print("Services terminated!")
 
 if __name__ == "__main__":
     main()

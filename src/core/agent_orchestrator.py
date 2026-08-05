@@ -39,7 +39,16 @@ def get_agent():
     
     def load_prompt(filename):
         with open(os.path.join(base_dir, "prompts", filename), "r", encoding="utf-8") as f:
-            return f.read()
+            prompt = f.read()
+            
+        policy_path = os.path.join(os.path.dirname(base_dir), "agent_policy_context.md")
+        if os.path.exists(policy_path):
+            with open(policy_path, "r", encoding="utf-8") as f:
+                policy = f.read()
+            # Inject policy context directly into the prompt so the LLM actually sees it!
+            prompt += "\n\n### GLOBAL BUSINESS POLICY CONTEXT\n" + policy
+            
+        return prompt
             
     investigator_prompt = load_prompt("InvestigatorAgent.md")
     reviewer_prompt = load_prompt("ReviewerAgent.md")
@@ -47,7 +56,7 @@ def get_agent():
     
     def fetch_logs_node(state: GraphState):
         print("\n" + "="*50)
-        print("📍 [STEP 1] LOG FETCHER NODE")
+        print("[STEP 1] LOG FETCHER NODE")
         print("="*50)
         enable_log_fetching = get_bool_env("ENABLE_LOG_FETCHING", False)
         if not enable_log_fetching:
@@ -63,7 +72,7 @@ def get_agent():
         
     def investigator_node(state: GraphState):
         print("\n" + "="*50)
-        print("📍 [STEP 2] INVESTIGATOR NODE")
+        print("[STEP 2] INVESTIGATOR NODE")
         print("="*50)
         print("   LLM is actively analyzing Kafka Payload & Rules (This may take a moment)...")
         payload = state.get("payload", {})
@@ -110,7 +119,7 @@ def get_agent():
 
     def reviewer_node(state: GraphState):
         print("\n" + "="*50)
-        print("📍 [STEP 3] REVIEWER NODE (QUALITY CONTROL)")
+        print("[STEP 3] REVIEWER NODE (QUALITY CONTROL)")
         print("="*50)
         print("   LLM is critically reviewing the Investigator's technical findings...")
         investigation = state.get("investigation", "")
@@ -176,7 +185,7 @@ def get_agent():
 
     def escalate_node(state: GraphState):
         print("\n" + "="*50)
-        print("📍 [STEP 4] ESCALATION NODE (NEEDS MANUAL REVIEW)")
+        print("[STEP 4] ESCALATION NODE (NEEDS MANUAL REVIEW)")
         print("="*50)
         print("   Generating escalation casebook...")
         
@@ -198,7 +207,7 @@ def get_agent():
 
     def synthesis_node(state: GraphState):
         print("\n" + "="*50)
-        print("📍 [STEP 4] SYNTHESIS NODE (FINAL CASEBOOK)")
+        print("[STEP 4] SYNTHESIS NODE (FINAL CASEBOOK)")
         print("="*50)
         print("   LLM is compiling the final JSON resolution...")
         investigation = state.get("investigation", "")
