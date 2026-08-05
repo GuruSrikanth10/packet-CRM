@@ -5,6 +5,7 @@ import requests
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from kafka import KafkaConsumer
+from pathlib import Path
 from .env import get_required_env
 from src.storage.factory import get_casebook_storage
 
@@ -16,12 +17,13 @@ kafkaConsumerBrokers = [
 kafkaConsumerTopicName = get_required_env("KAFKA_CONSUMER_TOPIC_NAME", "rejections")
 kafkaConsumerGroupId = get_required_env("KAFKA_CONSUMER_GROUP_ID", "rejection-agents-group")
 kafkaConsumerInternalEndpoint = get_required_env("KAFKA_CONSUMER_INTERNAL_ENDPOINT", "http://localhost:8000/process-rejection")
-kafkaConsumerInternalTimeoutSec = float(get_required_env("KAFKA_CONSUMER_INTERNAL_TIMEOUT_SEC", "300"))
+kafkaConsumerInternalTimeoutSec = float(os.environ.get("PACKET_TIMEOUT_SECONDS", "300"))
 
 # Consumer will be instantiated lazily in consume_forever
 consumer = None
 MAX_CONCURRENT_INVESTIGATIONS = int(get_required_env("MAX_CONCURRENT_INVESTIGATIONS", "5"))
 _worker_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_INVESTIGATIONS)
+# Create a bounded queue by acquiring semaphore BEFORE reading from Kafka
 _queue_semaphore = threading.Semaphore(MAX_CONCURRENT_INVESTIGATIONS)
 
 def forward_signal_to_internal_endpoint(signal: dict):
@@ -42,12 +44,23 @@ def forward_signal_to_internal_endpoint(signal: dict):
     return response
 
 def _process_and_commit(signal: dict):
+    event_id = signal.get("eventId")
     try:
-        logger.info("Forwarding event %s to internal endpoint", signal.get("eventId"))
+        logger.info("Forwarding event %s to internal endpoint", event_id)
         response = forward_signal_to_internal_endpoint(signal)
-        logger.info("Forwarded event %s status=%s", signal.get("eventId"), response.status_code)
+        logger.info("Forwarded event %s status=%s", event_id, response.status_code)
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout forwarding Kafka message Event ID: {event_id}")
+        storage = get_casebook_storage()
+        storage.save(event_id, {
+            "Metadata - Packet Details": {"EID": event_id},
+            "Packet Status": {"Status": "FAILED_TIMEOUT"},
+            "Resolution": {"Synthesis": "Investigation exceeded maximum allowed time."}
+        })
+        from src.utils.dlq_publisher import publish_to_dlq
+        publish_to_dlq(signal, "Pipeline timed out (PACKET_TIMEOUT_SECONDS exceeded)")
     except Exception:
-        logger.exception(f"Error forwarding Kafka message Event ID: {signal.get('eventId')}")
+        logger.exception(f"Error forwarding Kafka message Event ID: {event_id}")
     finally:
         _queue_semaphore.release()
 
@@ -67,15 +80,47 @@ def consume_forever():
     print(f"Brokers: {kafkaConsumerBrokers}")
     print(f"Topic: {kafkaConsumerTopicName}")
     print("="*50 + "\n")
-    for msg in consumer:
+    
+    heartbeat_file = Path(__file__).resolve().parent.parent.parent / "local_checkpoints" / "consumer_heartbeat.txt"
+    os.makedirs(heartbeat_file.parent, exist_ok=True)
+    
+    import time
+    while True:
+        # We use poll() to have a chance to update the heartbeat periodically even when idle
+        records = consumer.poll(timeout_ms=5000)
+        
+        with open(heartbeat_file, "w") as f:
+            f.write(str(time.time()))
+            
+        if not records:
+            continue
+            
+        for tp, messages in records.items():
+            for msg in messages:
+        # Block if queue is full BEFORE parsing (creates backpressure on polling)
+        _queue_semaphore.acquire()
+        
         try:
             payload = msg.value.decode("utf-8", errors="replace")
-            signal = json.loads(payload)
+            try:
+                signal = json.loads(payload)
+                from src.models.schemas import MessagePayload
+                # Validate payload structure (Poison-pill check)
+                MessagePayload(**signal)
+            except Exception as validation_err:
+                logger.error(f"Poison-pill payload detected: {validation_err}")
+                from src.utils.dlq_publisher import publish_to_dlq
+                publish_to_dlq(payload, f"Structural validation failed: {validation_err}")
+                consumer.commit()
+                _queue_semaphore.release()
+                continue
             
             # Check packetStatus if it's REJECTED
             summary = signal.get("packetExecutionSummary", {})
             if summary.get("packetStatus") != "REJECTED":
                 print(f"Skipping non-rejected packet {signal.get('eventId')}")
+                consumer.commit()
+                _queue_semaphore.release()
                 continue
             
             # Dedupe check
@@ -84,13 +129,12 @@ def consume_forever():
             if storage.exists(event_id, terminal_only=True):
                 print(f"[KAFKA] Skipping Event ID: {event_id}. Terminal casebook already exists.")
                 consumer.commit()
+                _queue_semaphore.release()
                 continue
                 
             print(f"\n[KAFKA] Received REJECTED packet with Event ID: {event_id}")
             print(f"[KAFKA] Enqueueing for agentic analysis...")
             
-            # Block if queue is full
-            _queue_semaphore.acquire()
             _worker_pool.submit(_process_and_commit, signal)
             
             # Since we are decoupling, we commit the offset right after enqueueing.
@@ -100,3 +144,4 @@ def consume_forever():
         except Exception as e:
             payload_sample = payload[:500] if 'payload' in locals() else 'Decode failed'
             logger.exception(f"Error processing Kafka message. Raw payload: {payload_sample}")
+            _queue_semaphore.release()

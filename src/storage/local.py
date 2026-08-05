@@ -25,6 +25,10 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
         tmp_path = target_dir / "casebook.json.tmp"
         lock_path = target_dir / "casebook.json.lock"
         
+        # Enforce schema version for backwards compatibility
+        if "schema_version" not in casebook:
+            casebook["schema_version"] = "1.0"
+        
         with FileLock(str(lock_path), timeout=10):
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(casebook, f, indent=4, ensure_ascii=False)

@@ -6,6 +6,9 @@ from contextlib import asynccontextmanager
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.api.routes import router as api_router
+from src.utils.config_validator import validate_config
+
+validate_config()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

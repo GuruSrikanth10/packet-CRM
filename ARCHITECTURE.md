@@ -112,15 +112,16 @@ Instead of relying on an unpredictable LLM to orchestrate the subagents, the sys
 5. **Synthesis Node**: The final agent that takes the approved, heavily vetted technical diagnosis and translates it into a human-readable JSON `Casebook`.
 6. **Log Processor & S3 Uploader**: After the graph completes, Python evaluates the fetched Elasticsearch logs. Traces under 5000 characters are embedded directly into the casebook `Rejection_logs` field. Massive traces are automatically uploaded to AWS S3 via `boto3` (`src/utils/s3_uploader.py`), and the resulting `s3://...` URL is embedded instead.
 
-### 3.4 Resilience & Hardening (Testing Phase)
-The architecture incorporates several resilience mechanisms to prevent runaway costs, silent failures, and file corruption:
-- **Idempotency**: The API intercepts requests and validates against the `CasebookStorage` interface. If a terminal casebook already exists for an `eventId`, the Kafka offset is acked without processing.
-- **Decoupled Consumer & Bounded Concurrency**: `main_consumer.py` isolates the Kafka polling loop. It submits tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`). Offsets are only committed manually. `start.py` can be used to run both `main_api.py` and `main_consumer.py` concurrently for local development.
-- **DLQ & Checkpointing**: LangGraph uses `SqliteSaver` for crash recovery. If a packet fails completely, it is published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
-- **Safe Self-Learning**: The Reviewer's `add_learning_rule` tool no longer modifies active prompts. Instead, it securely stages suggestions to `src/prompts/pending_rules.jsonl` using `filelock`. A human runs `src/tools/promote_rules.py` to approve and Git-commit the rules.
+### 3.4 Resilience & Hardening (Phase 1 & 2)
+The architecture incorporates several resilience mechanisms to prevent runaway costs, silent failures, file corruption, and pipeline deadlocks:
+- **Idempotency & Staleness Guards**: The API intercepts requests and validates against the `CasebookStorage` interface. `IN_PROGRESS` stubs are written immediately to prevent duplicate runs. If an `IN_PROGRESS` stub goes stale (exceeding `MAX_IN_PROGRESS_AGE_SECONDS`), the pipeline safely resumes from a LangGraph checkpoint or fresh start.
+- **Decoupled Consumer & Bounded Concurrency**: `main_consumer.py` isolates the Kafka polling loop and submits tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`). Offsets are committed immediately upon enqueuing.
+- **DLQ, Poison-pill, & Checkpointing**: LangGraph uses `SqliteSaver` (with WAL mode enabled) for scalable crash recovery. Structurally invalid Kafka messages (poison-pills) and unrecoverable pipeline crashes are immediately published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
+- **Pipeline Timeouts**: The overall graph invocation is wrapped in a hard timeout (`PACKET_TIMEOUT_SECONDS`). On timeout, the casebook is marked `FAILED_TIMEOUT` and the worker slot is guaranteed to be released.
+- **Safe Self-Learning & Drift Checks**: The Reviewer's `add_learning_rule` tool stages suggestions to `src/prompts/pending_rules.jsonl` using `filelock`. A human runs `src/tools/promote_rules.py` (which includes top-level locking and git-status safety checks) to approve and Git-commit the rules. Additionally, `src/tools/check_drift.py` detects database schema/policy drift.
 - **External Call Resilience**: `tenacity` handles exponential backoff retries, and `pybreaker` provides circuit breakers for database, Elasticsearch, and LLM calls.
-- **Storage Abstraction**: The `CasebookStorage` interface allows seamless switching between `LocalFilesystemCasebookStorage` (using atomic `.tmp` writes) and future `S3CasebookStorage` implementations.
-- **Structured Logging & Auth**: Standardized `structlog` emits JSON logs keyed by `eventId`. The FastAPI endpoints are secured via `X-API-Key` and a simple in-memory rate limiter.
+- **Storage Abstraction & Schema Versioning**: The `CasebookStorage` interface implements atomic `.tmp` writes and enforces a `"schema_version"` field on every saved casebook for backwards compatibility.
+- **Structured Logging & Health Checks**: The FastAPI server provides `/health` (monitoring consumer heartbeats) and `/ready` (verifying SQLite and Kafka producer connectivity) endpoints. `validate_config()` provides fail-fast configuration validation at boot.
 
 ### 3.3 The Agent Ecosystem
 The intelligence of the system relies on a multi-agent hierarchy. Both the Investigator and Synthesis agents are strictly instructed to reference the business logic outlined in `agent_policy_context.md` to understand success criteria and parse deviations correctly.

@@ -6,3 +6,5 @@ abd/
 *.xlsx
 *.csv
 *.log
+
+src/checkpoints.db

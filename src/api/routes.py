@@ -43,6 +43,64 @@ def rate_limiter(request: Request):
         
     _rate_limits[client_ip].append(current_time)
 
+@router.get("/health")
+def health_check():
+    import time
+    from pathlib import Path
+    
+    heartbeat_file = Path(__file__).resolve().parent.parent.parent / "local_checkpoints" / "consumer_heartbeat.txt"
+    last_heartbeat = None
+    if heartbeat_file.exists():
+        try:
+            with open(heartbeat_file, "r") as f:
+                last_heartbeat = float(f.read().strip())
+        except Exception:
+            pass
+            
+    is_consumer_alive = False
+    if last_heartbeat is not None:
+        # Consumer should poll every 5s, we give it a 30s grace period
+        is_consumer_alive = (time.time() - last_heartbeat) < 30
+        
+    return {
+        "status": "up",
+        "consumer_alive": is_consumer_alive,
+        "last_heartbeat": last_heartbeat
+    }
+
+@router.get("/ready")
+def readiness_check():
+    import sqlite3
+    import os
+    from pathlib import Path
+    from src.utils.dlq_publisher import get_producer
+    
+    # Check SQLite connectivity
+    db_path = Path(__file__).resolve().parent.parent.parent / "local_checkpoints" / "checkpoints.db"
+    db_ready = False
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("SELECT 1")
+        conn.close()
+        db_ready = True
+    except Exception as e:
+        logger.error(f"Readiness check failed on DB: {e}")
+        
+    # Check Kafka producer
+    kafka_ready = False
+    try:
+        producer = get_producer()
+        if producer is not None:
+            # Just checking if producer is created successfully
+            kafka_ready = True
+    except Exception as e:
+        logger.error(f"Readiness check failed on Kafka Producer: {e}")
+        
+    if db_ready and kafka_ready:
+        return {"status": "ready"}
+    else:
+        raise HTTPException(status_code=503, detail="Service Unavailable")
+
 @router.post("/process-rejection", dependencies=[Depends(get_api_key), Depends(rate_limiter)])
 def process_rejection(signal: MessagePayload):
     """
@@ -53,22 +111,46 @@ def process_rejection(signal: MessagePayload):
     event_id = str(signal.eventId).strip()
 
     storage = get_casebook_storage()
-    if storage.exists(event_id, terminal_only=True):
-        print(f"\n[API] Skipping Event ID: {event_id}. Terminal casebook already exists.")
-        return {"status": "already_processed", "event_id": event_id}
+    existing_casebook = storage.load(event_id)
+    
+    agent = get_agent()
+    config = {"configurable": {"thread_id": event_id}}
+    state = agent.get_state(config)
+    has_active_checkpoint = bool(state and getattr(state, "next", None))
+
+    if existing_casebook:
+        status = existing_casebook.get("Packet Status", {}).get("Status")
+        terminal_statuses = ("COMPLETED", "REJECTED", "NEEDS_MANUAL_REVIEW", "FAILED_PERMANENT", "DLQ", "FAILED_TIMEOUT")
+        if status in terminal_statuses:
+            print(f"\n[API] Skipping Event ID: {event_id}. Terminal casebook already exists.")
+            return {"status": "already_processed", "event_id": event_id}
+        
+        if status == "IN_PROGRESS":
+            started_at = existing_casebook.get("Metadata - Packet Details", {}).get("started_at", 0)
+            max_age = int(os.environ.get("MAX_IN_PROGRESS_AGE_SECONDS", 1800))
+            is_stale = (time.time() - started_at) > max_age
+            
+            if is_stale and not has_active_checkpoint:
+                print(f"\n[API] Event ID: {event_id} is IN_PROGRESS but stale with no active checkpoint. Reprocessing fresh.")
+            elif has_active_checkpoint:
+                print(f"\n[API] Event ID: {event_id} has active checkpoint. Resuming.")
+
+    # Write IN_PROGRESS stub before invoking graph
+    storage.save(event_id, {
+        "Metadata - Packet Details": {"EID": event_id, "started_at": time.time()},
+        "Packet Status": {"Status": "IN_PROGRESS"}
+    })
 
     log = logger.bind(event_id=event_id)
     log.info("Processing Rejection", state="IN_PROGRESS")
     
-    agent = get_agent()
-    
     # Run the agent with exception handling for DLQ
     log.info("Dispatching payload to LangGraph")
     try:
-        result = agent.invoke(
-            {"payload": signal_dict},
-            config={"configurable": {"thread_id": event_id}}
-        )
+        if has_active_checkpoint:
+            result = agent.invoke(None, config=config)
+        else:
+            result = agent.invoke({"payload": signal_dict}, config=config)
     except Exception as e:
         import traceback
         error_msg = traceback.format_exc()

@@ -5,18 +5,37 @@ from filelock import FileLock
 
 def promote_rules():
     base_dir = os.path.dirname(os.path.dirname(__file__))
-    pending_file = os.path.join(base_dir, "prompts", "pending_rules.jsonl")
-    lock_file = pending_file + ".lock"
-    target_file = os.path.join(base_dir, "prompts", "InvestigatorAgent.md")
+    prompts_dir = os.path.join(base_dir, "prompts")
+    pending_file = os.path.join(prompts_dir, "pending_rules.jsonl")
+    file_lock_path = pending_file + ".lock"
+    promo_lock_path = os.path.join(prompts_dir, "promotion.lock")
+    target_file = os.path.join(prompts_dir, "InvestigatorAgent.md")
     
-    if not os.path.exists(pending_file):
-        print("No pending rules to promote.")
+    # 1. Top-level lock to prevent concurrent promotions by multiple humans/scripts
+    promo_lock = FileLock(promo_lock_path, timeout=0)
+    try:
+        promo_lock.acquire()
+    except Exception:
+        print("Another promotion process is currently running. Exiting.")
         return
         
-    with FileLock(lock_file, timeout=10):
-        with open(pending_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+    try:
+        # 2. Git status check
+        result = subprocess.run(["git", "status", "--porcelain", prompts_dir], capture_output=True, text=True)
+        if result.stdout.strip():
+            print(f"Refusing to promote: uncommitted changes exist in {prompts_dir}")
+            print(result.stdout)
+            return
+
+        if not os.path.exists(pending_file):
+            print("No pending rules to promote.")
+            return
             
+        # 3. Read pending rules holding the file lock briefly
+        with FileLock(file_lock_path, timeout=10):
+            with open(pending_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                
         if not lines:
             print("No pending rules to promote.")
             return
@@ -50,11 +69,14 @@ def promote_rules():
             except Exception as e:
                 print(f"Error processing rule {i+1}: {e}")
                 
-        # Clear the pending file after processing
-        with open(pending_file, "w", encoding="utf-8") as f:
-            pass
-            
+        # Clear the pending file after processing, acquiring lock briefly
+        with FileLock(file_lock_path, timeout=10):
+            with open(pending_file, "w", encoding="utf-8") as f:
+                pass
+                
         print(f"\nFinished. Promoted {promoted_count} rules.")
+    finally:
+        promo_lock.release()
 
 if __name__ == "__main__":
     promote_rules()

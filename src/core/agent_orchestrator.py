@@ -234,6 +234,7 @@ def get_agent():
     
     db_path = os.path.join(base_dir, "checkpoints.db")
     conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
     checkpointer = SqliteSaver(conn)
     _agent = workflow.compile(checkpointer=checkpointer)
     
