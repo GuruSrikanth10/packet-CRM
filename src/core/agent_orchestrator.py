@@ -93,6 +93,31 @@ def get_agent():
             if reason_code:
                 rule_tool = get_tool_by_name("lookup_rule_by_reason_code")
                 db_rule = rule_tool.invoke(reason_code)
+                
+                # Filter DB rule by enrolmentType if multiple rules are returned
+                try:
+                    packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
+                    target_type = "UPDATE" if packet_type == "U" else ("ENROLMENT" if packet_type == "E" else None)
+                    
+                    if target_type and db_rule and db_rule.startswith("["):
+                        import json
+                        rules_list = json.loads(db_rule)
+                        filtered_rules = []
+                        for r in rules_list:
+                            try:
+                                rule_data = json.loads(r.get("rule_data", "{}"))
+                                cond = rule_data.get("statement", {}).get("Condition", {})
+                                str_eq = cond.get("StringEquals", {})
+                                rule_enrol_type = str_eq.get("enrolmentType")
+                                if rule_enrol_type == target_type or not rule_enrol_type:
+                                    filtered_rules.append(r)
+                            except Exception:
+                                filtered_rules.append(r)
+                        
+                        if filtered_rules:
+                            db_rule = json.dumps(filtered_rules)
+                except Exception as e:
+                    print(f"Error filtering rules: {e}")
             else:
                 db_rule = "No errorReasonCode found in payload."
         

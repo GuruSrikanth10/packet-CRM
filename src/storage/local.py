@@ -19,11 +19,11 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
         os.makedirs(target_dir, exist_ok=True)
         return target_dir
 
-    def save(self, event_id: str, casebook: dict) -> None:
+    def save(self, event_id: str, casebook: dict, filename: str = "casebook.json") -> None:
         target_dir = self._get_dir(event_id)
-        final_path = target_dir / "casebook.json"
-        tmp_path = target_dir / "casebook.json.tmp"
-        lock_path = target_dir / "casebook.json.lock"
+        final_path = target_dir / filename
+        tmp_path = target_dir / f"{filename}.tmp"
+        lock_path = target_dir / f"{filename}.lock"
         
         # Enforce schema version for backwards compatibility
         if "schema_version" not in casebook:
@@ -34,10 +34,10 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
                 json.dump(casebook, f, indent=4, ensure_ascii=False)
             os.replace(tmp_path, final_path)
             
-    def load(self, event_id: str) -> Optional[dict]:
+    def load(self, event_id: str, filename: str = "casebook.json") -> Optional[dict]:
         target_dir = self._get_dir(event_id)
-        final_path = target_dir / "casebook.json"
-        lock_path = target_dir / "casebook.json.lock"
+        final_path = target_dir / filename
+        lock_path = target_dir / f"{filename}.lock"
         
         if not final_path.exists():
             return None
@@ -49,8 +49,8 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
             except Exception:
                 return None
                 
-    def exists(self, event_id: str, terminal_only: bool = False) -> bool:
-        data = self.load(event_id)
+    def exists(self, event_id: str, terminal_only: bool = False, filename: str = "casebook.json") -> bool:
+        data = self.load(event_id, filename=filename)
         if not data:
             return False
             

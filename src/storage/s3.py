@@ -6,11 +6,11 @@ class S3CasebookStorage(CasebookStorage):
         # Setup boto3 client, bucket name from env, etc.
         pass
         
-    def save(self, event_id: str, casebook: dict) -> None:
+    def save(self, event_id: str, casebook: dict, filename: str = "casebook.json") -> None:
         raise NotImplementedError("S3CasebookStorage is not yet implemented.")
         
-    def load(self, event_id: str) -> Optional[dict]:
+    def load(self, event_id: str, filename: str = "casebook.json") -> Optional[dict]:
         raise NotImplementedError("S3CasebookStorage is not yet implemented.")
         
-    def exists(self, event_id: str, terminal_only: bool = False) -> bool:
+    def exists(self, event_id: str, terminal_only: bool = False, filename: str = "casebook.json") -> bool:
         raise NotImplementedError("S3CasebookStorage is not yet implemented.")

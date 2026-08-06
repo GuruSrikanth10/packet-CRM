@@ -111,7 +111,8 @@ def process_rejection(signal: MessagePayload):
     event_id = str(signal.eventId).strip()
 
     storage = get_casebook_storage()
-    existing_casebook = storage.load(event_id)
+    existing_casebook = storage.load(event_id, filename="casebook.json")
+    existing_status = storage.load(event_id, filename="status.json")
     
     agent = get_agent()
     config = {"configurable": {"thread_id": event_id}}
@@ -122,24 +123,27 @@ def process_rejection(signal: MessagePayload):
         status = existing_casebook.get("Packet Status", {}).get("Status")
         terminal_statuses = ("COMPLETED", "REJECTED", "NEEDS_MANUAL_REVIEW", "FAILED_PERMANENT", "DLQ", "FAILED_TIMEOUT")
         if status in terminal_statuses:
-            print(f"\n[API] Skipping Event ID: {event_id}. Terminal casebook already exists.")
+            print(f"\\n[API] Skipping Event ID: {event_id}. Terminal casebook already exists.")
             return {"status": "already_processed", "event_id": event_id}
-        
+            
+    if existing_status:
+        status = existing_status.get("Packet Status", {}).get("Status")
         if status == "IN_PROGRESS":
-            started_at = existing_casebook.get("Metadata - Packet Details", {}).get("started_at", 0)
+            started_at = existing_status.get("Metadata - Packet Details", {}).get("started_at", 0)
             max_age = int(os.environ.get("MAX_IN_PROGRESS_AGE_SECONDS", 1800))
             is_stale = (time.time() - started_at) > max_age
             
             if is_stale and not has_active_checkpoint:
-                print(f"\n[API] Event ID: {event_id} is IN_PROGRESS but stale with no active checkpoint. Reprocessing fresh.")
+                print(f"\\n[API] Event ID: {event_id} is IN_PROGRESS but stale with no active checkpoint. Reprocessing fresh.")
             elif has_active_checkpoint:
-                print(f"\n[API] Event ID: {event_id} has active checkpoint. Resuming.")
+                print(f"\\n[API] Event ID: {event_id} has active checkpoint. Resuming.")
+                return {"status": "already_processing_resumed", "event_id": event_id}
 
-    # Write IN_PROGRESS stub before invoking graph
+    # Write IN_PROGRESS stub before invoking graph to status.json
     storage.save(event_id, {
         "Metadata - Packet Details": {"EID": event_id, "started_at": time.time()},
         "Packet Status": {"Status": "IN_PROGRESS"}
-    })
+    }, filename="status.json")
 
     log = logger.bind(event_id=event_id)
     log.info("Processing Rejection", state="IN_PROGRESS")
@@ -174,7 +178,11 @@ def process_rejection(signal: MessagePayload):
         if fenced_match:
             investigation_result = json.loads(fenced_match.group(1))
         else:
-            investigation_result = json.loads(final_message)
+            json_match = re.search(r"(\{.*\})", final_message, re.DOTALL)
+            if json_match:
+                investigation_result = json.loads(json_match.group(1))
+            else:
+                investigation_result = json.loads(final_message)
     except Exception:
         investigation_result = final_message
     
