@@ -233,12 +233,68 @@ def fetch_kubernetes_logs(pod_id: str) -> str:
     """Fetch logs from Kubernetes for a given pod or event identifier."""
     return f"[MOCK] Kubelet logs for {pod_id}: container killed due to OOMKilled state after biometric memory spike."
 
+@tool
+def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, category: str, fromSedaStart: bool, notificationEmail: str, notificationMobile: str) -> str:
+    """Queue a packet for replay through the OIS pipeline."""
+    print(f"\\n[TOOL] queue_for_replay triggered for ID: {id}")
+    
+    payload = {
+        "id": id,
+        "idType": idType,
+        "priority": priority,
+        "operatorName": operatorName,
+        "category": category,
+        "fromSedaStart": fromSedaStart,
+        "notificationEmail": notificationEmail,
+        "notificationMobile": notificationMobile
+    }
+    
+    enable_auto_replay = get_bool_env("ENABLE_AUTO_REPLAY", False)
+    
+    if enable_auto_replay:
+        import requests
+        base_url = os.environ.get("OIS_FEIGN_BASE_URL", "http://10.10.79.62:31261/ois/hold/v1")
+        endpoint = f"{base_url}/api/v1/forceReplay"
+        print(f"[TOOL] Auto-replay enabled. Firing POST to {endpoint}")
+        try:
+            response = requests.post(endpoint, params=payload, timeout=10)
+            response.raise_for_status()
+            return f"Successfully auto-replayed packet {id}: {response.text}"
+        except Exception as e:
+            print(f"[TOOL] Failed to auto-replay {id}: {e}")
+            return f"Failed to replay packet {id} directly: {e}"
+    else:
+        # Append to pending queue
+        import json
+        from filelock import FileLock
+        from datetime import datetime
+        
+        base_dir = os.path.dirname(os.path.dirname(__file__))
+        queue_file = os.path.join(base_dir, "db", "pending_replays.jsonl")
+        os.makedirs(os.path.dirname(queue_file), exist_ok=True)
+        lock_file = queue_file + ".lock"
+        
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "payload": payload
+        }
+        
+        try:
+            with FileLock(lock_file, timeout=10):
+                with open(queue_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\\n")
+            return f"Successfully queued packet {id} for human review before replay."
+        except Exception as e:
+            print(f"[TOOL] Failed to queue replay for {id}: {e}")
+            return f"Failed to queue packet {id}: {e}"
+
 _TOOLS_MAP = {
     "lookup_resident_database": lookup_resident_database,
     "lookup_error_code": lookup_error_code,
     "lookup_rule_by_reason_code": lookup_rule_by_reason_code,
     "fetch_elastic_logs": fetch_elastic_logs,
-    "fetch_kubernetes_logs": fetch_kubernetes_logs
+    "fetch_kubernetes_logs": fetch_kubernetes_logs,
+    "queue_for_replay": queue_for_replay
 }
 
 def get_tool_by_name(name: str):

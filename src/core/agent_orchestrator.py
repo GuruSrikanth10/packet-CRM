@@ -213,7 +213,8 @@ def get_agent():
         investigation = state.get("investigation", "")
         prompt = f"Create the final JSON casebook based strictly on this approved investigation:\n{investigation}"
         
-        synthesis_agent = create_react_agent(llm, tools=[])
+        queue_tool = get_tool_by_name("queue_for_replay")
+        synthesis_agent = create_react_agent(llm, tools=[queue_tool])
         
         @llm_breaker
         @retry_transient

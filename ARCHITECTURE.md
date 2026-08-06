@@ -64,7 +64,6 @@ packet-CRM/
 ├── .agents/                        
 │   └── AGENTS.md                   # Agentic configurations and behavioral rules
 ├── agent_policy_context.md         # Foundational business logic & rules mapping for AI agents
-├── beginner_tech_guide.md          # Beginner-friendly guide explaining all technologies used
 ├── src/
 │   ├── main.py                     # App entry point, daemon lifecycle manager
 │   ├── api/
@@ -74,18 +73,16 @@ packet-CRM/
 │   ├── models/
 │   │   └── schemas.py              # Strict Pydantic data validation schemas
 │   ├── prompts/                    
-│   │   ├── manager.md              # RejectionManager orchestration logic
 │   │   ├── InvestigatorAgent.md    # Investigator context and instructions
 │   │   └── ReviewerAgent.md        # Reviewer context and validation logic
-│   ├── config/                     
-│   │   └── agents.json             # Map of Subagents to their prompts and tools
 │   ├── tools/
-│   │   └── tool_registry.py        # Custom Python tools (DB lookup, self-learning)
+│   │   ├── tool_registry.py        # Custom Python tools (DB lookup, self-learning)
+│   │   └── approve_replays.py      # CLI script for humans to approve packet replays
 │   └── utils/
 │       ├── env.py                  # Environment variable configuration
 │       ├── kafkaConsumer.py        # Background topic polling
 │       ├── llm_utils.py            # Local LLM and HF model factory
-│       └── s3_client.py            # (Disabled) Cloud storage integrations
+│       └── s3_uploader.py          # Uploads large Elastic logs to S3
 ```
 
 ---
@@ -119,6 +116,7 @@ The architecture incorporates several resilience mechanisms to prevent runaway c
 - **Decoupled Consumer & Bounded Concurrency**: `main_consumer.py` isolates the Kafka polling loop and submits tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`). Offsets are committed immediately upon enqueuing.
 - **DLQ, Poison-pill, & Checkpointing**: LangGraph uses `SqliteSaver` (with WAL mode enabled) for scalable crash recovery. Structurally invalid Kafka messages (poison-pills) and unrecoverable pipeline crashes are immediately published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
 - **Pipeline Timeouts**: The overall graph invocation is wrapped in a hard timeout (`PACKET_TIMEOUT_SECONDS`). On timeout, the casebook is marked `FAILED_TIMEOUT` and the worker slot is guaranteed to be released.
+- **Human-in-the-Loop Replays**: Agents cannot fire destructive API requests directly. Replay actions invoked by the LLM are safely queued to `pending_replays.jsonl` and require an operator to approve via `approve_replays.py`.
 - **Safe Self-Learning & Drift Checks**: The Reviewer's `add_learning_rule` tool stages suggestions to `src/prompts/pending_rules.jsonl` using `filelock`. A human runs `src/tools/promote_rules.py` (which includes top-level locking and git-status safety checks) to approve and Git-commit the rules. Additionally, `src/tools/check_drift.py` detects database schema/policy drift.
 - **External Call Resilience**: `tenacity` handles exponential backoff retries, and `pybreaker` provides circuit breakers for database, Elasticsearch, and LLM calls.
 - **Storage Abstraction & Schema Versioning**: The `CasebookStorage` interface implements atomic `.tmp` writes and enforces a `"schema_version"` field on every saved casebook for backwards compatibility.
