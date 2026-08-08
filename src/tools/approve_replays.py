@@ -3,9 +3,15 @@ import os
 import json
 import time
 import requests
+import argparse
 from filelock import FileLock
 
 def main():
+    parser = argparse.ArgumentParser(description="Approve Human-in-the-Loop Replays")
+    parser.add_argument("--approve-all", action="store_true", help="Approve all matching replays without prompting")
+    parser.add_argument("--filter-category", type=str, help="Only process replays with this category")
+    args = parser.parse_args()
+
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     queue_file = os.path.join(base_dir, "db", "pending_replays.jsonl")
     lock_file = queue_file + ".lock"
@@ -44,16 +50,25 @@ def main():
     for i, replay in enumerate(replays):
         payload = replay.get("payload", {})
         packet_id = payload.get("id", "UNKNOWN")
+        category = payload.get("category", "")
         
+        if args.filter_category and args.filter_category.lower() != category.lower():
+            remaining_replays.append(replay)
+            continue
+            
         print("\n" + "="*50)
         print(f"Replay Request {i+1}/{len(replays)}")
         print(f"Timestamp: {replay.get('timestamp')}")
         print(f"Packet ID: {packet_id}")
-        print(f"Category: {payload.get('category')}")
+        print(f"Category: {category}")
         print(f"Priority: {payload.get('priority')}")
         print("="*50)
         
-        action = input("Approve and execute this replay? (y/n/skip): ").strip().lower()
+        if args.approve_all:
+            action = 'y'
+            print("Auto-approving due to --approve-all flag.")
+        else:
+            action = input("Approve and execute this replay? (y/n/skip): ").strip().lower()
         
         if action == 'y':
             print(f"Firing HTTP POST to {endpoint}...")

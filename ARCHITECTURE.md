@@ -77,7 +77,16 @@ packet-CRM/
 │   │   └── ReviewerAgent.md        # Reviewer context and validation logic
 │   ├── tools/
 │   │   ├── tool_registry.py        # Custom Python tools (DB lookup, self-learning)
-│   │   └── approve_replays.py      # CLI script for humans to approve packet replays
+│   │   ├── approve_replays.py      # CLI script for humans to approve packet replays
+│   │   ├── build_catalog.py        # Stage 0: Offline template catalog builder
+│   │   ├── eval_harness.py         # Stage 6: Evaluation harness for pipeline accuracy
+│   │   └── prune_checkpoints.py    # SQLite checkpoint pruning utility
+│   ├── log_pipeline/
+│   │   ├── config.py               # Pipeline constants and tunables
+│   │   ├── catalog.py              # Stage 0: Template classification catalog
+│   │   ├── fetcher.py              # Stage 1: Improved ES fetch (source-filtered, search_after)
+│   │   ├── reducer.py              # Stages 2-4: ERROR branch, Drain3 clustering, guardrails
+│   │   └── pipeline.py             # Top-level orchestrator wiring Stages 1-4
 │   └── utils/
 │       ├── env.py                  # Environment variable configuration
 │       ├── kafkaConsumer.py        # Background topic polling
@@ -113,6 +122,7 @@ Instead of relying on an unpredictable LLM to orchestrate the subagents, the sys
 ### 3.4 Resilience & Hardening (Phase 1 & 2)
 The architecture incorporates several resilience mechanisms to prevent runaway costs, silent failures, file corruption, and pipeline deadlocks:
 - **Idempotency & Staleness Guards**: The API intercepts requests and validates against the `CasebookStorage` interface. `IN_PROGRESS` stubs are written immediately to a separate `status.json` file to prevent duplicate runs without polluting the final `casebook.json`. If an `IN_PROGRESS` stub goes stale (exceeding `MAX_IN_PROGRESS_AGE_SECONDS`), the pipeline safely resumes from a LangGraph checkpoint or fresh start.
+- **6-Stage Log Reduction Pipeline (`src/log_pipeline/`)**: Elasticsearch logs are no longer dumped raw into the LLM context. Instead, they pass through a production-grade pipeline: Stage 1 (source-filtered fetch with `search_after` + `_seq_no` tiebreaker), Stage 2 (branch on ERROR -- stuck packets skip clustering), Stage 3 (Drain3 clustering with file-persisted state for stable template IDs), and Stage 4 (evidence assembly guardrails enforcing decision-vocabulary regex matches, rare-template retention, and flow-boundary context). An offline Stage 0 catalog (`build_catalog.py`) classifies templates as boilerplate/informative/decision-marker, and a Stage 6 eval harness (`eval_harness.py`) validates pipeline accuracy before production use.
 - **Decoupled Consumer & Bounded Concurrency**: `main_consumer.py` isolates the Kafka polling loop and submits tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`). Offsets are committed immediately upon enqueuing.
 - **DLQ, Poison-pill, & Checkpointing**: LangGraph uses `SqliteSaver` (with WAL mode enabled) for scalable crash recovery. Structurally invalid Kafka messages (poison-pills) and unrecoverable pipeline crashes are immediately published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
 - **Pipeline Timeouts**: The overall graph invocation is wrapped in a hard timeout (`PACKET_TIMEOUT_SECONDS`). On timeout, the casebook is marked `FAILED_TIMEOUT` and the worker slot is guaranteed to be released.
@@ -130,11 +140,20 @@ The intelligence of the system relies on a multi-agent hierarchy. Both the Inves
 - **ReviewerAgent**: The auditor. It checks the Investigator's homework to eliminate hallucinations.
 - **SynthesisAgent**: The resolution writer. Once the investigation is validated, this agent synthesizes the findings into plain English, categorizes the remediation steps into strict enums (e.g., `NEW_PACKET`, `REPLAY`), and generates the analytical JSON block.
 
-### 3.4 The Self-Learning Loop (`tool_registry.py`)
+### 3.4 6-Stage Log Reduction Pipeline
+Elasticsearch logs are heavily compressed to prevent LLM context window exhaustion and save tokens, using a production-grade map-reduce and clustering architecture (`src/log_pipeline/`):
+- **Stage 0 (Offline Catalog)**: `build_catalog.py` samples historical logs to identify structural templates, classifying them as `boilerplate`, `informative`, or `decision-marker` based on cross-flow frequency.
+- **Stage 1 (Fetch)**: Source-filters Elastic logs to minimal fields, uses `search_after` with `_seq_no` for stable pagination, and uses catalog-driven `must_not` filters to drop pure boilerplate.
+- **Stage 2 (ERROR Branching)**: Instantly detects `level=ERROR` logs. If found, it trims the trace to the exact error plus a 200-line preceding context window, bypassing clustering entirely to preserve raw crash forensics.
+- **Stage 3 (Drain3 Clustering)**: For non-crashing (logic/rule rejection) flows, it uses Drain3 to strip dynamic noise (UUIDs, IPs) and cluster identical logs into structural templates. Clustering state is file-persisted to keep template IDs stable.
+- **Stage 4 (Evidence Guardrails)**: Regardless of clustering, it forces full-text retention for matches against a decision-vocabulary regex (e.g., `Validation Failed`), rare templates (count < 5), and flow boundaries.
+- **Stage 5 & 6 (LLM & Eval)**: The heavily compressed, structured output is injected into the LLM context. `eval_harness.py` provides an offline safety check to measure evidence-citation accuracy against ground truth before trusting the pipeline in production.
+
+### 3.5 The Self-Learning Loop (`tool_registry.py`)
 If the `ReviewerAgent` spots a mistake (e.g., the Investigator recommended a solution that contradicts the business rule), the Reviewer invokes the `add_learning_rule` tool.
 This tool programmatically opens `src/prompts/InvestigatorAgent.md` and permanently writes a new `- CRITICAL RULE:` constraint to the file. This ensures the system perpetually improves its accuracy on future runs without requiring manual developer intervention.
 
-### 3.5 Storage & Casesheets
+### 3.6 Storage & Casesheets
 Outputs are stored in `local_casesheets/casebook_<event_id>/casebook.json`. 
 To ensure zero hallucinations, `routes.py` deterministically extracts static metadata directly from the Kafka payload. The output is guaranteed to be a highly structured, hierarchical JSON block formatted for downstream systems:
 - **Metadata - Packet Details** (`SRN`, `EID`, `PACKET_TYPE`, etc.)

@@ -36,6 +36,7 @@ def get_agent():
     print("[ORCHESTRATOR] Building Deterministic LangGraph from scratch...")
     base_dir = os.path.dirname(os.path.dirname(__file__))
     llm = get_llm("complex")
+    simple_llm = get_llm("simple")
     
     def load_prompt(filename):
         with open(os.path.join(base_dir, "prompts", filename), "r", encoding="utf-8") as f:
@@ -239,7 +240,7 @@ def get_agent():
         prompt = f"Create the final JSON casebook based strictly on this approved investigation:\n{investigation}"
         
         queue_tool = get_tool_by_name("queue_for_replay")
-        synthesis_agent = create_react_agent(llm, tools=[queue_tool])
+        synthesis_agent = create_react_agent(simple_llm, tools=[queue_tool])
         
         @llm_breaker
         @retry_transient

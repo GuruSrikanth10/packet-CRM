@@ -1,4 +1,5 @@
 import os
+import functools
 import pandas as pd
 from langchain_core.tools import tool
 from sqlalchemy import create_engine
@@ -8,6 +9,22 @@ from src.utils.resilience import retry_transient, db_breaker, es_breaker
 import pybreaker
 
 _DB_CACHE = None
+_LIVE_DB_ENGINE = None
+
+def get_live_db_engine():
+    global _LIVE_DB_ENGINE
+    if _LIVE_DB_ENGINE is None:
+        db_user = get_required_env("DB_USERNAME", "su01")
+        db_pass = get_required_env("DB_PASSWORD", "su01")
+        db_host = get_required_env("DB_HOST", "localhost")
+        db_port = get_required_env("DB_PORT", "3306")
+        db_name = get_required_env("DB_NAME", "uidmasterv1_1")
+        _LIVE_DB_ENGINE = create_engine(
+            f"mysql+pymysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}",
+            pool_size=10, 
+            max_overflow=20
+        )
+    return _LIVE_DB_ENGINE
 
 def _load_mock_db():
     global _DB_CACHE
@@ -63,6 +80,7 @@ def lookup_error_code(error_code: str) -> str:
 @tool
 @db_breaker
 @retry_transient
+@functools.lru_cache(maxsize=128)
 def lookup_rule_by_reason_code(reason_code: str) -> str:
     """Lookup the exact corresponding rule (including ruleId, payload, etc.) for a given reason code."""
     print(f"\n[TOOL] lookup_rule_by_reason_code triggered for: {reason_code}")
@@ -96,13 +114,7 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
     else:
         print(f"[TOOL] Querying LIVE MySQL database for: {reason_code}")
         try:
-            db_user = get_required_env("DB_USERNAME", "su01")
-            db_pass = get_required_env("DB_PASSWORD", "su01")
-            db_host = get_required_env("DB_HOST", "localhost")
-            db_port = get_required_env("DB_PORT", "3306")
-            db_name = get_required_env("DB_NAME", "uidmasterv1_1")
-            
-            engine = create_engine(f"mysql+pymysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}")
+            engine = get_live_db_engine()
             
             # Using pandas to query and format identically to the mock DB approach
             query = "SELECT * FROM rules WHERE reject_reason_code = %s"
@@ -124,109 +136,27 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
 @es_breaker
 @retry_transient
 def fetch_elastic_logs(event_id: str) -> str:
-    """Fetch logs from Elastic for a given event ID using pagination to capture the full trace."""
+    """Fetch and reduce logs from Elastic using the 6-stage log reduction pipeline.
+    
+    Stages:
+      1. Paginated ES fetch with source-filtering and catalog-driven must_not.
+      2. Branch on ERROR presence (stuck path vs approve/reject path).
+      3. Drain3 clustering with persisted state for stable template IDs.
+      4. Evidence assembly guardrails (decision-vocabulary, rare templates, boundaries).
+    
+    Returns a compact, evidence-preserving string for LLM context injection.
+    """
     print(f"\n[TOOL] fetch_elastic_logs triggered for: {event_id}")
     
-    es_host = os.environ.get("ES_HOST")
-    es_user = os.environ.get("ES_USERNAME")
-    es_pass = os.environ.get("ES_PASSWORD")
-    index_pattern = os.environ.get("ES_INDEX_PATTERN", "logs-*")
-    
-    if not es_host:
-        print("[TOOL] ES_HOST not set. Falling back to mock response.")
-        return f"[MOCK] Elastic logs for {event_id}: ERROR - connection timeout. Stacktrace missing."
-        
     try:
-        from elasticsearch import Elasticsearch
-        
-        auth_args = {}
-        if es_user and es_pass:
-            auth_args["basic_auth"] = (es_user, es_pass)
-            
-        es_client = Elasticsearch(
-            es_host,
-            verify_certs=False,
-            **auth_args
-        )
-        
-        query_body = {
-            "query": {
-                "bool": {
-                    "must": [
-                        {
-                            "query_string": {
-                                "query": f'"{event_id}"'
-                            }
-                        }
-                    ],
-                    "filter": [
-                        {
-                            "term": {
-                                "application_name.keyword": "enu-biometric"
-                            }
-                        }
-                    ]
-                }
-            }
-        }
-
-        sort_criteria = [
-            {"@timestamp": {"order": "asc"}},
-            {"_id": {"order": "asc"}}
-        ]
-
-        llm_context = []
-        llm_context.append(f"--- Log Trace for ID: {event_id} ---")
-        
-        search_after_values = None
-        page_size = 500
-        total_fetched = 0
-
-        while True:
-            search_kwargs = {
-                "index": index_pattern,
-                "size": page_size,
-                "sort": sort_criteria,
-                "query": query_body["query"]
-            }
-            
-            if search_after_values:
-                search_kwargs["search_after"] = search_after_values
-
-            response = es_client.search(**search_kwargs)
-            hits = response.get("hits", {}).get("hits", [])
-            
-            if not hits:
-                break
-                
-            for hit in hits:
-                source = hit["_source"]
-                timestamp = source.get("@timestamp", "UNKNOWN_TIME")
-                app_name = source.get("application_name", 
-                           source.get("kubernetes", {}).get("container", {}).get("name", 
-                           source.get("HOSTNAME", "unknown-service")))
-                level = source.get("level", "INFO")
-                log_msg = source.get("message", source.get("msg", str(source)))
-                
-                llm_context.append(f"[{timestamp}] [{app_name}] [{level}] {log_msg}")
-                search_after_values = hit["sort"]
-                
-            total_fetched += len(hits)
-            
-        print(f"[TOOL] Successfully fetched {total_fetched} logs from Elastic!")
-        
-        if total_fetched == 0:
-            return f"No logs found for ID: {event_id}"
-
-        llm_context.append(f"--- End of Trace ({total_fetched} logs total) ---")
-        return "\n".join(llm_context)
-        
+        from src.log_pipeline.pipeline import reduce_logs
+        return reduce_logs(event_id)
     except pybreaker.CircuitBreakerError:
         print("[TOOL] ES Circuit breaker is OPEN. Failing fast.")
         return f"Failed to query Elastic: Circuit Breaker Open"
     except Exception as e:
-        print(f"[TOOL] Failed to fetch Elastic logs: {e}")
-        return f"Failed to query Elastic: {e}"
+        print(f"[TOOL] Log reduction pipeline failed: {e}")
+        return f"Failed to process logs: {e}"
 
 @tool
 def fetch_kubernetes_logs(pod_id: str) -> str:
