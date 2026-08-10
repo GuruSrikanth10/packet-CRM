@@ -32,6 +32,13 @@ def rate_limiter(request: Request):
     client_ip = request.client.host
     current_time = time.time()
     
+    # Periodically evict stale IPs to prevent unbounded memory growth
+    if len(_rate_limits) > 1000:
+        stale_ips = [ip for ip, ts_list in _rate_limits.items() 
+                     if not ts_list or (current_time - max(ts_list)) > RATE_WINDOW]
+        for ip in stale_ips:
+            del _rate_limits[ip]
+    
     # Initialize or clean up old entries
     if client_ip not in _rate_limits:
         _rate_limits[client_ip] = []
@@ -123,7 +130,7 @@ def process_rejection(signal: MessagePayload):
         status = existing_casebook.get("Packet Status", {}).get("Status")
         terminal_statuses = ("COMPLETED", "REJECTED", "NEEDS_MANUAL_REVIEW", "FAILED_PERMANENT", "DLQ", "FAILED_TIMEOUT")
         if status in terminal_statuses:
-            print(f"\\n[API] Skipping Event ID: {event_id}. Terminal casebook already exists.")
+            print(f"\n[API] Skipping Event ID: {event_id}. Terminal casebook already exists.")
             return {"status": "already_processed", "event_id": event_id}
             
     if existing_status:
@@ -134,9 +141,9 @@ def process_rejection(signal: MessagePayload):
             is_stale = (time.time() - started_at) > max_age
             
             if is_stale and not has_active_checkpoint:
-                print(f"\\n[API] Event ID: {event_id} is IN_PROGRESS but stale with no active checkpoint. Reprocessing fresh.")
+                print(f"\n[API] Event ID: {event_id} is IN_PROGRESS but stale with no active checkpoint. Reprocessing fresh.")
             elif has_active_checkpoint:
-                print(f"\\n[API] Event ID: {event_id} has active checkpoint. Resuming.")
+                print(f"\n[API] Event ID: {event_id} has active checkpoint. Resuming.")
                 return {"status": "already_processing_resumed", "event_id": event_id}
 
     # Write IN_PROGRESS stub before invoking graph to status.json
@@ -254,6 +261,15 @@ def process_rejection(signal: MessagePayload):
     
     storage = get_casebook_storage()
     storage.save(event_id, casebook_data)
+    
+    # Clean up the IN_PROGRESS status.json now that we have a final casebook
+    try:
+        storage.save(event_id, {
+            "Metadata - Packet Details": {"EID": event_id},
+            "Packet Status": {"Status": casebook_data["Packet Status"]["Status"]}
+        }, filename="status.json")
+    except Exception:
+        pass  # Non-critical: casebook.json is the source of truth
         
     log.info("Successfully saved finalized Casebook", final_status=casebook_data["Packet Status"]["Status"], state="COMPLETED")
     

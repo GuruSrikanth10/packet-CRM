@@ -61,7 +61,7 @@ def get_agent():
         print("="*50)
         enable_log_fetching = get_bool_env("ENABLE_LOG_FETCHING", False)
         if not enable_log_fetching:
-            print("   ⏩ Skipped: Log fetching is disabled via .env")
+            print("   >> Skipped: Log fetching is disabled via .env")
             return {"logs": "Log fetching disabled."}
             
         event_id = state.get("payload", {}).get("eventId", "")
@@ -71,6 +71,11 @@ def get_agent():
         print("   Logs successfully retrieved!")
         return {"logs": logs}
         
+    # OPT-2: Create agents once during graph construction, not per invocation
+    investigator_agent = create_react_agent(llm, tools=[])
+    queue_tool = get_tool_by_name("queue_for_replay")
+    synthesis_agent = create_react_agent(simple_llm, tools=[queue_tool])
+
     def investigator_node(state: GraphState):
         print("\n" + "="*50)
         print("[STEP 2] INVESTIGATOR NODE")
@@ -101,7 +106,6 @@ def get_agent():
                     target_type = "UPDATE" if packet_type == "U" else ("ENROLMENT" if packet_type == "E" else None)
                     
                     if target_type and db_rule and db_rule.startswith("["):
-                        import json
                         rules_list = json.loads(db_rule)
                         filtered_rules = []
                         for r in rules_list:
@@ -128,8 +132,6 @@ def get_agent():
         prompt += f"Database Rule Configuration:\n{db_rule}\n\n"
         if feedback:
             prompt += f"Reviewer Feedback (You MUST fix your previous analysis): {feedback}\n\n"
-            
-        investigator_agent = create_react_agent(llm, tools=[])
         
         @llm_breaker
         @retry_transient
@@ -238,9 +240,6 @@ def get_agent():
         print("   LLM is compiling the final JSON resolution...")
         investigation = state.get("investigation", "")
         prompt = f"Create the final JSON casebook based strictly on this approved investigation:\n{investigation}"
-        
-        queue_tool = get_tool_by_name("queue_for_replay")
-        synthesis_agent = create_react_agent(simple_llm, tools=[queue_tool])
         
         @llm_breaker
         @retry_transient

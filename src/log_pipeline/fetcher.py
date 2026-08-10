@@ -10,10 +10,6 @@ Improvements over the old fetch_elastic_logs:
 import os
 from typing import Optional
 
-import pybreaker
-
-from src.utils.env import get_required_env
-from src.utils.resilience import retry_transient, es_breaker
 from src.log_pipeline.catalog import TemplateCatalog
 
 
@@ -70,10 +66,10 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None) -> list
     # Source-filter: only pull the fields we need
     source_fields = ["@timestamp", "level", "message", "application_name"]
 
-    # Stable sort with _seq_no tiebreaker
+    # Stable sort with _id tiebreaker (broadly compatible across ES versions)
     sort_criteria = [
         {"@timestamp": {"order": "asc"}},
-        {"_seq_no": {"order": "asc"}},
+        {"_id": {"order": "asc"}},
     ]
 
     # Paginate with search_after ---------------------------------------
@@ -88,6 +84,7 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None) -> list
             "sort": sort_criteria,
             "query": query,
             "_source": source_fields,
+            "seq_no_primary_term": True,
         }
         if search_after_values:
             search_kwargs["search_after"] = search_after_values

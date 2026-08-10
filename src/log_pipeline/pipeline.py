@@ -17,14 +17,25 @@ from src.log_pipeline.fetcher import fetch_logs
 from src.log_pipeline.reducer import branch_on_error, cluster_logs, apply_evidence_guardrails
 
 
+_cached_catalog = None
+
+
+def _get_catalog() -> TemplateCatalog:
+    """Return a module-level cached catalog instance."""
+    global _cached_catalog
+    if _cached_catalog is None:
+        _cached_catalog = TemplateCatalog()
+    return _cached_catalog
+
+
 def reduce_logs(event_id: str) -> str:
     """Run the full log reduction pipeline for an event_id.
 
     Returns a formatted string suitable for LLM context injection.
     Raw logs are also persisted to disk for audit.
     """
-    # Load catalog (may be empty if not yet built -- that's fine)
-    catalog = TemplateCatalog()
+    # Load catalog (cached -- only reads disk once)
+    catalog = _get_catalog()
 
     # ------------------------------------------------------------------
     # Stage 1: Fetch

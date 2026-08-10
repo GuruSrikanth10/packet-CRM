@@ -166,7 +166,7 @@ def fetch_kubernetes_logs(pod_id: str) -> str:
 @tool
 def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, category: str, fromSedaStart: bool, notificationEmail: str, notificationMobile: str) -> str:
     """Queue a packet for replay through the OIS pipeline."""
-    print(f"\\n[TOOL] queue_for_replay triggered for ID: {id}")
+    print(f"\n[TOOL] queue_for_replay triggered for ID: {id}")
     
     payload = {
         "id": id,
@@ -212,7 +212,7 @@ def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, cat
         try:
             with FileLock(lock_file, timeout=10):
                 with open(queue_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry) + "\\n")
+                    f.write(json.dumps(entry) + "\n")
             return f"Successfully queued packet {id} for human review before replay."
         except Exception as e:
             print(f"[TOOL] Failed to queue replay for {id}: {e}")
