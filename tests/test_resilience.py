@@ -26,7 +26,7 @@ DUMMY_PAYLOAD = {
         "srn": "1234567890",
     },
     "packetExecutionSummary": {
-        "packetStatus": "REJECTED",
+        "packetstatus": "REJECTED",
         "errorData": [{"errorReasonCode": "RESIDENT_MAN_DEDUP_REJECT_TD"}],
     }
 }
@@ -60,13 +60,13 @@ def test_loop_guard_max_retries():
             
     storage = get_casebook_storage()
     casebook = storage.load("test-1234")
-    assert casebook["Packet Status"]["Status"] == "NEEDS_MANUAL_REVIEW"
+    assert casebook["packet_status"]["status"] == "NEEDS_MANUAL_REVIEW"
     assert "ESCALATED TO HUMAN REVIEW" in casebook["Resolution"]["Synthesis"]
 
 def test_idempotency_short_circuit():
     storage = get_casebook_storage()
     storage.save("test-1234", {
-        "Packet Status": {"Status": "COMPLETED"}
+        "packet_status": {"status": "COMPLETED"}
     })
     
     with patch("src.core.agent_orchestrator.get_agent") as mock_get_agent:
@@ -102,9 +102,9 @@ def test_atomic_write_interruption():
         
     assert not storage.exists(event_id)
     
-    storage.save(event_id, {"Packet Status": {"Status": "COMPLETED"}})
+    storage.save(event_id, {"packet_status": {"status": "COMPLETED"}})
     assert storage.exists(event_id)
-    assert storage.load(event_id)["Packet Status"]["Status"] == "COMPLETED"
+    assert storage.load(event_id)["packet_status"]["status"] == "COMPLETED"
 
 def test_concurrent_add_learning_rule():
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -141,7 +141,7 @@ def test_dlq_forced_unrecoverable_failure(mock_publish):
         
     storage = get_casebook_storage()
     casebook = storage.load(DUMMY_PAYLOAD["eventId"])
-    assert casebook["Packet Status"]["Status"] == "DLQ"
+    assert casebook["packet_status"]["status"] == "DLQ"
     
     assert len(MOCK_DLQ) == 1
     assert "Hard crash!" in MOCK_DLQ[0]["error"]
@@ -159,7 +159,7 @@ def test_pipeline_timeout_handling():
     
     storage = get_casebook_storage()
     casebook = storage.load(DUMMY_PAYLOAD["eventId"])
-    assert casebook["Packet Status"]["Status"] == "FAILED_TIMEOUT"
+    assert casebook["packet_status"]["status"] == "FAILED_TIMEOUT"
 
 def test_circuit_breaker_mock():
     import pybreaker

@@ -55,7 +55,7 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
             return False
             
         if terminal_only:
-            status = data.get("Packet Status", {}).get("Status")
+            status = data.get("packet_status", {}).get("status")
             # Usually COMPLETED, REJECTED, NEEDS_MANUAL_REVIEW, FAILED_PERMANENT are terminal
             return status in ("COMPLETED", "REJECTED", "NEEDS_MANUAL_REVIEW", "FAILED_PERMANENT", "DLQ", "FAILED_TIMEOUT")
         

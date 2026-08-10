@@ -53,9 +53,9 @@ def _process_and_commit(signal: dict):
         logger.error(f"Timeout forwarding Kafka message Event ID: {event_id}")
         storage = get_casebook_storage()
         storage.save(event_id, {
-            "Metadata - Packet Details": {"EID": event_id},
-            "Packet Status": {"Status": "FAILED_TIMEOUT"},
-            "Resolution": {"Synthesis": "Investigation exceeded maximum allowed time."}
+            "packet_metadata": {"eid": event_id},
+            "packet_status": {"status": "FAILED_TIMEOUT"},
+            "resolution": {"synthesis": "Investigation exceeded maximum allowed time."}
         })
         from src.utils.dlq_publisher import publish_to_dlq
         publish_to_dlq(signal, "Pipeline timed out (PACKET_TIMEOUT_SECONDS exceeded)")

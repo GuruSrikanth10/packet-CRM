@@ -226,9 +226,7 @@ def get_agent():
             "Rejection_description": f"ESCALATED: The automated agents could not agree on a resolution after multiple attempts.\nLast Investigation:\n{investigation}\n\nLast Reviewer Feedback:\n{feedback}",
             "Synthesis": "ESCALATED TO HUMAN REVIEW. The system encountered a complex edge case and exceeded the maximum allowed retries for agentic resolution.",
             "Action": "MANUAL_REVIEW",
-            "Resident_action": "PENDING",
-            "UIDAI_ACTION": "ESCALATE_TO_L2",
-            "Artifact_design": "manual_escalation"
+            "Resident_action": "PENDING"
         }
         # Dump to JSON so routes.py can parse it
         return {"synthesis": json.dumps(escalation_result)}

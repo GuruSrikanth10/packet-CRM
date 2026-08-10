@@ -127,16 +127,17 @@ def process_rejection(signal: MessagePayload):
     has_active_checkpoint = bool(state and getattr(state, "next", None))
 
     if existing_casebook:
-        status = existing_casebook.get("Packet Status", {}).get("Status")
+        status = existing_casebook.get("packet_status", {}).get("status")
         terminal_statuses = ("COMPLETED", "REJECTED", "NEEDS_MANUAL_REVIEW", "FAILED_PERMANENT", "DLQ", "FAILED_TIMEOUT")
         if status in terminal_statuses:
             print(f"\n[API] Skipping Event ID: {event_id}. Terminal casebook already exists.")
             return {"status": "already_processed", "event_id": event_id}
             
     if existing_status:
-        status = existing_status.get("Packet Status", {}).get("Status")
+        status = existing_status.get("packet_status", {}).get("status")
+        
         if status == "IN_PROGRESS":
-            started_at = existing_status.get("Metadata - Packet Details", {}).get("started_at", 0)
+            started_at = existing_status.get("packet_metadata", {}).get("started_at", 0)
             max_age = int(os.environ.get("MAX_IN_PROGRESS_AGE_SECONDS", 1800))
             is_stale = (time.time() - started_at) > max_age
             
@@ -148,8 +149,8 @@ def process_rejection(signal: MessagePayload):
 
     # Write IN_PROGRESS stub before invoking graph to status.json
     storage.save(event_id, {
-        "Metadata - Packet Details": {"EID": event_id, "started_at": time.time()},
-        "Packet Status": {"Status": "IN_PROGRESS"}
+        "packet_metadata": {"eid": event_id, "started_at": time.time()},
+        "packet_status": {"status": "IN_PROGRESS"}
     }, filename="status.json")
 
     log = logger.bind(event_id=event_id)
@@ -170,9 +171,9 @@ def process_rejection(signal: MessagePayload):
         
         # Mark as FAILED_PERMANENT in storage so it doesn't get re-run on redelivery
         storage.save(event_id, {
-            "Metadata - Packet Details": {"EID": event_id},
-            "Packet Status": {"Status": "DLQ"},
-            "Resolution": {"Synthesis": "Failed unrecoverably during pipeline. Sent to DLQ."}
+            "packet_metadata": {"eid": event_id},
+            "packet_status": {"status": "DLQ"},
+            "resolution": {"synthesis": f"Failed with {type(e).__name__}: {str(e)}"}
         })
         return {"status": "dlq", "event_id": event_id, "error": str(e)}
         
@@ -208,7 +209,7 @@ def process_rejection(signal: MessagePayload):
             
     # Handle investigation result defaults if it's not a dict
     if not isinstance(investigation_result, dict):
-        investigation_result = {"Rejection_description": str(investigation_result)}
+        investigation_result = {"rejection_description": str(investigation_result)}
     
     # Handle Rejection_logs logic
     # The original logs fetch string is in result.get("logs") if we passed it back, 
@@ -226,36 +227,34 @@ def process_rejection(signal: MessagePayload):
         processed_logs = raw_logs
         
     casebook_data = {
-        "Metadata - Packet Details": {
-            "SRN": packet_meta.get("srn"),
-            "EID": event_id,
-            "REFID": packet_meta.get("refId"),
-            "SOURCE": signal_dict.get("sourceTopic"),
-            "PACKET_TYPE": packet_meta.get("enrolmentType"),
-            "MBU": None,  # MBU mapping not immediately available in payload
-            "Update_type": None,  # B/D mapping not immediately available
+        "packet_metadata": {
+            "srn": packet_meta.get("srn"),
+            "eid": event_id,
+            "ref_id": packet_meta.get("refId"),
+            "source": signal_dict.get("sourceTopic"),
+            "packet_type": packet_meta.get("enrolmentType"),
+            "is_mbu": None,  # MBU mapping not immediately available in payload
+            "update_type": None,  # B/D mapping not immediately available
             "is_child": None,  # Age determination not immediately available
-            "Created_at": signal_dict.get("eventTimestamp"),
-            "Uploaded_at": signal_dict.get("eventTimestamp")
+            "created_at": signal_dict.get("eventTimestamp"),
+            "uploaded_at": signal_dict.get("eventTimestamp")
         },
-        "Packet Status": {
-            "Status": "NEEDS_MANUAL_REVIEW" if investigation_result.get("Action") == "MANUAL_REVIEW" else exec_summary.get("packetStatus"),
-            "Service": flow_meta.get("stage"),
+        "packet_status": {
+            "status": "NEEDS_MANUAL_REVIEW" if investigation_result.get("action") == "MANUAL_REVIEW" else exec_summary.get("packetStatus"),
+            "service": flow_meta.get("stage"),
             "sub_service": flow_meta.get("subStage"),
             "last_updated": None,
-            "Inprocess": False if exec_summary.get("packetStatus") == "REJECTED" else None,
-            "Rejection Data": {
-                "Rejection_code": rejection_code,
-                "Rejection_description": investigation_result.get("Rejection_description"),
-                "Rejection_logs": processed_logs,
-                "Artifact_design": investigation_result.get("Artifact_design")
+            "is_in_process": False if exec_summary.get("packetStatus") == "REJECTED" else None,
+            "rejection_data": {
+                "rejection_code": rejection_code,
+                "rejection_description": investigation_result.get("rejection_description"),
+                "rejection_logs": processed_logs
             }
         },
-        "Resolution": {
-            "Synthesis": investigation_result.get("Synthesis"),
-            "Action": investigation_result.get("Action"),
-            "Resident_action": investigation_result.get("Resident_action"),
-            "UIDAI_ACTION": investigation_result.get("UIDAI_ACTION")
+        "resolution": {
+            "synthesis": investigation_result.get("synthesis"),
+            "action": investigation_result.get("action"),
+            "resident_action": investigation_result.get("resident_action")
         }
     }
     
@@ -265,12 +264,12 @@ def process_rejection(signal: MessagePayload):
     # Clean up the IN_PROGRESS status.json now that we have a final casebook
     try:
         storage.save(event_id, {
-            "Metadata - Packet Details": {"EID": event_id},
-            "Packet Status": {"Status": casebook_data["Packet Status"]["Status"]}
+            "packet_metadata": {"eid": event_id},
+            "packet_status": {"status": casebook_data["packet_status"]["status"]}
         }, filename="status.json")
-    except Exception:
-        pass  # Non-critical: casebook.json is the source of truth
+    except Exception as e:
+        log.error("Failed to update status.json after completion", error=str(e), exc_info=True)
         
-    log.info("Successfully saved finalized Casebook", final_status=casebook_data["Packet Status"]["Status"], state="COMPLETED")
+    log.info("Successfully saved finalized Casebook", final_status=casebook_data["packet_status"]["status"], state="COMPLETED")
     
     return {"status": "processed", "event_id": event_id}
