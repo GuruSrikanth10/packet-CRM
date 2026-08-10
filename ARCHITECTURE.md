@@ -149,14 +149,18 @@ Elasticsearch logs are heavily compressed to prevent LLM context window exhausti
 - **Stage 2 (ERROR Branching)**: Instantly detects `level=ERROR` logs. If found, it trims the trace to the exact error plus a 200-line preceding context window, bypassing clustering entirely to preserve raw crash forensics.
 - **Stage 3 (Drain3 Clustering)**: For non-crashing (logic/rule rejection) flows, it uses Drain3 to strip dynamic noise (UUIDs, IPs) and cluster identical logs into structural templates. Clustering state is file-persisted to keep template IDs stable.
 - **Stage 4 (Evidence Guardrails)**: Regardless of clustering, it forces full-text retention for matches against a decision-vocabulary regex (e.g., `Validation Failed`), rare templates (count < 5), and flow boundaries.
-- **Stage 5 & 6 (LLM & Eval)**: The heavily compressed, structured output is injected into the LLM context. `eval_harness.py` provides an offline safety check to measure evidence-citation accuracy against ground truth before trusting the pipeline in production.
+- **Stage 5 & 6 (LLM & Eval)**: The heavily compressed, structured output is injected into the LLM context (and simultaneously persisted to `reduced_logs.txt` for human audits). `eval_harness.py` provides an offline safety check to measure evidence-citation accuracy against ground truth before trusting the pipeline in production.
 
 ### 3.5 The Self-Learning Loop (`tool_registry.py`)
 If the `ReviewerAgent` spots a mistake (e.g., the Investigator recommended a solution that contradicts the business rule), the Reviewer invokes the `add_learning_rule` tool.
 This tool programmatically opens `src/prompts/InvestigatorAgent.md` and permanently writes a new `- CRITICAL RULE:` constraint to the file. This ensures the system perpetually improves its accuracy on future runs without requiring manual developer intervention.
 
 ### 3.6 Storage & Casesheets
-Outputs are stored in `local_casesheets/casebook_<event_id>/casebook.json`. 
+Outputs are stored in `local_casesheets/casebook_<event_id>/`. This directory contains:
+- `casebook.json`: The final structured JSON block.
+- `raw_logs.txt`: The complete uncompressed Elasticsearch log trace.
+- `reduced_logs.txt`: The heavily compressed logs that were injected into the LLM.
+
 To ensure zero hallucinations, `routes.py` deterministically extracts static metadata directly from the Kafka payload. The output is guaranteed to be a highly structured, hierarchical JSON block formatted for downstream systems:
 - **packet_metadata** (`srn`, `eid`, `packet_type`, etc.)
 - **packet_status** (`status`, `service`, `rejection_data`)

@@ -38,7 +38,9 @@ When a packet fails, it triggers a `reject_reason_code` based on JSON rule condi
 - `numberOfUniqueCandidates > 0` -> (For Enrolment) Matches were found. Biometrics are not unique.
 - `isApplicantWhiteListed: false` -> The resident triggered a manual review threshold but lacked the necessary whitelisting override to bypass it.
 - `isApplicantWrongFaceCapture: true` -> The photo uploaded was invalid (e.g., closed eyes, multiple faces), violating capture quality rules.
-- `isFirstTimeBioUpdate: false` -> Indicates this is a standard update, meaning they must match their own parent Aadhaar. If they matched a different parent (`numberOfCandidatesWithDifferentParent > 0`), it's a biometric mix-up.
+- `"enrolmentType": "UPDATE"` AND `isFirstTimeBioUpdate: true` -> Indicates this is a **MANDATORY BIOMETRIC UPDATE (MBU)**. Treat this strictly as an Enrolment (1:N deduplication) since it is their first time giving biometrics.
+- `"enrolmentType": "UPDATE"` AND `isFirstTimeBioUpdate: false` -> Indicates this is a **STANDARD BIOMETRIC UPDATE**. They must match their own parent Aadhaar. If they matched a different parent (`numberOfCandidatesWithDifferentParent > 0`), it's a biometric mix-up.
+- **DEFAULT OVERRIDE**: If `isFirstTimeBioUpdate` is completely missing from the rule data, you MUST check the Elasticsearch logs. If neither source specifies it, you MUST assume it is a **STANDARD BIOMETRIC UPDATE**.
 
 ---
 

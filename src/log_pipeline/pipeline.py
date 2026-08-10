@@ -57,7 +57,9 @@ def reduce_logs(event_id: str) -> str:
         for log in raw_logs:
             lines.append(f"[{log['timestamp']}] [{log['app_name']}] [{log['level']}] {log['message']}")
         lines.append(f"--- End of Trace ({total_fetched} logs total) ---")
-        return "\n".join(lines)
+        formatted = "\n".join(lines)
+        _save_reduced_logs(event_id, formatted)
+        return formatted
 
     # ------------------------------------------------------------------
     # Stage 2: Branch on ERROR
@@ -66,7 +68,9 @@ def reduce_logs(event_id: str) -> str:
 
     if branch_result["has_error"]:
         # Stuck path: format the trimmed context directly
-        return _format_error_path(event_id, branch_result["payload"], total_fetched, log_file_path)
+        formatted = _format_error_path(event_id, branch_result["payload"], total_fetched, log_file_path)
+        _save_reduced_logs(event_id, formatted)
+        return formatted
 
     # ------------------------------------------------------------------
     # Stage 3: Clustering (approve/reject path)
@@ -81,7 +85,9 @@ def reduce_logs(event_id: str) -> str:
     # ------------------------------------------------------------------
     # Format for LLM injection
     # ------------------------------------------------------------------
-    return _format_normal_path(event_id, assembled, total_fetched, log_file_path)
+    formatted = _format_normal_path(event_id, assembled, total_fetched, log_file_path)
+    _save_reduced_logs(event_id, formatted)
+    return formatted
 
 
 # ======================================================================
@@ -174,4 +180,19 @@ def _save_raw_logs(event_id: str, logs: list[dict]) -> str:
         return log_file_path
     except Exception as e:
         print(f"[PIPELINE] Failed to save raw logs: {e}")
+        return "Failed to save"
+
+def _save_reduced_logs(event_id: str, reduced_text: str) -> str:
+    """Write reduced logs to disk and return the file path."""
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        log_dir = os.path.join(base_dir, "local_casesheets", f"casebook_{event_id}")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file_path = os.path.join(log_dir, "reduced_logs.txt")
+        with open(log_file_path, "w", encoding="utf-8") as f:
+            f.write(reduced_text)
+        print(f"[PIPELINE] Saved reduced logs to {log_file_path}")
+        return log_file_path
+    except Exception as e:
+        print(f"[PIPELINE] Failed to save reduced logs: {e}")
         return "Failed to save"

@@ -74,7 +74,7 @@ def get_agent():
     # OPT-2: Create agents once during graph construction, not per invocation
     investigator_agent = create_react_agent(llm, tools=[])
     queue_tool = get_tool_by_name("queue_for_replay")
-    synthesis_agent = create_react_agent(simple_llm, tools=[queue_tool])
+    synthesis_agent = create_react_agent(llm, tools=[queue_tool])
 
     def investigator_node(state: GraphState):
         print("\n" + "="*50)

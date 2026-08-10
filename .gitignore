@@ -8,3 +8,10 @@ abd/
 *.log
 
 src/checkpoints.db
+
+local_casesheets/
+local_checkpoints/
+*.db
+*.db-shm
+*.db-wal
+

@@ -32,19 +32,43 @@ def get_llm(tier: str = "complex"):
         )
         return ChatHuggingFace(llm=llm)
     else:
-        from langchain_openai import ChatOpenAI
-        if tier == "complex":
-            model = os.environ.get("LLM_MODEL_COMPLEX", "glm-5.2-fp8")
-            base_url = os.environ.get("LLM_BASE_URL_COMPLEX", "http://localhost:8000/v1")
-            api_key = os.environ.get("LLM_API_KEY_COMPLEX", "dummy")
+        use_mistral = os.environ.get("MOCK_LLM_WITH_MISTRAL", "false").lower() == "true"
+        
+        if use_mistral:
+            try:
+                from langchain_mistralai import ChatMistralAI
+            except ImportError:
+                raise ImportError("Please install langchain-mistralai to use Mistral: pip install langchain-mistralai")
+                
+            if tier == "complex":
+                model = os.environ.get("MISTRAL_MODEL_COMPLEX", "mistral-large-latest")
+                api_key = os.environ.get("LLM_API_KEY_COMPLEX", "dummy")
+            else:
+                model = os.environ.get("MISTRAL_MODEL_SIMPLE", "mistral-small-latest")
+                api_key = os.environ.get("LLM_API_KEY_SIMPLE", "dummy")
+                # Fallback to complex key if simple key wasn't explicitly set
+                if api_key == "dummy":
+                    api_key = os.environ.get("LLM_API_KEY_COMPLEX", "dummy")
+                
+            return ChatMistralAI(
+                model=model,
+                mistral_api_key=api_key,
+                temperature=0
+            )
         else:
-            model = os.environ.get("LLM_MODEL_SIMPLE", "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8")
-            base_url = os.environ.get("LLM_BASE_URL_SIMPLE", "http://localhost:8000/v1")
-            api_key = os.environ.get("LLM_API_KEY_SIMPLE", "dummy")
-            
-        return ChatOpenAI(
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            temperature=0
-        )
+            from langchain_openai import ChatOpenAI
+            if tier == "complex":
+                model = os.environ.get("LLM_MODEL_COMPLEX", "glm-5.2-fp8")
+                base_url = os.environ.get("LLM_BASE_URL_COMPLEX", "http://localhost:8000/v1")
+                api_key = os.environ.get("LLM_API_KEY_COMPLEX", "dummy")
+            else:
+                model = os.environ.get("LLM_MODEL_SIMPLE", "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8")
+                base_url = os.environ.get("LLM_BASE_URL_SIMPLE", "http://localhost:8000/v1")
+                api_key = os.environ.get("LLM_API_KEY_SIMPLE", "dummy")
+                
+            return ChatOpenAI(
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                temperature=0
+            )
