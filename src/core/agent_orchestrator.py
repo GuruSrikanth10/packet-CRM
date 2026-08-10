@@ -223,10 +223,10 @@ def get_agent():
         
         # We format it to match the expected JSON structure so routes.py parses it
         escalation_result = {
-            "Rejection_description": f"ESCALATED: The automated agents could not agree on a resolution after multiple attempts.\nLast Investigation:\n{investigation}\n\nLast Reviewer Feedback:\n{feedback}",
-            "Synthesis": "ESCALATED TO HUMAN REVIEW. The system encountered a complex edge case and exceeded the maximum allowed retries for agentic resolution.",
-            "Action": "MANUAL_REVIEW",
-            "Resident_action": "PENDING"
+            "rejection_description": f"ESCALATED: The automated agents could not agree on a resolution after multiple attempts.\nLast Investigation:\n{investigation}\n\nLast Reviewer Feedback:\n{feedback}",
+            "synthesis": "ESCALATED TO HUMAN REVIEW. The system encountered a complex edge case and exceeded the maximum allowed retries for agentic resolution.",
+            "action": "MANUAL_REVIEW",
+            "resident_action": "PENDING"
         }
         # Dump to JSON so routes.py can parse it
         return {"synthesis": json.dumps(escalation_result)}
