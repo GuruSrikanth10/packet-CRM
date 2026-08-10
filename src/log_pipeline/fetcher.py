@@ -8,6 +8,7 @@ Improvements over the old fetch_elastic_logs:
   - Returns structured dicts, not raw formatted strings.
 """
 import os
+import json
 from typing import Optional
 
 from src.log_pipeline.catalog import TemplateCatalog
@@ -20,6 +21,50 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None) -> list
     Sorted by @timestamp ASC with _seq_no tiebreaker.
     """
     print(f"\n[FETCHER] Fetching logs for: {event_id}")
+
+    # --- Testing/Mock Mode: Load logs from a local CSV file ---
+    mock_file = os.environ.get("ES_MOCK_FILE")
+    if mock_file:
+        print(f"[FETCHER] ES_MOCK_FILE set. Loading logs from {mock_file}.")
+        logs = []
+        try:
+            with open(mock_file, 'r', encoding='utf-8') as f:
+                # Skip the header line
+                next(f, None)
+                for line in f:
+                    # Extract the JSON object from the line
+                    start_idx = line.find('{')
+                    end_idx = line.rfind('}')
+                    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                        log_json_str = line[start_idx:end_idx+1]
+                        
+                        # Kibana CSV exports often escape quotes as ""
+                        if '""' in log_json_str:
+                            log_json_str = log_json_str.replace('""', '"')
+                            
+                        # Filter by event_id if provided (skips logs not matching the event)
+                        if event_id and event_id not in log_json_str:
+                            continue
+                            
+                        try:
+                            source = json.loads(log_json_str)
+                            logs.append({
+                                "timestamp": source.get("@timestamp", "UNKNOWN_TIME"),
+                                "level": source.get("level", "INFO"),
+                                "message": source.get("message", str(source)),
+                                "app_name": source.get("application_name", "unknown-service"),
+                            })
+                        except json.JSONDecodeError as e:
+                            print(f"[FETCHER] Skipped line due to JSON decode error: {e}")
+                            print(f"[FETCHER] Problematic JSON: {log_json_str[:150]}...")
+                            continue
+            # Sort by timestamp to mimic Elasticsearch's ascending order
+            logs.sort(key=lambda x: x["timestamp"])
+            print(f"[FETCHER] Loaded {len(logs)} logs from file.")
+            return logs
+        except Exception as e:
+            print(f"[FETCHER] Error loading mock file: {e}")
+            return []
 
     es_host = os.environ.get("ES_HOST")
     es_user = os.environ.get("ES_USERNAME")
