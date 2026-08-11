@@ -632,7 +632,8 @@ criteria are met.**
 | 5 | **Complete** | `src/tools/fetch_pod_logs.py` operator CLI. 16 tests. Rotation detection was corrected during this phase: it now uses the *unfiltered* stream boundary and is suppressed when the pod is younger than the missing span (see 5.8). |
 | 6 | **Complete** | `src/log_pipeline/redaction.py`, wired into retrieval after filtering and before return. 20 tests including the over-redaction guard. |
 | 7 | **Complete** | `k8s/retry.py` (per-status predicate + jittered backoff), `k8s_breaker`, wall-clock fetch deadline. 26 tests. |
-| 8-10 | Not started | |
+| 8 | **Complete** | `src/log_pipeline/snapshot.py` (atomic JSONL + meta, gap replay), `src/tools/prune_casesheets.py`. 18 tests. |
+| 9-10 | Not started | |
 
 Full suite: 191 passed.
 
