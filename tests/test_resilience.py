@@ -2,6 +2,7 @@ import os
 import json
 import time
 import pytest
+from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 import threading
 import concurrent.futures
@@ -10,6 +11,7 @@ from src.storage.factory import get_casebook_storage
 from src.core.agent_orchestrator import get_agent
 from src.api.routes import process_rejection
 from src.models.schemas import MessagePayload
+from src.utils.paths import CHECKPOINT_DB_PATH
 
 # --- Mock DLQ for assertions ---
 MOCK_DLQ = []
@@ -26,7 +28,7 @@ DUMMY_PAYLOAD = {
         "srn": "1234567890",
     },
     "packetExecutionSummary": {
-        "packetstatus": "REJECTED",
+        "packetStatus": "REJECTED",
         "errorData": [{"errorReasonCode": "RESIDENT_MAN_DEDUP_REJECT_TD"}],
     }
 }
@@ -38,6 +40,14 @@ def clean_environment():
     if hasattr(storage, 'base_dir'):
         import shutil
         shutil.rmtree(storage.base_dir, ignore_errors=True)
+    # Also wipe the LangGraph checkpoint DB -- otherwise retry_count and
+    # other graph state leak between tests that share a thread_id/eventId
+    # (this is what produced a stale `retry_count: 5` against a fresh
+    # "test-1234" invocation before this fix).
+    for suffix in ("", "-wal", "-shm"):
+        db_file = Path(str(CHECKPOINT_DB_PATH) + suffix)
+        if db_file.exists():
+            db_file.unlink()
     os.environ["MAX_INVESTIGATION_RETRIES"] = "2"
     os.environ["MAX_IN_PROGRESS_AGE_SECONDS"] = "1"
     os.environ["PACKET_TIMEOUT_SECONDS"] = "2"
@@ -61,7 +71,7 @@ def test_loop_guard_max_retries():
     storage = get_casebook_storage()
     casebook = storage.load("test-1234")
     assert casebook["packet_status"]["status"] == "NEEDS_MANUAL_REVIEW"
-    assert "ESCALATED TO HUMAN REVIEW" in casebook["Resolution"]["Synthesis"]
+    assert "ESCALATED TO HUMAN REVIEW" in casebook["resolution"]["synthesis"]
 
 def test_idempotency_short_circuit():
     storage = get_casebook_storage()
@@ -69,7 +79,7 @@ def test_idempotency_short_circuit():
         "packet_status": {"status": "COMPLETED"}
     })
     
-    with patch("src.core.agent_orchestrator.get_agent") as mock_get_agent:
+    with patch("src.api.routes.get_agent") as mock_get_agent:
         res = process_rejection(MessagePayload(**DUMMY_PAYLOAD))
         assert res["status"] == "already_processed"
         mock_get_agent.assert_not_called()

@@ -1,5 +1,11 @@
 from typing import Optional, List, Any, Dict
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# eventId is interpolated directly into filesystem paths (local casebook
+# storage) and S3 keys. Left unconstrained, a value like "../../something"
+# escapes the storage root even though this arrives API-key-protected and
+# straight off a Kafka topic (0.11).
+EVENT_ID_PATTERN = r"^[A-Za-z0-9_.:-]{1,128}$"
 
 class ErrorData(BaseModel):
     type: Optional[str] = None
@@ -14,7 +20,7 @@ class PacketExecutionSummary(BaseModel):
     isValidationSuccess: Optional[bool] = None
 
 class MessagePayload(BaseModel):
-    eventId: str
+    eventId: str = Field(pattern=EVENT_ID_PATTERN)
     category: Optional[str] = None
     eventType: Optional[str] = None
     eventTimestamp: Optional[str] = None

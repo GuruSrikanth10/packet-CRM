@@ -1,5 +1,11 @@
 import os
 
+# Neither ChatOpenAI nor ChatMistralAI had a bound timeout, so a hung model
+# could keep the API thread alive indefinitely (0.8). max_retries=0 hands
+# retry ownership entirely to `tenacity` (see resilience.retry_transient) so
+# the two don't compound into surprising multi-minute retry storms.
+LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "60"))
+
 def get_llm(tier: str = "complex"):
     """
     Centralized LLM factory.
@@ -46,14 +52,13 @@ def get_llm(tier: str = "complex"):
             else:
                 model = os.environ.get("MISTRAL_MODEL_SIMPLE", "mistral-small-latest")
                 api_key = os.environ.get("LLM_API_KEY_SIMPLE", "dummy")
-                # Fallback to complex key if simple key wasn't explicitly set
-                if api_key == "dummy":
-                    api_key = os.environ.get("LLM_API_KEY_COMPLEX", "dummy")
                 
             return ChatMistralAI(
                 model=model,
                 mistral_api_key=api_key,
-                temperature=0
+                temperature=0,
+                timeout=LLM_TIMEOUT_SECONDS,
+                max_retries=0
             )
         else:
             from langchain_openai import ChatOpenAI
@@ -70,5 +75,7 @@ def get_llm(tier: str = "complex"):
                 model=model,
                 base_url=base_url,
                 api_key=api_key,
-                temperature=0
+                temperature=0,
+                timeout=LLM_TIMEOUT_SECONDS,
+                max_retries=0
             )

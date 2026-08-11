@@ -12,8 +12,22 @@ from src.utils.env import get_bool_env
 from src.tools.tool_registry import get_tool_by_name
 from src.utils.resilience import retry_transient, llm_breaker
 from src.utils.logging_config import get_logger
+from src.utils.paths import CHECKPOINT_DB_PATH
 
 logger = get_logger(__name__)
+
+def is_reviewer_approved(feedback: str) -> bool:
+    """Return True only if the Reviewer's verdict is an unqualified APPROVED.
+
+    A naive `"APPROVED" in feedback.upper()` substring check also matches
+    "NOT APPROVED", "DISAPPROVED", or prose like "this is not approved
+    because...", silently skipping the QC loop. The Reviewer is instructed to
+    reply with exactly 'APPROVED' when findings are valid, so requiring the
+    (markdown/whitespace-stripped) verdict to *start with* that token is both
+    correct for the happy path and closed against negation phrasing.
+    """
+    normalized = (feedback or "").strip().strip("*_`\"' \t\n\r").upper()
+    return normalized.startswith("APPROVED")
 
 class GraphState(TypedDict):
     payload: dict
@@ -195,13 +209,13 @@ def get_agent():
         return {"reviewer_feedback": feedback, "retry_count": state.get("retry_count", 0) + 1}
 
     def check_approval(state: GraphState):
-        feedback = state.get("reviewer_feedback", "").upper()
+        feedback = state.get("reviewer_feedback", "")
         retry_count = state.get("retry_count", 0)
         max_retries = int(os.environ.get("MAX_INVESTIGATION_RETRIES", 3))
         event_id = state.get("payload", {}).get("eventId", "unknown")
         log = logger.bind(event_id=event_id, retry_count=retry_count)
-        
-        if "APPROVED" in feedback:
+
+        if is_reviewer_approved(feedback):
             log.info("Reviewer APPROVED findings", transition="synthesis")
             return "synthesis"
         elif retry_count >= max_retries:
@@ -265,8 +279,8 @@ def get_agent():
     workflow.add_edge("synthesize", END)
     workflow.add_edge("escalate", END)
     
-    db_path = os.path.join(base_dir, "checkpoints.db")
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    os.makedirs(CHECKPOINT_DB_PATH.parent, exist_ok=True)
+    conn = sqlite3.connect(str(CHECKPOINT_DB_PATH), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     checkpointer = SqliteSaver(conn)
     _agent = workflow.compile(checkpointer=checkpointer)

@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 import sqlite3
-import os
 import argparse
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from src.utils.paths import CHECKPOINT_DB_PATH, REPO_ROOT
 
 def main():
     parser = argparse.ArgumentParser(description="Prune LangGraph checkpoints for completed packets.")
     parser.add_argument("--dry-run", action="store_true", help="Print what would be deleted without actually deleting")
     args = parser.parse_args()
 
-    # The SQLite DB is located at local_checkpoints/checkpoints.db
-    base_dir = Path(__file__).resolve().parent.parent.parent
-    db_path = base_dir / "local_checkpoints" / "checkpoints.db"
-    
+    base_dir = REPO_ROOT
+    db_path = CHECKPOINT_DB_PATH
+
     if not db_path.exists():
         print(f"Database not found at {db_path}")
         return

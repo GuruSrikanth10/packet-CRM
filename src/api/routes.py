@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import concurrent.futures
 from fastapi import APIRouter, Depends, HTTPException, Security, Request
 from fastapi.security import APIKeyHeader
 import time
@@ -12,6 +13,27 @@ from src.utils.dlq_publisher import publish_to_dlq
 from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# Statuses written by another actor (e.g. the consumer's own timeout handler,
+# or the DLQ path on a previous attempt) that a slow, late-finishing agent
+# run must never overwrite with a stale "successful" result.
+_PROTECTED_TERMINAL_STATUSES = ("FAILED_TIMEOUT", "DLQ")
+
+
+def _get_agent_invoke_timeout_seconds() -> float:
+    """Server-side budget for a single agent.invoke() call.
+
+    The consumer's HTTP client gives up after PACKET_TIMEOUT_SECONDS (default
+    300s) and marks the packet FAILED_TIMEOUT / DLQ on its own. Without a
+    server-side budget, the API thread keeps running an already-abandoned
+    investigation and can later overwrite that terminal status with a
+    "successful" result once the LLM call finally returns (0.8). Read at
+    call time (not module import time) so it tracks PACKET_TIMEOUT_SECONDS
+    when that is reconfigured, e.g. in tests.
+    """
+    packet_timeout = float(os.environ.get("PACKET_TIMEOUT_SECONDS", "300"))
+    default_budget = max(packet_timeout - 30, 30)
+    return float(os.environ.get("agent_invoke_timeout_seconds", default_budget))
 
 router = APIRouter()
 
@@ -78,15 +100,16 @@ def health_check():
 @router.get("/ready")
 def readiness_check():
     import sqlite3
-    import os
-    from pathlib import Path
     from src.utils.dlq_publisher import get_producer
-    
-    # Check SQLite connectivity
-    db_path = Path(__file__).resolve().parent.parent.parent / "local_checkpoints" / "checkpoints.db"
+    from src.utils.paths import CHECKPOINT_DB_PATH
+
+    # Check SQLite connectivity. A missing DB file should fail the probe,
+    # not be silently created by sqlite3.connect().
     db_ready = False
     try:
-        conn = sqlite3.connect(db_path)
+        if not CHECKPOINT_DB_PATH.exists():
+            raise FileNotFoundError(f"Checkpoint DB not found at {CHECKPOINT_DB_PATH}")
+        conn = sqlite3.connect(str(CHECKPOINT_DB_PATH))
         conn.execute("SELECT 1")
         conn.close()
         db_ready = True
@@ -120,19 +143,22 @@ def process_rejection(signal: MessagePayload):
     storage = get_casebook_storage()
     existing_casebook = storage.load(event_id, filename="casebook.json")
     existing_status = storage.load(event_id, filename="status.json")
-    
-    agent = get_agent()
-    config = {"configurable": {"thread_id": event_id}}
-    state = agent.get_state(config)
-    has_active_checkpoint = bool(state and getattr(state, "next", None))
 
+    # Check terminal short-circuit before provisioning the agent or touching
+    # the checkpoint DB -- an already-terminal packet has no business paying
+    # for either.
     if existing_casebook:
         status = existing_casebook.get("packet_status", {}).get("status")
         terminal_statuses = ("COMPLETED", "REJECTED", "NEEDS_MANUAL_REVIEW", "FAILED_PERMANENT", "DLQ", "FAILED_TIMEOUT")
         if status in terminal_statuses:
             print(f"\n[API] Skipping Event ID: {event_id}. Terminal casebook already exists.")
             return {"status": "already_processed", "event_id": event_id}
-            
+
+    agent = get_agent()
+    config = {"configurable": {"thread_id": event_id}}
+    state = agent.get_state(config)
+    has_active_checkpoint = bool(state and getattr(state, "next", None))
+
     if existing_status:
         status = existing_status.get("packet_status", {}).get("status")
         
@@ -146,6 +172,12 @@ def process_rejection(signal: MessagePayload):
             elif has_active_checkpoint:
                 print(f"\n[API] Event ID: {event_id} has active checkpoint. Resuming.")
                 return {"status": "already_processing_resumed", "event_id": event_id}
+            else:
+                # Not stale, and no active checkpoint: a run is in flight but
+                # between checkpoint writes. Treat as already processing
+                # instead of falling through to a full duplicate reprocess.
+                print(f"\n[API] Event ID: {event_id} is IN_PROGRESS and not stale. Skipping duplicate invocation.")
+                return {"status": "already_processing", "event_id": event_id}
 
     # Write IN_PROGRESS stub before invoking graph to status.json
     storage.save(event_id, {
@@ -158,17 +190,41 @@ def process_rejection(signal: MessagePayload):
     
     # Run the agent with exception handling for DLQ
     log.info("Dispatching payload to LangGraph")
+    agent_invoke_timeout_seconds = _get_agent_invoke_timeout_seconds()
+    invoke_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         if has_active_checkpoint:
-            result = agent.invoke(None, config=config)
+            future = invoke_executor.submit(agent.invoke, None, config=config)
         else:
-            result = agent.invoke({"payload": signal_dict}, config=config)
+            # retry_count is explicitly reset here: thread_id is the eventId,
+            # and a redelivered "fresh" invocation (no active checkpoint) can
+            # otherwise resume a persisted checkpoint whose retry_count is
+            # already at/over MAX_INVESTIGATION_RETRIES, escalating instantly
+            # without doing any work (0.5).
+            future = invoke_executor.submit(
+                agent.invoke, {"payload": signal_dict, "retry_count": 0}, config=config
+            )
+        try:
+            result = future.result(timeout=agent_invoke_timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            log.error(
+                "Agent invocation exceeded server-side budget",
+                exc_info=False,
+                state="FAILED_TIMEOUT",
+                timeout_seconds=agent_invoke_timeout_seconds,
+            )
+            storage.save(event_id, {
+                "packet_metadata": {"eid": event_id},
+                "packet_status": {"status": "FAILED_TIMEOUT"},
+                "resolution": {"synthesis": f"Investigation exceeded the server-side budget of {agent_invoke_timeout_seconds}s."}
+            }, filename="status.json")
+            return {"status": "failed_timeout", "event_id": event_id}
     except Exception as e:
         import traceback
         error_msg = traceback.format_exc()
         log.error("Unhandled exception during agent processing", exc_info=True, state="DLQ")
         publish_to_dlq(signal_dict, error_msg)
-        
+
         # Mark as FAILED_PERMANENT in storage so it doesn't get re-run on redelivery
         storage.save(event_id, {
             "packet_metadata": {"eid": event_id},
@@ -176,7 +232,11 @@ def process_rejection(signal: MessagePayload):
             "resolution": {"synthesis": f"Failed with {type(e).__name__}: {str(e)}"}
         })
         return {"status": "dlq", "event_id": event_id, "error": str(e)}
-        
+    finally:
+        # Don't block the response on a hung/slow invocation still running in
+        # the background thread -- the timeout path above has already reacted.
+        invoke_executor.shutdown(wait=False)
+
     log.info("Agent investigation complete", state="COMPLETED_GRAPH")
     final_message = result.get("synthesis", "{}")
     
@@ -259,8 +319,23 @@ def process_rejection(signal: MessagePayload):
     }
     
     storage = get_casebook_storage()
+
+    # Guard against overwriting a terminal status another actor already
+    # recorded while this invocation was still in flight -- e.g. the
+    # consumer's own client-side timeout fired and wrote FAILED_TIMEOUT/DLQ
+    # before this slow LLM call finally returned (0.8).
+    current_status_doc = storage.load(event_id, filename="status.json")
+    current_status = (current_status_doc or {}).get("packet_status", {}).get("status")
+    if current_status in _PROTECTED_TERMINAL_STATUSES:
+        log.warning(
+            "Discarding late result; a terminal status was already recorded by another actor",
+            recorded_status=current_status,
+            state=current_status,
+        )
+        return {"status": "already_processed", "event_id": event_id}
+
     storage.save(event_id, casebook_data)
-    
+
     # Clean up the IN_PROGRESS status.json now that we have a final casebook
     try:
         storage.save(event_id, {

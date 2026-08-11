@@ -28,9 +28,9 @@ sequenceDiagram
     API->>API: Validate via Pydantic (MessagePayload)
     API->>M: Invoke Orchestrator
     
-    M->>I: Dispatch for Investigation
-    I->>T: lookup_rule_by_reason_code
-    I->>T: lookup_resident_database
+    M->>T: lookup_rule_by_reason_code (pre-fetched in Python)
+    T-->>M: Rule row(s), filtered by enrolmentType
+    M->>I: Dispatch payload + logs + rule for Investigation
     I-->>M: Return detailed technical findings
     
     M->>R: Dispatch findings for Validation
@@ -38,14 +38,14 @@ sequenceDiagram
     
     alt Mistake Detected
         R->>T: add_learning_rule()
-        T->>FS: Appends constraint to InvestigatorAgent.md
-        R-->>M: Return corrected findings
+        T->>FS: Stages proposal to src/prompts/pending_rules.jsonl
+        R-->>M: Return corrective feedback (loop back to I)
     else Validated
-        R-->>M: Confirm findings
+        R-->>M: Reply "APPROVED"
     end
     
     M->>S: Dispatch for Synthesis
-    S->>S: Formulate Resolution & Action Enums
+    S->>T: queue_for_replay (only if Action is REPLAY/QC_REPLAY)
     S-->>M: Return strict analytical JSON
     
     M-->>API: Pass analytical JSON to backend
@@ -61,38 +61,66 @@ The repository follows standard Python backend architecture for modularity and s
 
 ```text
 packet-CRM/
-├── .agents/                        
+├── .agents/
 │   └── AGENTS.md                   # Agentic configurations and behavioral rules
 ├── agent_policy_context.md         # Foundational business logic & rules mapping for AI agents
+├── start.py                        # Process supervisor: spawns main_api.py + main_consumer.py
+├── local_run.py                    # CLI: POST a local packet JSON to the running API
+├── test_payload.py                 # Static Pydantic validation smoke test
+├── rules.csv                       # Rules export used by check_drift.py
+├── tests/
+│   └── test_resilience.py          # Resilience/idempotency/DLQ regression tests
 ├── src/
-│   ├── main.py                     # App entry point, daemon lifecycle manager
+│   ├── main_api.py                 # FastAPI entry point (uvicorn, port 8000)
+│   ├── main_consumer.py            # Kafka consumer entry point (separate process)
 │   ├── api/
-│   │   └── routes.py               # REST endpoints (/process-rejection)
+│   │   └── routes.py               # REST endpoints (/process-rejection, /health, /ready)
 │   ├── core/
-│   │   └── agent_orchestrator.py   # LangGraph initialization and LLM provisioning
+│   │   └── agent_orchestrator.py   # LangGraph StateGraph build + LLM provisioning
 │   ├── models/
 │   │   └── schemas.py              # Strict Pydantic data validation schemas
-│   ├── prompts/                    
+│   ├── prompts/
 │   │   ├── InvestigatorAgent.md    # Investigator context and instructions
-│   │   └── ReviewerAgent.md        # Reviewer context and validation logic
+│   │   ├── ReviewerAgent.md        # Reviewer context and validation logic
+│   │   ├── SynthesisAgent.md       # Synthesis output contract (strict JSON keys)
+│   │   └── pending_rules.jsonl     # Staged self-learning proposals (human-gated)
+│   ├── storage/
+│   │   ├── base.py                 # CasebookStorage Protocol
+│   │   ├── local.py                # Atomic .tmp + filelock local filesystem backend
+│   │   ├── s3.py                   # S3 backend (stub, NotImplementedError)
+│   │   └── factory.py              # Backend selection via CASEBOOK_STORAGE_BACKEND
+│   ├── db/
+│   │   └── pending_replays.jsonl   # Human-in-the-loop replay queue
 │   ├── tools/
-│   │   ├── tool_registry.py        # Custom Python tools (DB lookup, self-learning)
+│   │   ├── tool_registry.py        # Custom Python tools (DB lookup, logs, replay queue)
 │   │   ├── approve_replays.py      # CLI script for humans to approve packet replays
+│   │   ├── promote_rules.py        # CLI script to promote + git-commit learned rules
+│   │   ├── check_drift.py          # rules.csv schema drift detector
 │   │   ├── build_catalog.py        # Stage 0: Offline template catalog builder
 │   │   ├── eval_harness.py         # Stage 6: Evaluation harness for pipeline accuracy
 │   │   └── prune_checkpoints.py    # SQLite checkpoint pruning utility
 │   ├── log_pipeline/
 │   │   ├── config.py               # Pipeline constants and tunables
 │   │   ├── catalog.py              # Stage 0: Template classification catalog
-│   │   ├── fetcher.py              # Stage 1: Improved ES fetch (source-filtered, search_after)
+│   │   ├── fetcher.py              # Stage 1: Source-filtered ES fetch + search_after
 │   │   ├── reducer.py              # Stages 2-4: ERROR branch, Drain3 clustering, guardrails
 │   │   └── pipeline.py             # Top-level orchestrator wiring Stages 1-4
 │   └── utils/
 │       ├── env.py                  # Environment variable configuration
-│       ├── kafkaConsumer.py        # Background topic polling
-│       ├── llm_utils.py            # Local LLM and HF model factory
+│       ├── config_validator.py     # Fail-fast boot-time configuration validation
+│       ├── logging_config.py       # structlog JSON logging setup
+│       ├── kafkaConsumer.py        # Background topic polling + bounded worker pool
+│       ├── llm_utils.py            # LLM factory (local OpenAI-compatible / Mistral / HF)
+│       ├── resilience.py           # tenacity retries + pybreaker circuit breakers
+│       ├── dlq_publisher.py        # Dead Letter Queue producer
 │       └── s3_uploader.py          # Uploads large Elastic logs to S3
+├── local_casesheets/               # Generated: casebook_<eventId>/{casebook,status}.json, logs
+└── local_checkpoints/              # Generated: consumer heartbeat, drain3 state, catalog
 ```
+
+> Note: the LangGraph SQLite checkpoint file is currently written to `src/checkpoints.db`,
+> while `/ready` and `prune_checkpoints.py` look for it under `local_checkpoints/`.
+> See section 5 (Known Gaps).
 
 ---
 
@@ -105,28 +133,33 @@ The system manages all operational feature flags, LLM credentials, MySQL databas
 - **Security:** The actual `.env` file is excluded via `.gitignore` to prevent secret leakage.
 
 ### 3.2 Environment & Local LLM Integration (`llm_utils.py`)
-Unlike generic AI projects bound to OpenAI, `packet-CRM` is designed for on-premise, secure environments. 
-The `get_llm(tier="complex")` factory dynamic routes requests to custom, locally hosted models via `LLM_BASE_URL_COMPLEX` (e.g., `http://localhost:8000/v1`). 
-Additionally, it provides a seamless fallback to free Hugging Face endpoints by simply toggling the `USE_HF=true` environment variable.
+Unlike generic AI projects bound to OpenAI, `packet-CRM` is designed for on-premise, secure environments.
+`get_llm(tier)` is a three-way factory selected by environment flags, in priority order:
+1. `USE_HF=true` -> `ChatHuggingFace` over `HuggingFaceEndpoint` (requires `HF_TOKEN`).
+2. `MOCK_LLM_WITH_MISTRAL=true` -> `ChatMistralAI` (development/demo path, requires `langchain-mistralai`).
+3. Default -> `ChatOpenAI` pointed at an OpenAI-compatible local endpoint via `LLM_BASE_URL_COMPLEX` (e.g. `http://localhost:8000/v1`).
 
-### 2.2 Core Pipeline (Deterministic StateGraph)
+The factory accepts `tier="complex"` and `tier="simple"`. Only the `complex` tier is
+consumed by the graph today; the `simple` tier is constructed but unused.
+
+### 3.3 Core Pipeline (Deterministic StateGraph)
 Instead of relying on an unpredictable LLM to orchestrate the subagents, the system uses a highly robust, strictly deterministic Python `StateGraph` (via `langgraph`) in `src/core/agent_orchestrator.py`. This ensures the exact sequential execution of every step.
 
 1. **Log Fetcher Node**: (If `ENABLE_LOG_FETCHING=true`) Automatically triggers the `fetch_elastic_logs` tool to pull relevant Kibana traces using the `eventId`.
-2. **Investigator Node**: A React agent that receives the raw Kafka payload and the Elastic logs. The database rule (e.g., `lookup_rule_by_reason_code`) is pre-fetched in Python and injected into the agent's prompt to drastically optimize database calls and prevent redundant queries.
-3. **Reviewer Node**: A distinct React agent that acts as a strict QC validator. It evaluates the Investigator's technical analysis.
-4. **Conditional Router & Loop Guard**: A pure Python control edge that checks the Reviewer's output. If the Reviewer rejects, it increments a `retry_count`. If retries exceed `MAX_INVESTIGATION_RETRIES`, it routes to the `EscalateToHuman` node (preventing infinite LLM loops). Otherwise, it forcefully loops back to the Investigator Node.
-5. **Synthesis Node**: The final agent that takes the approved, heavily vetted technical diagnosis and translates it into a human-readable JSON `Casebook`.
-6. **Log Processor & S3 Uploader**: After the graph completes, Python evaluates the fetched Elasticsearch logs. Traces under 5000 characters are embedded directly into the casebook `Rejection_logs` field. Massive traces are automatically uploaded to AWS S3 via `boto3` (`src/utils/s3_uploader.py`), and the resulting `s3://...` URL is embedded instead.
+2. **Investigator Node**: A React agent constructed with an **empty tool list**. All external lookups are performed deterministically in Python before the call: `lookup_rule_by_reason_code` is invoked by the node itself, the result is filtered by `enrolmentType`, and the rule text is injected into the prompt. This removes a whole class of tool-call hallucination and redundant DB round-trips.
+3. **Reviewer Node**: A distinct React agent that acts as a strict QC validator, holding one tool (`add_learning_rule`). It is rebuilt per invocation because the tool closes over the current `event_id` and investigation text.
+4. **Conditional Router & Loop Guard**: A pure Python control edge that checks the Reviewer's output. It approves when the literal token `APPROVED` appears in the (upper-cased) feedback. Otherwise it increments `retry_count`; once `retry_count >= MAX_INVESTIGATION_RETRIES` it routes to the `escalate` node (preventing infinite LLM loops), else it loops back to the Investigator Node.
+5. **Synthesis Node**: The final agent that takes the approved, heavily vetted technical diagnosis and translates it into a human-readable JSON `Casebook`. It holds the `queue_for_replay` tool.
+6. **Log Processor & S3 Uploader**: After the graph completes, `routes.py` evaluates the reduced log text carried in graph state. Text under 5000 characters is embedded directly into the casebook `packet_status.rejection_data.rejection_logs` field. Larger payloads are uploaded to AWS S3 via `boto3` (`src/utils/s3_uploader.py`), and the resulting `s3://...` URL is embedded instead. If `S3_LOGS_BUCKET` is unset, a mock `s3://mock-bucket/...` URL is substituted and the text is not persisted remotely.
 
 ### 3.4 Resilience & Hardening (Phase 1 & 2)
 The architecture incorporates several resilience mechanisms to prevent runaway costs, silent failures, file corruption, and pipeline deadlocks:
 - **Idempotency & Staleness Guards**: The API intercepts requests and validates against the `CasebookStorage` interface. `IN_PROGRESS` stubs are written immediately to a separate `status.json` file to prevent duplicate runs without polluting the final `casebook.json`. Upon successful completion, `status.json` is overwritten with the terminal status. If an `IN_PROGRESS` stub goes stale (exceeding `MAX_IN_PROGRESS_AGE_SECONDS`), the pipeline safely resumes from a LangGraph checkpoint or fresh start. Terminal statuses include `COMPLETED`, `REJECTED`, `NEEDS_MANUAL_REVIEW`, `FAILED_PERMANENT`, `DLQ`, and `FAILED_TIMEOUT`.
-- **6-Stage Log Reduction Pipeline (`src/log_pipeline/`)**: Elasticsearch logs are no longer dumped raw into the LLM context. Instead, they pass through a production-grade pipeline: Stage 1 (source-filtered fetch with `search_after` + `_seq_no` tiebreaker, and local Kibana CSV mock support for offline testing), Stage 2 (branch on ERROR -- stuck packets skip clustering), Stage 3 (Drain3 clustering with file-persisted state for stable template IDs), and Stage 4 (evidence assembly guardrails enforcing decision-vocabulary regex matches, rare-template retention, and flow-boundary context). An offline Stage 0 catalog (`build_catalog.py`) classifies templates as boilerplate/informative/decision-marker, and a Stage 6 eval harness (`eval_harness.py`) validates pipeline accuracy before production use.
+- **6-Stage Log Reduction Pipeline (`src/log_pipeline/`)**: Elasticsearch logs are no longer dumped raw into the LLM context. Instead, they pass through a production-grade pipeline: Stage 1 (source-filtered fetch with `search_after` and an `_id` tiebreaker for broad ES version compatibility, plus local Kibana CSV mock support via `ES_MOCK_FILE` for offline testing), Stage 2 (branch on ERROR -- stuck packets skip clustering), Stage 3 (Drain3 clustering with file-persisted state for stable template IDs), and Stage 4 (evidence assembly guardrails enforcing decision-vocabulary regex matches, rare-template retention, and flow-boundary context). An offline Stage 0 catalog (`build_catalog.py`) classifies templates as boilerplate/informative/decision-marker, and a Stage 6 eval harness (`eval_harness.py`) validates pipeline accuracy before production use.
 - **Decoupled Consumer & Bounded Concurrency**: `main_consumer.py` isolates the Kafka polling loop and submits tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`). Offsets are committed immediately upon enqueuing.
 - **DLQ, Poison-pill, & Checkpointing**: LangGraph uses `SqliteSaver` (with WAL mode enabled) for scalable crash recovery. Structurally invalid Kafka messages (poison-pills) and unrecoverable pipeline crashes are immediately published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
-- **Pipeline Timeouts**: The overall graph invocation is wrapped in a hard timeout (`PACKET_TIMEOUT_SECONDS`). On timeout, the casebook is marked `FAILED_TIMEOUT` and the worker slot is guaranteed to be released.
-- **Human-in-the-Loop Replays**: Agents cannot fire destructive API requests directly. Replay actions invoked by the LLM are safely queued to `pending_replays.jsonl` and require an operator to approve via `approve_replays.py`.
+- **Pipeline Timeouts**: `PACKET_TIMEOUT_SECONDS` is applied as the **consumer-side HTTP client timeout** in `kafkaConsumer.py`. When it fires, the consumer marks the casebook `FAILED_TIMEOUT`, publishes to the DLQ, and releases the worker slot. Note this bounds the consumer, not the server: the API-side graph invocation itself is not currently wrapped in a hard timeout, so a hung LLM call can outlive the client deadline. See section 5 (Known Gaps).
+- **Human-in-the-Loop Replays**: Agents cannot fire destructive API requests directly. Unless `ENABLE_AUTO_REPLAY=true`, replay actions invoked by the LLM are queued to `src/db/pending_replays.jsonl` under a `filelock` and require an operator to approve via `approve_replays.py`.
 - **Safe Self-Learning & Drift Checks**: The Reviewer's `add_learning_rule` tool stages suggestions to `src/prompts/pending_rules.jsonl` using `filelock`. A human runs `src/tools/promote_rules.py` (which includes top-level locking and git-status safety checks) to approve and Git-commit the rules. Additionally, `src/tools/check_drift.py` detects database schema/policy drift.
 - **External Call Resilience**: `tenacity` handles exponential backoff retries, and `pybreaker` provides circuit breakers for database, Elasticsearch, and LLM calls.
 - **Storage Abstraction & Schema Versioning**: The `CasebookStorage` interface implements atomic `.tmp` writes and enforces a `"schema_version"` field on every saved casebook for backwards compatibility.
@@ -134,15 +167,15 @@ The architecture incorporates several resilience mechanisms to prevent runaway c
 - **Agent Caching**: Investigator and Synthesis React agents are created once at graph construction time and reused across invocations, avoiding per-packet LLM handshake overhead.
 - **Rate Limiter Eviction**: The in-memory IP rate limiter evicts stale entries when it exceeds 1000 tracked IPs to prevent unbounded memory growth.
 
-### 3.3 The Agent Ecosystem
+### 3.5 The Agent Ecosystem
 The intelligence of the system relies on a multi-agent hierarchy. Both the Investigator and Synthesis agents are strictly instructed to reference the business logic outlined in `agent_policy_context.md` to understand success criteria and parse deviations correctly.
 - **Dynamic Context Injection**: The Python orchestrator dynamically intercepts and filters database rules (e.g., checking the `enrolmentType` from the payload) before injecting the exact correct rule into the agent's prompt to avoid LLM hallucinations.
-- **RejectionManagerAgent**: The conductor. It reads the payload and coordinates a strict sequential pipeline. It cannot solve problems itself.
-- **InvestigatorAgent**: The detective. It actively queries databases to correlate error codes (`reasonCode`) with internal business rules (`ruleId`) and determines the technical failure.
+- **RejectionManager (not an LLM)**: The conductor is the compiled `StateGraph` itself, not an agent. Routing is plain Python, so the sequence of steps cannot be altered by a model.
+- **InvestigatorAgent**: The detective. It correlates error codes (`reasonCode`) with the internal business rule (`ruleId`) that the orchestrator pre-fetched for it, cross-references the reduced Elasticsearch trace, and determines the technical failure. It holds no tools of its own.
 - **ReviewerAgent**: The auditor. It checks the Investigator's homework to eliminate hallucinations.
 - **SynthesisAgent**: The resolution writer. Once the investigation is validated, this agent synthesizes the findings into plain English, categorizes the remediation steps into strict enums (e.g., `NEW_PACKET`, `REPLAY`), and generates the analytical JSON block.
 
-### 3.4 6-Stage Log Reduction Pipeline
+### 3.6 6-Stage Log Reduction Pipeline
 Elasticsearch logs are heavily compressed to prevent LLM context window exhaustion and save tokens, using a production-grade map-reduce and clustering architecture (`src/log_pipeline/`):
 - **Stage 0 (Offline Catalog)**: `build_catalog.py` samples historical logs to identify structural templates, classifying them as `boilerplate`, `informative`, or `decision-marker` based on cross-flow frequency.
 - **Stage 1 (Fetch)**: Source-filters Elastic logs to minimal fields, uses `search_after` with `_seq_no` for stable pagination, and uses catalog-driven `must_not` filters to drop pure boilerplate.
@@ -151,20 +184,33 @@ Elasticsearch logs are heavily compressed to prevent LLM context window exhausti
 - **Stage 4 (Evidence Guardrails)**: Regardless of clustering, it forces full-text retention for matches against a decision-vocabulary regex (e.g., `Validation Failed`), rare templates (count < 5), and flow boundaries.
 - **Stage 5 & 6 (LLM & Eval)**: The heavily compressed, structured output is injected into the LLM context (and simultaneously persisted to `reduced_logs.txt` for human audits). `eval_harness.py` provides an offline safety check to measure evidence-citation accuracy against ground truth before trusting the pipeline in production.
 
-### 3.5 The Self-Learning Loop (`tool_registry.py`)
-If the `ReviewerAgent` spots a mistake (e.g., the Investigator recommended a solution that contradicts the business rule), the Reviewer invokes the `add_learning_rule` tool.
-This tool programmatically opens `src/prompts/InvestigatorAgent.md` and permanently writes a new `- CRITICAL RULE:` constraint to the file. This ensures the system perpetually improves its accuracy on future runs without requiring manual developer intervention.
+### 3.7 The Self-Learning Loop (human-gated)
+If the `ReviewerAgent` spots a mistake (e.g., the Investigator recommended a solution that contradicts the business rule), the Reviewer invokes the `add_learning_rule` tool, defined inline in `agent_orchestrator.reviewer_node`.
 
-### 3.6 Storage & Casesheets
+The tool does **not** mutate any prompt directly. It appends a JSON proposal
+(`eventId`, timestamp, proposed rule, reviewer reasoning, original investigator output)
+to `src/prompts/pending_rules.jsonl` under a `filelock`. A human then runs
+`src/tools/promote_rules.py`, which refuses to run if `src/prompts/` has uncommitted
+changes, prompts per rule, appends approved ones to `src/prompts/InvestigatorAgent.md`
+as `- CRITICAL RULE:` lines, and Git-commits each promotion. This keeps the learning
+loop auditable and prevents an LLM from silently rewriting its own instructions.
+
+### 3.8 Storage & Casesheets
 Outputs are stored in `local_casesheets/casebook_<event_id>/`. This directory contains:
-- `casebook.json`: The final structured JSON block.
+- `casebook.json`: The final structured JSON block (terminal state only).
+- `status.json`: The in-flight lifecycle marker (`IN_PROGRESS`, then the terminal status).
 - `raw_logs.txt`: The complete uncompressed Elasticsearch log trace.
 - `reduced_logs.txt`: The heavily compressed logs that were injected into the LLM.
+- `*.lock` / `*.tmp`: `filelock` and atomic-write scratch files.
 
-To ensure zero hallucinations, `routes.py` deterministically extracts static metadata directly from the Kafka payload. The output is guaranteed to be a highly structured, hierarchical JSON block formatted for downstream systems:
-- **packet_metadata** (`srn`, `eid`, `packet_type`, etc.)
-- **packet_status** (`status`, `service`, `rejection_data`)
-- **Resolution** (Generated by the `SynthesisAgent` containing `Synthesis`, `Action`, `Resident_action`, etc.)
+To ensure zero hallucinations, `routes.py` deterministically extracts static metadata directly from the Kafka payload. All keys are `snake_case`. The output is a hierarchical JSON block formatted for downstream systems:
+- **packet_metadata** (`srn`, `eid`, `ref_id`, `source`, `packet_type`, `created_at`, ...)
+- **packet_status** (`status`, `service`, `sub_service`, `rejection_data`)
+- **resolution** (Generated by the `SynthesisAgent`: `synthesis`, `action`, `resident_action`)
+- **schema_version** (injected by the storage layer, currently `"1.0"`)
+
+`packet_metadata.is_mbu`, `update_type`, and `is_child` are currently emitted as `null`
+because the mapping is not derivable from the payload alone.
 
 ---
 
@@ -193,13 +239,22 @@ To ensure zero hallucinations, `routes.py` deterministically extracts static met
    ```
 
 2. **Configuration:**
-   Ensure environment variables like `USE_MOCK_DB=true` and `LLM_BASE_URL_COMPLEX` are configured.
+   Copy `.env.example` to `.env` and set at minimum `USE_MOCK_DB`, `MOCK_DB_PATH`,
+   `LLM_BASE_URL_COMPLEX` / `LLM_MODEL_COMPLEX`, and `PACKET_CRM_API_KEY`.
+   For fully offline runs, set `ES_MOCK_FILE` to a Kibana CSV export.
 
-3. **Start the Server:**
+3. **Start both services:**
    ```bash
-   python3 src/main.py
+   python3 start.py
    ```
-   *Note: This starts both the FastAPI server on port 8000 and the daemon Kafka consumer.*
+   *This supervisor spawns `src/main_api.py` (FastAPI on port 8000) and
+   `src/main_consumer.py` (Kafka consumer) as two separate processes.*
+
+   To run them individually:
+   ```bash
+   python3 src/main_api.py        # API only
+   python3 src/main_consumer.py   # Consumer only
+   ```
 
 ### 4.2 API Documentation (Swagger UI)
 Because the application is built on FastAPI with populated metadata, interactive API documentation is automatically generated.
@@ -208,6 +263,40 @@ Because the application is built on FastAPI with populated metadata, interactive
 
 4. **Testing Pipeline (No Kafka Required):**
    ```bash
-   python3 test_payload.py
+   python3 test_payload.py                 # static Pydantic validation smoke test
+   python3 local_run.py path/to/packet.json # POST a real packet to a running API
+   python3 -m pytest tests/ -q             # resilience regression suite
    ```
-   *This statically parses a mock Kafka payload through the expanded Pydantic models to ensure validation logic is intact.*
+
+### 4.3 Operator CLIs
+```bash
+python3 -m src.tools.promote_rules       # review + git-commit staged learning rules
+python3 -m src.tools.approve_replays     # approve queued packet replays
+python3 -m src.tools.check_drift         # detect rules.csv schema drift
+python3 -m src.tools.prune_checkpoints --dry-run
+python3 -m src.tools.build_catalog --refids-file refids.txt
+python3 -m src.tools.eval_harness --test-cases test_cases.json
+```
+
+---
+
+## 5. Known Gaps & Deviations
+
+This section records where the running code diverges from the design intent above.
+It is maintained deliberately so the document stays a truthful source of truth.
+
+| # | Area | Gap |
+|---|------|-----|
+| 1 | Checkpoint path | The graph writes `src/checkpoints.db`, but `/ready` and `prune_checkpoints.py` read `local_checkpoints/checkpoints.db`. `/ready` therefore never reports ready, and pruning never finds the database. |
+| 2 | Drain3 state scope | `cluster_logs` emits every cluster in the persisted parse tree, so templates first seen in *other* packets appear in this packet's evidence with counts that are not from this flow. This also skews `build_catalog.py` toward classifying everything as boilerplate. |
+| 3 | Approval detection | The router matches the substring `APPROVED`, so reviewer text such as "NOT APPROVED" or "DISAPPROVED" routes to synthesis. |
+| 4 | Checkpoint reuse | `thread_id` is the `eventId`, and `retry_count` persists in the checkpoint, so a redelivered packet can resume with the retry budget already exhausted. |
+| 5 | Server-side timeout | `PACKET_TIMEOUT_SECONDS` bounds only the consumer's HTTP client. No timeout is configured on the LLM clients or on `agent.invoke`. |
+| 6 | LLM retry coverage | `TRANSIENT_EXCEPTIONS` lists `requests`/`urllib3`/ES/SQLAlchemy errors. `langchain-openai` raises `openai`/`httpx` exceptions, which are not matched, so LLM calls are not actually retried. |
+| 7 | Investigator tooling | `InvestigatorAgent.md` instructs the model to call `lookup_rule_by_reason_code`, but the node is built with `tools=[]`. The rule is pre-fetched instead; the prompt has not been updated to match. |
+| 8 | Env naming | `.env` defines `*_MEDIUM` / `*_BASIC` tiers while `llm_utils.py` and `.env.example` use `*_SIMPLE`. `config_validator.py` requires `OPENAI_API_KEY`, which no code path reads. |
+| 9 | Rule cache | `lookup_rule_by_reason_code` is wrapped in an unbounded-lifetime `lru_cache`, so both stale rules and transient DB error strings persist for the process lifetime. |
+| 10 | Consumer offsets | `consumer.commit()` commits all fetched offsets, including messages later in the batch that have not yet been enqueued. |
+| 11 | Test suite | `tests/test_resilience.py::test_loop_guard_max_retries` still asserts the pre-rename `Resolution`/`Synthesis` keys and fails. |
+
+A prioritised remediation plan for these items is tracked separately.

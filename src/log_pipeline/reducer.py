@@ -8,7 +8,10 @@ Stage 4: Evidence assembly guardrails.
 import json
 import os
 import re
+import threading
 from typing import Optional
+
+from filelock import FileLock
 
 from src.log_pipeline.config import (
     DECISION_VOCABULARY_REGEX,
@@ -17,6 +20,12 @@ from src.log_pipeline.config import (
     RARE_TEMPLATE_THRESHOLD,
 )
 from src.log_pipeline.catalog import TemplateCatalog
+
+# Serializes access to the shared, file-persisted Drain3 parse tree so two
+# packets processed concurrently in this process never read-modify-write the
+# state file at the same time (0.2). The FileLock below extends the same
+# protection across process boundaries (e.g. API + consumer).
+_drain3_intraprocess_lock = threading.Lock()
 
 
 # ======================================================================
@@ -74,58 +83,76 @@ def cluster_logs(logs: list[dict], catalog: Optional[TemplateCatalog] = None) ->
 
     os.makedirs(DRAIN3_STATE_DIR, exist_ok=True)
     state_file = os.path.join(DRAIN3_STATE_DIR, "drain3_state.bin")
+    lock_file = state_file + ".lock"
 
-    # Use file persistence so template IDs stay stable across runs
-    persistence = FilePersistence(state_file)
-    config = TemplateMinerConfig()
-    template_miner = TemplateMiner(persistence, config)
+    # Hold both locks for the entire construct-feed-persist cycle so no other
+    # thread/process can interleave a read-modify-write on the shared parse
+    # tree (0.2), and so the cluster set below reflects only this call's logs.
+    with _drain3_intraprocess_lock, FileLock(lock_file, timeout=30):
+        # Use file persistence so template IDs stay stable across runs
+        persistence = FilePersistence(state_file)
+        config = TemplateMinerConfig()
+        template_miner = TemplateMiner(persistence, config)
 
-    # Track per-cluster metadata as we feed logs
-    # cluster_id -> {first_seen, last_seen, examples, count}
-    cluster_meta: dict[int, dict] = {}
+        # Track per-cluster metadata as we feed logs
+        # cluster_id -> {first_seen, last_seen, examples, count}
+        cluster_meta: dict[int, dict] = {}
+        # Only clusters actually touched by *this* call's logs may be emitted --
+        # template_miner.drain.clusters holds every cluster ever seen across
+        # every packet, since the parse tree is shared and file-persisted.
+        seen_cluster_ids: set[int] = set()
 
-    for log_entry in logs:
-        msg = log_entry.get("message", "")
-        ts = log_entry.get("timestamp", "")
+        for log_entry in logs:
+            msg = log_entry.get("message", "")
+            ts = log_entry.get("timestamp", "")
 
-        result = template_miner.add_log_message(msg)
-        cluster_id = result["cluster_id"]
+            result = template_miner.add_log_message(msg)
+            cluster_id = result["cluster_id"]
+            seen_cluster_ids.add(cluster_id)
 
-        if cluster_id not in cluster_meta:
-            cluster_meta[cluster_id] = {
-                "first_seen": ts,
-                "last_seen": ts,
-                "examples": [],
-                "count": 0,
-            }
+            if cluster_id not in cluster_meta:
+                cluster_meta[cluster_id] = {
+                    "first_seen": ts,
+                    "last_seen": ts,
+                    "examples": [],
+                    "count": 0,
+                }
 
-        meta = cluster_meta[cluster_id]
-        meta["last_seen"] = ts
-        meta["count"] += 1
-        # Keep up to 3 example lines for non-boilerplate clusters
-        if len(meta["examples"]) < 3:
-            meta["examples"].append(msg)
+            meta = cluster_meta[cluster_id]
+            meta["last_seen"] = ts
+            meta["count"] += 1
+            # Keep up to 3 example lines for non-boilerplate clusters
+            if len(meta["examples"]) < 3:
+                meta["examples"].append(msg)
 
-    # Build output ordered by first_seen timestamp
-    clusters_output = []
-    for cluster in template_miner.drain.clusters:
-        cid = cluster.cluster_id
-        meta = cluster_meta.get(cid, {})
-        tid = f"t_{cid:04d}"
+        # Force the updated parse tree to disk before releasing the lock, so
+        # the next caller always starts from a fully-written, consistent state.
+        template_miner.save_state("cluster_logs: end of batch")
 
-        classification = "unknown"
-        if catalog:
-            classification = catalog.get_classification(tid)
+        # Build output ordered by first_seen timestamp, restricted to clusters
+        # actually matched by this call's logs.
+        clusters_output = []
+        for cluster in template_miner.drain.clusters:
+            cid = cluster.cluster_id
+            if cid not in seen_cluster_ids:
+                continue
 
-        clusters_output.append({
-            "template_id": tid,
-            "template": cluster.get_template(),
-            "count": meta.get("count", cluster.size),
-            "first_seen": meta.get("first_seen", ""),
-            "last_seen": meta.get("last_seen", ""),
-            "classification": classification,
-            "examples": meta.get("examples", []),
-        })
+            meta = cluster_meta.get(cid, {})
+            tid = f"t_{cid:04d}"
+
+            classification = "unknown"
+            if catalog:
+                classification = catalog.get_classification(tid)
+
+            clusters_output.append({
+                "template_id": tid,
+                "template": cluster.get_template(),
+                "count": meta.get("count", 0),
+                "first_seen": meta.get("first_seen", ""),
+                "last_seen": meta.get("last_seen", ""),
+                "classification": classification,
+                "examples": meta.get("examples", []),
+            })
 
     # Sort by first_seen timestamp (not frequency -- the LLM needs the sequence)
     clusters_output.sort(key=lambda c: c["first_seen"])

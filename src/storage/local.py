@@ -15,7 +15,16 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
         os.makedirs(self.base_dir, exist_ok=True)
         
     def _get_dir(self, event_id: str) -> Path:
-        target_dir = self.base_dir / f"casebook_{event_id}"
+        base_resolved = self.base_dir.resolve()
+        target_dir = (self.base_dir / f"casebook_{event_id}").resolve()
+
+        # Defense in depth alongside the Pydantic eventId pattern (0.11):
+        # never create or touch a path that resolves outside the storage root.
+        try:
+            target_dir.relative_to(base_resolved)
+        except ValueError:
+            raise ValueError(f"Resolved casebook directory escapes storage root: {target_dir}")
+
         os.makedirs(target_dir, exist_ok=True)
         return target_dir
 
