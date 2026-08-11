@@ -1,11 +1,13 @@
 import os
 import json
 import re
+import time
+import asyncio
+import functools
 import threading
 import concurrent.futures
 from fastapi import APIRouter, Depends, HTTPException, Security, Request
 from fastapi.security import APIKeyHeader
-import time
 from src.models.schemas import MessagePayload
 from src.core.agent_orchestrator import get_agent
 from src.utils.s3_uploader import upload_logs_to_s3
@@ -19,6 +21,52 @@ logger = get_logger(__name__)
 # or the DLQ path on a previous attempt) that a slow, late-finishing agent
 # run must never overwrite with a stale "successful" result.
 _PROTECTED_TERMINAL_STATUSES = ("FAILED_TIMEOUT", "DLQ")
+
+# A dedicated, bounded pool for agent.invoke() calls -- separate from
+# Starlette's own threadpool used to dispatch sync endpoints/dependencies.
+# Before this, a burst of multi-minute investigations could occupy every
+# slot in that shared pool and leave /health, /ready, and the sync
+# dependencies (get_api_key, rate_limiter) queued behind them (2.6). Sized
+# to match the consumer's own concurrency ceiling so the API enforces the
+# same bound independently of how many requests the consumer's semaphore
+# actually lets through.
+#
+# Note: a timed-out invocation can't be forcibly killed (Python threads
+# can't be interrupted), so under sustained timeouts this pool can fill with
+# abandoned-but-still-running work; new requests then queue for a free slot
+# rather than each spawning an unbounded new OS thread. That's an accepted
+# tradeoff for a bounded, predictable ceiling.
+_MAX_CONCURRENT_INVESTIGATIONS = int(os.environ.get("MAX_CONCURRENT_INVESTIGATIONS", "5"))
+_agent_invoke_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_MAX_CONCURRENT_INVESTIGATIONS, thread_name_prefix="agent-invoke"
+)
+
+# Kafka producer health, cached so a burst of /ready probes (an orchestrator
+# typically polls this every few seconds) doesn't each attempt a fresh
+# connection/DNS resolution against the broker (2.7).
+_PRODUCER_HEALTH_TTL_SECONDS = float(os.environ.get("PRODUCER_HEALTH_TTL_SECONDS", "30"))
+_producer_health_lock = threading.Lock()
+_producer_health_cache = {"ready": False, "checked_at": 0.0}
+
+
+def _check_kafka_producer_ready() -> bool:
+    now = time.time()
+    with _producer_health_lock:
+        if now - _producer_health_cache["checked_at"] < _PRODUCER_HEALTH_TTL_SECONDS:
+            return _producer_health_cache["ready"]
+
+    ready = False
+    try:
+        from src.utils.dlq_publisher import get_producer
+        producer = get_producer()
+        ready = producer is not None
+    except Exception as e:
+        logger.error(f"Readiness check failed on Kafka Producer: {e}")
+
+    with _producer_health_lock:
+        _producer_health_cache["ready"] = ready
+        _producer_health_cache["checked_at"] = now
+    return ready
 
 
 def _get_agent_invoke_timeout_seconds() -> float:
@@ -106,7 +154,6 @@ def health_check():
 @router.get("/ready")
 def readiness_check():
     import sqlite3
-    from src.utils.dlq_publisher import get_producer
     from src.utils.paths import CHECKPOINT_DB_PATH
 
     # Check SQLite connectivity. A missing DB file should fail the probe,
@@ -121,27 +168,23 @@ def readiness_check():
         db_ready = True
     except Exception as e:
         logger.error(f"Readiness check failed on DB: {e}")
-        
-    # Check Kafka producer
-    kafka_ready = False
-    try:
-        producer = get_producer()
-        if producer is not None:
-            # Just checking if producer is created successfully
-            kafka_ready = True
-    except Exception as e:
-        logger.error(f"Readiness check failed on Kafka Producer: {e}")
-        
+
+    kafka_ready = _check_kafka_producer_ready()
+
     if db_ready and kafka_ready:
         return {"status": "ready"}
     else:
         raise HTTPException(status_code=503, detail="Service Unavailable")
 
 @router.post("/process-rejection", dependencies=[Depends(get_api_key), Depends(rate_limiter)])
-def process_rejection(signal: MessagePayload):
+async def process_rejection(signal: MessagePayload):
     """
     Endpoint that receives only rejected signals from Kafka.
     It provisions the Agent to investigate the error and decides on the solution.
+
+    async so that awaiting the (potentially multi-minute) agent.invoke() call
+    below yields the event loop instead of occupying a slot in Starlette's
+    sync-dispatch threadpool for the whole duration (2.6).
     """
     signal_dict = signal.model_dump()
     event_id = str(signal.eventId).strip()
@@ -157,7 +200,7 @@ def process_rejection(signal: MessagePayload):
         status = existing_casebook.get("packet_status", {}).get("status")
         terminal_statuses = ("COMPLETED", "REJECTED", "NEEDS_MANUAL_REVIEW", "FAILED_PERMANENT", "DLQ", "FAILED_TIMEOUT")
         if status in terminal_statuses:
-            print(f"\n[API] Skipping Event ID: {event_id}. Terminal casebook already exists.")
+            logger.bind(event_id=event_id).info("Skipping event; terminal casebook already exists.")
             return {"status": "already_processed", "event_id": event_id}
 
     agent = get_agent()
@@ -167,22 +210,23 @@ def process_rejection(signal: MessagePayload):
 
     if existing_status:
         status = existing_status.get("packet_status", {}).get("status")
-        
+        pre_invoke_log = logger.bind(event_id=event_id)
+
         if status == "IN_PROGRESS":
             started_at = existing_status.get("packet_metadata", {}).get("started_at", 0)
             max_age = int(os.environ.get("MAX_IN_PROGRESS_AGE_SECONDS", 1800))
             is_stale = (time.time() - started_at) > max_age
-            
+
             if is_stale and not has_active_checkpoint:
-                print(f"\n[API] Event ID: {event_id} is IN_PROGRESS but stale with no active checkpoint. Reprocessing fresh.")
+                pre_invoke_log.info("IN_PROGRESS but stale with no active checkpoint. Reprocessing fresh.")
             elif has_active_checkpoint:
-                print(f"\n[API] Event ID: {event_id} has active checkpoint. Resuming.")
+                pre_invoke_log.info("Has active checkpoint. Resuming.")
                 return {"status": "already_processing_resumed", "event_id": event_id}
             else:
                 # Not stale, and no active checkpoint: a run is in flight but
                 # between checkpoint writes. Treat as already processing
                 # instead of falling through to a full duplicate reprocess.
-                print(f"\n[API] Event ID: {event_id} is IN_PROGRESS and not stale. Skipping duplicate invocation.")
+                pre_invoke_log.info("IN_PROGRESS and not stale. Skipping duplicate invocation.")
                 return {"status": "already_processing", "event_id": event_id}
 
     # Write IN_PROGRESS stub before invoking graph to status.json
@@ -194,25 +238,31 @@ def process_rejection(signal: MessagePayload):
     log = logger.bind(event_id=event_id)
     log.info("Processing Rejection", state="IN_PROGRESS")
     
-    # Run the agent with exception handling for DLQ
+    # Run the agent with exception handling for DLQ. Offloaded onto the
+    # module-level bounded executor (not a per-request one) so agent.invoke
+    # never occupies Starlette's own threadpool for its multi-minute
+    # duration (2.6).
     log.info("Dispatching payload to LangGraph")
     agent_invoke_timeout_seconds = _get_agent_invoke_timeout_seconds()
-    invoke_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_running_loop()
     try:
         if has_active_checkpoint:
-            future = invoke_executor.submit(agent.invoke, None, config=config)
+            invoke_call = functools.partial(agent.invoke, None, config=config)
         else:
             # retry_count is explicitly reset here: thread_id is the eventId,
             # and a redelivered "fresh" invocation (no active checkpoint) can
             # otherwise resume a persisted checkpoint whose retry_count is
             # already at/over MAX_INVESTIGATION_RETRIES, escalating instantly
             # without doing any work (0.5).
-            future = invoke_executor.submit(
+            invoke_call = functools.partial(
                 agent.invoke, {"payload": signal_dict, "retry_count": 0}, config=config
             )
         try:
-            result = future.result(timeout=agent_invoke_timeout_seconds)
-        except concurrent.futures.TimeoutError:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(_agent_invoke_executor, invoke_call),
+                timeout=agent_invoke_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
             log.error(
                 "Agent invocation exceeded server-side budget",
                 exc_info=False,
@@ -243,10 +293,6 @@ def process_rejection(signal: MessagePayload):
         storage.save(event_id, dlq_status)
         storage.save(event_id, dlq_status, filename="status.json")
         return {"status": "dlq", "event_id": event_id, "error": str(e)}
-    finally:
-        # Don't block the response on a hung/slow invocation still running in
-        # the background thread -- the timeout path above has already reacted.
-        invoke_executor.shutdown(wait=False)
 
     log.info("Agent investigation complete", state="COMPLETED_GRAPH")
     final_message = result.get("synthesis", "{}")
@@ -295,7 +341,7 @@ def process_rejection(signal: MessagePayload):
     if not raw_logs or raw_logs == "Log fetching disabled.":
         processed_logs = None
     elif len(raw_logs) > 5000:
-        print("[API] Logs are too large for JSON, uploading to S3...")
+        log.info("Logs are too large for JSON, uploading to S3...")
         uploaded_url = upload_logs_to_s3(event_id, raw_logs)
         if uploaded_url:
             processed_logs = uploaded_url

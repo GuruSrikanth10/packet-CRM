@@ -13,6 +13,9 @@ from typing import Optional
 
 from src.log_pipeline.catalog import TemplateCatalog
 from src.utils.env import get_bool_env
+from src.utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 # Hard cap on total documents pulled per event_id -- without this, a noisy
 # event can pull an unbounded number of rows into memory (1.10).
@@ -25,15 +28,16 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None) -> list
     Returns a list of dicts with keys: timestamp, level, message, app_name.
     Sorted by @timestamp ASC with _seq_no tiebreaker.
     """
-    print(f"\n[FETCHER] Fetching logs for: {event_id}")
+    log = logger.bind(event_id=event_id)
+    log.info("[FETCHER] Fetching logs")
 
     # --- Testing/Mock Mode: Load logs from a local CSV file ---
     mock_file = os.environ.get("ES_MOCK_FILE")
     if mock_file:
-        print(f"[FETCHER] ES_MOCK_FILE set. Loading logs from {mock_file}.")
+        log.info(f"[FETCHER] ES_MOCK_FILE set. Loading logs from {mock_file}.")
         logs = []
         try:
-            with open(mock_file, 'r', encoding='utf-8') as f:
+            with open(mock_file, 'r', encoding='utf-8', errors='replace') as f:
                 # Skip the header line
                 next(f, None)
                 for line in f:
@@ -60,15 +64,15 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None) -> list
                                 "app_name": source.get("application_name", "unknown-service"),
                             })
                         except json.JSONDecodeError as e:
-                            print(f"[FETCHER] Skipped line due to JSON decode error: {e}")
-                            print(f"[FETCHER] Problematic JSON: {log_json_str[:150]}...")
+                            log.warning(f"[FETCHER] Skipped line due to JSON decode error: {e}")
+                            log.warning(f"[FETCHER] Problematic JSON: {log_json_str[:150]}...")
                             continue
             # Sort by timestamp to mimic Elasticsearch's ascending order
             logs.sort(key=lambda x: x["timestamp"])
-            print(f"[FETCHER] Loaded {len(logs)} logs from file.")
+            log.info(f"[FETCHER] Loaded {len(logs)} logs from file.")
             return logs
         except Exception as e:
-            print(f"[FETCHER] Error loading mock file: {e}")
+            log.error(f"[FETCHER] Error loading mock file: {e}")
             return []
 
     es_host = os.environ.get("ES_HOST")
@@ -77,7 +81,7 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None) -> list
     index_pattern = os.environ.get("ES_INDEX_PATTERN", "logs-*")
 
     if not es_host:
-        print("[FETCHER] ES_HOST not set. Returning mock logs.")
+        log.info("[FETCHER] ES_HOST not set. Returning mock logs.")
         return [
             {"timestamp": "MOCK", "level": "ERROR", "message": f"[MOCK] connection timeout for {event_id}", "app_name": "mock-service"}
         ]
@@ -165,7 +169,7 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None) -> list
             search_after_values = hit["sort"]
 
         if len(logs) >= LOG_MAX_DOCUMENTS:
-            print(f"[FETCHER] Hit LOG_MAX_DOCUMENTS cap ({LOG_MAX_DOCUMENTS}); truncating results for {event_id}.")
+            log.warning(f"[FETCHER] Hit LOG_MAX_DOCUMENTS cap ({LOG_MAX_DOCUMENTS}); truncating results.")
             logs = logs[:LOG_MAX_DOCUMENTS]
             break
 
@@ -174,5 +178,5 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None) -> list
         if len(hits) < page_size:
             break
 
-    print(f"[FETCHER] Fetched {len(logs)} logs from Elasticsearch.")
+    log.info(f"[FETCHER] Fetched {len(logs)} logs from Elasticsearch.")
     return logs

@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import asyncio
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
@@ -66,7 +67,7 @@ def test_loop_guard_max_retries():
     
     with patch("src.core.agent_orchestrator.create_react_agent", return_value=mock_agent_instance):
         with patch("src.core.agent_orchestrator._agent", None):
-            process_rejection(MessagePayload(**DUMMY_PAYLOAD))
+            asyncio.run(process_rejection(MessagePayload(**DUMMY_PAYLOAD)))
             
     storage = get_casebook_storage()
     casebook = storage.load("test-1234")
@@ -80,7 +81,7 @@ def test_idempotency_short_circuit():
     })
     
     with patch("src.api.routes.get_agent") as mock_get_agent:
-        res = process_rejection(MessagePayload(**DUMMY_PAYLOAD))
+        res = asyncio.run(process_rejection(MessagePayload(**DUMMY_PAYLOAD)))
         assert res["status"] == "already_processed"
         mock_get_agent.assert_not_called()
 
@@ -145,7 +146,7 @@ def test_dlq_forced_unrecoverable_failure(mock_publish):
     mock_agent = MagicMock()
     mock_agent.invoke.side_effect = Exception("Hard crash!")
     with patch("src.api.routes.get_agent", return_value=mock_agent):
-        res = process_rejection(MessagePayload(**DUMMY_PAYLOAD))
+        res = asyncio.run(process_rejection(MessagePayload(**DUMMY_PAYLOAD)))
         assert res["status"] == "dlq"
         assert res["error"] == "Hard crash!"
         

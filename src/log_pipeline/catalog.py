@@ -16,6 +16,9 @@ import os
 from typing import Optional
 
 from src.log_pipeline.config import CATALOG_PATH
+from src.utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class TemplateCatalog:
@@ -39,17 +42,17 @@ class TemplateCatalog:
                     tid = entry.get("template_id")
                     if tid:
                         self._entries[tid] = entry
-                print(f"[CATALOG] Loaded {len(self._entries)} templates from {self._path}")
+                logger.info(f"[CATALOG] Loaded {len(self._entries)} templates from {self._path}")
             except Exception as e:
-                print(f"[CATALOG] Failed to load catalog: {e}")
+                logger.error(f"[CATALOG] Failed to load catalog: {e}")
         else:
-            print(f"[CATALOG] No catalog found at {self._path}. All templates will be classified as 'unknown'.")
+            logger.info(f"[CATALOG] No catalog found at {self._path}. All templates will be classified as 'unknown'.")
 
     def save(self):
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
         with open(self._path, "w", encoding="utf-8") as f:
             json.dump(list(self._entries.values()), f, indent=2)
-        print(f"[CATALOG] Saved {len(self._entries)} templates to {self._path}")
+        logger.info(f"[CATALOG] Saved {len(self._entries)} templates to {self._path}")
 
     # ------------------------------------------------------------------
     # Query

@@ -1,5 +1,6 @@
 import json
 import time
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -90,7 +91,7 @@ def test_idempotency_in_progress_not_stale_no_checkpoint_short_circuits():
     mock_agent.get_state.return_value = mock_state
 
     with patch("src.api.routes.get_agent", return_value=mock_agent):
-        res = process_rejection(MessagePayload(**DUMMY_PAYLOAD))
+        res = asyncio.run(process_rejection(MessagePayload(**DUMMY_PAYLOAD)))
 
     assert res["status"] == "already_processing"
     mock_agent.invoke.assert_not_called()

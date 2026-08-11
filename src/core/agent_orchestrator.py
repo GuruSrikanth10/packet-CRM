@@ -1,5 +1,6 @@
 import os
 import json
+import contextvars
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -15,6 +16,14 @@ from src.utils.logging_config import get_logger
 from src.utils.paths import CHECKPOINT_DB_PATH
 
 logger = get_logger(__name__)
+
+# Per-packet context for the add_learning_rule tool, which is now built once
+# at graph-construction time instead of once per review call (2.1). Each
+# packet is processed on its own dedicated thread (see routes.py), and
+# contextvars are thread-local by default, so setting these at the top of
+# reviewer_node is safe under concurrent packets.
+_current_event_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_event_id", default="unknown")
+_current_investigation: contextvars.ContextVar[str] = contextvars.ContextVar("current_investigation", default="")
 
 def is_reviewer_approved(feedback: str) -> bool:
     """Return True only if the Reviewer's verdict is an unqualified APPROVED.
@@ -44,10 +53,10 @@ _agent = None
 def get_agent():
     global _agent
     if _agent is not None:
-        print("[ORCHESTRATOR] Returning cached Deterministic Graph.")
+        logger.info("Returning cached Deterministic Graph.")
         return _agent
 
-    print("[ORCHESTRATOR] Building Deterministic LangGraph from scratch...")
+    logger.info("Building Deterministic LangGraph from scratch...")
     base_dir = os.path.dirname(os.path.dirname(__file__))
     llm = get_llm("complex")
     simple_llm = get_llm("simple")
@@ -70,36 +79,69 @@ def get_agent():
     synthesis_prompt = load_prompt("SynthesisAgent.md")
     
     def fetch_logs_node(state: GraphState):
-        print("\n" + "="*50)
-        print("[STEP 1] LOG FETCHER NODE")
-        print("="*50)
+        event_id = state.get("payload", {}).get("eventId", "")
+        log = logger.bind(event_id=event_id)
+        log.info("Log fetcher node started", state="LOG_FETCHER")
         enable_log_fetching = get_bool_env("ENABLE_LOG_FETCHING", False)
         if not enable_log_fetching:
-            print("   >> Skipped: Log fetching is disabled via .env")
+            log.info("Log fetching disabled via .env; skipping.")
             return {"logs": "Log fetching disabled."}
-            
-        event_id = state.get("payload", {}).get("eventId", "")
-        print(f"   Fetching Elasticsearch traces for Event ID: {event_id}...")
+
+        log.info("Fetching Elasticsearch traces")
         tool = get_tool_by_name("fetch_elastic_logs")
         logs = tool.invoke(event_id)
-        print("   Logs successfully retrieved!")
+        log.info("Logs retrieved")
         return {"logs": logs}
-        
-    # OPT-2: Create agents once during graph construction, not per invocation
+
+    # Create agents once during graph construction, not per invocation.
     investigator_agent = create_react_agent(llm, tools=[])
     queue_tool = get_tool_by_name("queue_for_replay")
     synthesis_agent = create_react_agent(llm, tools=[queue_tool])
 
+    from langchain_core.tools import tool
+    from datetime import datetime
+    from filelock import FileLock
+
+    @tool
+    def add_learning_rule(rule_text: str, reasoning: str) -> str:
+        """Propose a new permanent rule to fix Investigator mistakes."""
+        target_file = os.path.join(base_dir, "prompts", "pending_rules.jsonl")
+        lock_file = target_file + ".lock"
+
+        entry = {
+            "eventId": _current_event_id.get(),
+            "timestamp": datetime.now().isoformat(),
+            "proposed_rule": rule_text,
+            "reviewer_reasoning": reasoning,
+            "investigator_original_output": _current_investigation.get(),
+        }
+        try:
+            with FileLock(lock_file, timeout=10):
+                with open(target_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+            return f"Successfully queued rule for human review: {rule_text}"
+        except Exception as e:
+            return f"Failed to queue rule: {e}"
+
+    # 2.1: built once here (not per-review) now that the tool reads its
+    # per-packet context from contextvars instead of a closure over
+    # event_id/investigation -- rebuilding a React agent (with the tool
+    # schema binding that implies) on every single review call, and every
+    # retry loop, was pure waste.
+    # 2.2: the Reviewer is a bounded verdict task, a natural fit for the
+    # cheaper "simple" tier, which was otherwise constructed and unused.
+    reviewer_agent = create_react_agent(simple_llm, tools=[add_learning_rule])
+
     def investigator_node(state: GraphState):
-        print("\n" + "="*50)
-        print("[STEP 2] INVESTIGATOR NODE")
-        print("="*50)
-        print("   LLM is actively analyzing Kafka Payload & Rules (This may take a moment)...")
         payload = state.get("payload", {})
+        event_id = payload.get("eventId", "unknown")
+        log = logger.bind(event_id=event_id)
+        log.info("Investigator node started", state="INVESTIGATING")
         logs = state.get("logs", "")
         feedback = state.get("reviewer_feedback", "")
         db_rule = state.get("db_rule", "")
-        
+        investigation = state.get("investigation", "")
+
         # Optimize DB Calls: Fetch rule in Python if not already fetched
         if not db_rule:
             exec_summary = payload.get("packetExecutionSummary") or {}
@@ -136,17 +178,39 @@ def get_agent():
                         if filtered_rules:
                             db_rule = json.dumps(filtered_rules)
                 except Exception as e:
-                    print(f"Error filtering rules: {e}")
+                    log.warning("Error filtering rules by enrolmentType", error=str(e))
             else:
                 db_rule = "No errorReasonCode found in payload."
-        
-        prompt = f"Kafka Payload: {json.dumps(payload)}\n\n"
-        if logs and logs != "Log fetching disabled.":
-            prompt += f"Elasticsearch Logs: {logs}\n\n"
-        prompt += f"Database Rule Configuration:\n{db_rule}\n\n"
-        if feedback:
-            prompt += f"Reviewer Feedback (You MUST fix your previous analysis): {feedback}\n\n"
-        
+
+        is_retry = bool(feedback)
+        if is_retry:
+            # Retry: the static context (payload/logs/rule) was already sent
+            # on the first attempt and hasn't changed since -- resending it
+            # verbatim on every retry multiplies token cost for no benefit
+            # on a multi-retry packet. Send only the delta: the prior
+            # investigation plus the reviewer's feedback (2.3).
+            prompt = (
+                f"Your previous analysis:\n{investigation}\n\n"
+                f"Reviewer Feedback (You MUST fix your previous analysis): {feedback}\n\n"
+            )
+        else:
+            # Project the payload down to only the fields the prompt
+            # actually needs -- the full nested Kafka message carries many
+            # fields (sourceTopic, callbackTopic, taskMetaData, rejectBits,
+            # resubmissionSummary, uidV2DataArray, ...) the Investigator
+            # never uses (2.3).
+            flow_meta = payload.get("flowMetaData") or {}
+            projected_payload = {
+                "eventId": payload.get("eventId"),
+                "packetMetaData": payload.get("packetMetaData"),
+                "packetExecutionSummary": payload.get("packetExecutionSummary"),
+                "flowMetaData": {"stage": flow_meta.get("stage")},
+            }
+            prompt = f"Kafka Payload: {json.dumps(projected_payload)}\n\n"
+            if logs and logs != "Log fetching disabled.":
+                prompt += f"Elasticsearch Logs: {logs}\n\n"
+            prompt += f"Database Rule Configuration:\n{db_rule}\n\n"
+
         @llm_breaker
         @retry_transient
         def invoke_investigator():
@@ -154,47 +218,25 @@ def get_agent():
                 SystemMessage(content=investigator_prompt),
                 HumanMessage(content=prompt)
             ]})
-            
+
         res = invoke_investigator()
-        print("   Investigator finished analysis!")
+        log.info("Investigator finished analysis")
         return {"investigation": res["messages"][-1].content, "db_rule": db_rule}
 
     def reviewer_node(state: GraphState):
-        print("\n" + "="*50)
-        print("[STEP 3] REVIEWER NODE (QUALITY CONTROL)")
-        print("="*50)
-        print("   LLM is critically reviewing the Investigator's technical findings...")
         investigation = state.get("investigation", "")
         event_id = state.get("payload", {}).get("eventId", "unknown")
-        
-        from langchain_core.tools import tool
-        from datetime import datetime
-        from filelock import FileLock
-        
-        @tool
-        def add_learning_rule(rule_text: str, reasoning: str) -> str:
-            """Propose a new permanent rule to fix Investigator mistakes."""
-            target_file = os.path.join(base_dir, "prompts", "pending_rules.jsonl")
-            lock_file = target_file + ".lock"
-            
-            entry = {
-                "eventId": event_id,
-                "timestamp": datetime.now().isoformat(),
-                "proposed_rule": rule_text,
-                "reviewer_reasoning": reasoning,
-                "investigator_original_output": investigation
-            }
-            try:
-                with FileLock(lock_file, timeout=10):
-                    with open(target_file, "a", encoding="utf-8") as f:
-                        f.write(json.dumps(entry) + "\n")
-                return f"Successfully queued rule for human review: {rule_text}"
-            except Exception as e:
-                return f"Failed to queue rule: {e}"
-        
+        log = logger.bind(event_id=event_id)
+        log.info("Reviewer node started", state="REVIEWING")
+
+        # Set the per-packet context the module-scope add_learning_rule tool
+        # reads (see its definition above) instead of closing over these
+        # values directly.
+        _current_event_id.set(event_id)
+        _current_investigation.set(investigation)
+
         prompt = f"Validate this investigation:\n{investigation}\n\nIf it's perfect, reply with exactly 'APPROVED'. If not, explain what is wrong."
-        reviewer_agent = create_react_agent(llm, tools=[add_learning_rule])
-        
+
         @llm_breaker
         @retry_transient
         def invoke_reviewer():
@@ -202,10 +244,10 @@ def get_agent():
                 SystemMessage(content=reviewer_prompt),
                 HumanMessage(content=prompt)
             ]})
-            
+
         res = invoke_reviewer()
         feedback = res["messages"][-1].content
-        print("   Reviewer finished assessment!")
+        log.info("Reviewer finished assessment")
         return {"reviewer_feedback": feedback, "retry_count": state.get("retry_count", 0) + 1}
 
     def check_approval(state: GraphState):
@@ -226,15 +268,13 @@ def get_agent():
             return "investigator"
 
     def escalate_node(state: GraphState):
-        print("\n" + "="*50)
-        print("[STEP 4] ESCALATION NODE (NEEDS MANUAL REVIEW)")
-        print("="*50)
-        print("   Generating escalation casebook...")
-        
+        event_id = state.get("payload", {}).get("eventId", "unknown")
+        logger.bind(event_id=event_id).info("Generating escalation casebook", state="ESCALATING")
+
         # We manually construct a fake synthesis payload that forces the routes.py to mark it NEEDS_MANUAL_REVIEW
         investigation = state.get("investigation", "")
         feedback = state.get("reviewer_feedback", "")
-        
+
         # We format it to match the expected JSON structure so routes.py parses it
         escalation_result = {
             "rejection_description": f"ESCALATED: The automated agents could not agree on a resolution after multiple attempts.\nLast Investigation:\n{investigation}\n\nLast Reviewer Feedback:\n{feedback}",
@@ -246,13 +286,12 @@ def get_agent():
         return {"synthesis": json.dumps(escalation_result)}
 
     def synthesis_node(state: GraphState):
-        print("\n" + "="*50)
-        print("[STEP 4] SYNTHESIS NODE (FINAL CASEBOOK)")
-        print("="*50)
-        print("   LLM is compiling the final JSON resolution...")
+        event_id = state.get("payload", {}).get("eventId", "unknown")
+        log = logger.bind(event_id=event_id)
+        log.info("Synthesis node started", state="SYNTHESIZING")
         investigation = state.get("investigation", "")
         prompt = f"Create the final JSON casebook based strictly on this approved investigation:\n{investigation}"
-        
+
         @llm_breaker
         @retry_transient
         def invoke_synthesis():
@@ -260,8 +299,9 @@ def get_agent():
                 SystemMessage(content=synthesis_prompt),
                 HumanMessage(content=prompt)
             ]})
-            
+
         res = invoke_synthesis()
+        log.info("Synthesis finished")
         return {"synthesis": res["messages"][-1].content, "messages": res["messages"]}
 
     # Build Graph
@@ -285,5 +325,5 @@ def get_agent():
     checkpointer = SqliteSaver(conn)
     _agent = workflow.compile(checkpointer=checkpointer)
     
-    print("[ORCHESTRATOR] Deterministic Graph successfully constructed!")
+    logger.info("Deterministic Graph successfully constructed!")
     return _agent

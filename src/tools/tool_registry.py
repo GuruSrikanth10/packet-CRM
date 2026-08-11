@@ -7,10 +7,18 @@ from sqlalchemy import create_engine
 import pymysql
 from src.utils.env import get_bool_env, get_required_env
 from src.utils.resilience import retry_transient, db_breaker, es_breaker
+from src.utils.logging_config import get_logger
 import pybreaker
+
+logger = get_logger(__name__)
 
 _DB_CACHE = None
 _LIVE_DB_ENGINE = None
+# (target_col, {reason_code_str: [row_positions]}) built once from _DB_CACHE,
+# or (None, {}) if the DB is empty/has no recognizable reason-code column.
+# Avoids an O(n) astype(str)-and-compare scan of the whole table on every
+# single lookup (2.4).
+_RULE_INDEX_CACHE = None
 
 # A plain functools.lru_cache here would cache for the process lifetime,
 # including failure strings -- one transient MySQL blip would then poison
@@ -52,24 +60,63 @@ def _load_mock_db():
     global _DB_CACHE
     if _DB_CACHE is not None:
         return _DB_CACHE
-        
+
     # Use environment variable or default to src/db/mock_db.xlsx
     db_path = os.environ.get("MOCK_DB_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "db", "mock_db.xlsx"))
+    # Every branch below assigns to _DB_CACHE before returning -- previously
+    # a missing/unreadable file fell through to an *uncached* empty
+    # DataFrame, so os.path.exists() and a failed read were repeated on
+    # every single call (2.4).
     if os.path.exists(db_path) and str(db_path).endswith((".xlsx", ".xls")):
         try:
             _DB_CACHE = pd.read_excel(db_path)
-            return _DB_CACHE
         except Exception as e:
-            print(f"Failed to load excel db: {e}")
-            return None
+            logger.error(f"Failed to load excel db: {e}")
+            _DB_CACHE = pd.DataFrame()
     elif os.path.exists(db_path) and db_path.endswith(".csv"):
         try:
             _DB_CACHE = pd.read_csv(db_path)
-            return _DB_CACHE
         except Exception as e:
-            print(f"Failed to load csv db: {e}")
-            return None
-    return pd.DataFrame()
+            logger.error(f"Failed to load csv db: {e}")
+            _DB_CACHE = pd.DataFrame()
+    else:
+        _DB_CACHE = pd.DataFrame()
+    return _DB_CACHE
+
+
+def _build_rule_index():
+    """Build (and cache) a reason_code -> row-position index over _DB_CACHE.
+
+    Serializes to the same target column detection as before, but only
+    scans the whole table once instead of on every lookup (2.4).
+    """
+    global _RULE_INDEX_CACHE
+    if _RULE_INDEX_CACHE is not None:
+        return _RULE_INDEX_CACHE
+
+    db = _load_mock_db()
+    if db is None or db.empty:
+        _RULE_INDEX_CACHE = (None, {})
+        return _RULE_INDEX_CACHE
+
+    possible_cols = ['reasoncode', 'reason_code', 'errorcode', 'error_code', 'rejectioncode', 'rejection_code', 'code', 'rejectreasoncode', 'reject_reason_code']
+    target_col = None
+    for col in db.columns:
+        clean_col = str(col).lower().replace(" ", "").replace("_", "")
+        if clean_col in possible_cols:
+            target_col = col
+            break
+
+    if not target_col:
+        _RULE_INDEX_CACHE = (None, {})
+        return _RULE_INDEX_CACHE
+
+    index: dict = {}
+    for pos, key in enumerate(db[target_col].astype(str)):
+        index.setdefault(key, []).append(pos)
+
+    _RULE_INDEX_CACHE = (target_col, index)
+    return _RULE_INDEX_CACHE
 
 @tool
 def lookup_resident_database(uid: str, srn: str) -> str:
@@ -106,7 +153,7 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
     """Lookup the exact corresponding rule (including ruleId, payload, etc.) for a given reason code."""
     cached_result = _rule_cache.get(reason_code)
     if cached_result is not None:
-        print(f"[TOOL] Cache hit for rule lookup: {reason_code}")
+        logger.info(f"[TOOL] Cache hit for rule lookup: {reason_code}")
         return cached_result
 
     result = _lookup_rule_by_reason_code_impl(reason_code)
@@ -118,52 +165,45 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
 
 
 def _lookup_rule_by_reason_code_impl(reason_code: str) -> str:
-    print(f"\n[TOOL] lookup_rule_by_reason_code triggered for: {reason_code}")
+    logger.info(f"[TOOL] lookup_rule_by_reason_code triggered for: {reason_code}")
     use_mock = get_bool_env("USE_MOCK_DB", True)
     if use_mock:
         db = _load_mock_db()
         if db is None or db.empty:
-            print("[TOOL] Mock database is empty or could not be loaded!")
+            logger.warning("[TOOL] Mock database is empty or could not be loaded!")
             return "Mock database is empty or could not be loaded."
-        
-        # Find the column that might contain the reason code (case-insensitive and flexible)
-        possible_cols = ['reasoncode', 'reason_code', 'errorcode', 'error_code', 'rejectioncode', 'rejection_code', 'code', 'rejectreasoncode', 'reject_reason_code']
-        target_col = None
-        for col in db.columns:
-            clean_col = str(col).lower().replace(" ", "").replace("_", "")
-            if clean_col in possible_cols:
-                target_col = col
-                break
-                
-        if target_col:
-            matches = db[db[target_col].astype(str) == str(reason_code)]
-            if not matches.empty:
-                print(f"[TOOL] Found {len(matches)} matching rule(s) in DB for {reason_code}")
-                return matches.to_json(orient="records")
-            else:
-                print(f"[TOOL] No rules found in DB for {reason_code}")
-                return f"Rule not found for reason code: {reason_code} in mock DB (Searched column: {target_col})."
-        
-        print("[TOOL] Could not find a valid Reason Code column in the DB!")
-        return f"Could not find a valid Reason Code column in the DB. Available columns: {list(db.columns)}"
+
+        target_col, index = _build_rule_index()
+        if not target_col:
+            logger.warning("[TOOL] Could not find a valid Reason Code column in the DB!")
+            return f"Could not find a valid Reason Code column in the DB. Available columns: {list(db.columns)}"
+
+        positions = index.get(str(reason_code), [])
+        if positions:
+            matches = db.iloc[positions]
+            logger.info(f"[TOOL] Found {len(matches)} matching rule(s) in DB for {reason_code}")
+            return matches.to_json(orient="records")
+        else:
+            logger.info(f"[TOOL] No rules found in DB for {reason_code}")
+            return f"Rule not found for reason code: {reason_code} in mock DB (Searched column: {target_col})."
     else:
-        print(f"[TOOL] Querying LIVE MySQL database for: {reason_code}")
+        logger.info(f"[TOOL] Querying LIVE MySQL database for: {reason_code}")
         try:
             engine = get_live_db_engine()
-            
+
             # Using pandas to query and format identically to the mock DB approach
             query = "SELECT * FROM rules WHERE reject_reason_code = %s"
             matches = pd.read_sql(query, engine, params=(reason_code,))
-            
+
             if not matches.empty:
-                print(f"[TOOL] Found {len(matches)} matching rule(s) in Live DB for {reason_code}")
+                logger.info(f"[TOOL] Found {len(matches)} matching rule(s) in Live DB for {reason_code}")
                 return matches.to_json(orient="records")
             else:
-                print(f"[TOOL] No rules found in Live DB for {reason_code}")
+                logger.info(f"[TOOL] No rules found in Live DB for {reason_code}")
                 return f"Rule not found for reason code: {reason_code} in live DB."
-                
+
         except Exception as e:
-            print(f"[TOOL] Live DB connection or query failed: {e}")
+            logger.error(f"[TOOL] Live DB connection or query failed: {e}")
             return f"Failed to query live DB: {e}"
 
 
@@ -187,16 +227,17 @@ def fetch_elastic_logs(event_id: str) -> Optional[str]:
     of them, so the other silently flowed downstream as if it were log
     content (1.6).
     """
-    print(f"\n[TOOL] fetch_elastic_logs triggered for: {event_id}")
+    log = logger.bind(event_id=event_id)
+    log.info("[TOOL] fetch_elastic_logs triggered")
 
     try:
         from src.log_pipeline.pipeline import reduce_logs
         return reduce_logs(event_id)
     except pybreaker.CircuitBreakerError:
-        print("[TOOL] ES Circuit breaker is OPEN. Failing fast.")
+        log.error("[TOOL] ES Circuit breaker is OPEN. Failing fast.")
         return None
     except Exception as e:
-        print(f"[TOOL] Log reduction pipeline failed: {e}")
+        log.error(f"[TOOL] Log reduction pipeline failed: {e}")
         return None
 
 @tool
@@ -207,8 +248,8 @@ def fetch_kubernetes_logs(pod_id: str) -> str:
 @tool
 def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, category: str, fromSedaStart: bool, notificationEmail: str, notificationMobile: str) -> str:
     """Queue a packet for replay through the OIS pipeline."""
-    print(f"\n[TOOL] queue_for_replay triggered for ID: {id}")
-    
+    logger.info(f"[TOOL] queue_for_replay triggered for ID: {id}")
+
     payload = {
         "id": id,
         "idType": idType,
@@ -226,7 +267,7 @@ def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, cat
         import requests
         base_url = os.environ.get("OIS_FEIGN_BASE_URL", "http://10.10.79.62:31261/ois/hold/v1")
         endpoint = f"{base_url}/api/v1/forceReplay"
-        print(f"[TOOL] Auto-replay enabled. Firing POST to {endpoint}")
+        logger.info(f"[TOOL] Auto-replay enabled. Firing POST to {endpoint}")
         try:
             # Sent as a JSON body with an auth header rather than query
             # params -- query params land in server access logs, which would
@@ -237,7 +278,7 @@ def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, cat
             response.raise_for_status()
             return f"Successfully auto-replayed packet {id}: {response.text}"
         except Exception as e:
-            print(f"[TOOL] Failed to auto-replay {id}: {e}")
+            logger.error(f"[TOOL] Failed to auto-replay {id}: {e}")
             return f"Failed to replay packet {id} directly: {e}"
     else:
         # Append to pending queue
@@ -261,7 +302,7 @@ def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, cat
                     f.write(json.dumps(entry) + "\n")
             return f"Successfully queued packet {id} for human review before replay."
         except Exception as e:
-            print(f"[TOOL] Failed to queue replay for {id}: {e}")
+            logger.error(f"[TOOL] Failed to queue replay for {id}: {e}")
             return f"Failed to queue packet {id}: {e}"
 
 _TOOLS_MAP = {

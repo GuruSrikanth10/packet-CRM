@@ -15,6 +15,9 @@ import os
 from src.log_pipeline.catalog import TemplateCatalog
 from src.log_pipeline.fetcher import fetch_logs
 from src.log_pipeline.reducer import branch_on_error, cluster_logs, apply_evidence_guardrails
+from src.utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 _cached_catalog = None
@@ -46,7 +49,8 @@ def reduce_logs(event_id: str) -> str:
         return f"No logs found for ID: {event_id}"
 
     total_fetched = len(raw_logs)
-    print(f"[PIPELINE] Fetched {total_fetched} logs for {event_id}.")
+    log = logger.bind(event_id=event_id)
+    log.info(f"[PIPELINE] Fetched {total_fetched} logs.")
 
     # Persist raw logs to disk for audit
     log_file_path = _save_raw_logs(event_id, raw_logs)
@@ -176,10 +180,10 @@ def _save_raw_logs(event_id: str, logs: list[dict]) -> str:
         with open(log_file_path, "w", encoding="utf-8") as f:
             for log in logs:
                 f.write(f"[{log['timestamp']}] [{log['app_name']}] [{log['level']}] {log['message']}\n")
-        print(f"[PIPELINE] Saved raw logs to {log_file_path}")
+        logger.bind(event_id=event_id).info(f"[PIPELINE] Saved raw logs to {log_file_path}")
         return log_file_path
     except Exception as e:
-        print(f"[PIPELINE] Failed to save raw logs: {e}")
+        logger.bind(event_id=event_id).error(f"[PIPELINE] Failed to save raw logs: {e}")
         return "Failed to save"
 
 def _save_reduced_logs(event_id: str, reduced_text: str) -> str:
@@ -191,8 +195,8 @@ def _save_reduced_logs(event_id: str, reduced_text: str) -> str:
         log_file_path = os.path.join(log_dir, "reduced_logs.txt")
         with open(log_file_path, "w", encoding="utf-8") as f:
             f.write(reduced_text)
-        print(f"[PIPELINE] Saved reduced logs to {log_file_path}")
+        logger.bind(event_id=event_id).info(f"[PIPELINE] Saved reduced logs to {log_file_path}")
         return log_file_path
     except Exception as e:
-        print(f"[PIPELINE] Failed to save reduced logs: {e}")
+        logger.bind(event_id=event_id).error(f"[PIPELINE] Failed to save reduced logs: {e}")
         return "Failed to save"

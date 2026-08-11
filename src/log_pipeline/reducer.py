@@ -21,12 +21,21 @@ from src.log_pipeline.config import (
     RARE_TEMPLATE_THRESHOLD,
 )
 from src.log_pipeline.catalog import TemplateCatalog
+from src.utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 # Serializes access to the shared, file-persisted Drain3 parse tree so two
 # packets processed concurrently in this process never read-modify-write the
 # state file at the same time (0.2). The FileLock below extends the same
 # protection across process boundaries (e.g. API + consumer).
 _drain3_intraprocess_lock = threading.Lock()
+
+# Held for the process lifetime and reused across packets -- constructing a
+# fresh TemplateMiner per call re-reads and re-deserializes the whole state
+# file every time, which only grows as more templates accumulate (2.5).
+# Access is still only ever under _drain3_intraprocess_lock / FileLock above.
+_template_miner_instance = None
 
 
 # ======================================================================
@@ -58,8 +67,10 @@ def branch_on_error(logs: list[dict]) -> dict:
 
     trimmed = logs[context_start:context_end]
 
-    print(f"[REDUCER] ERROR branch: found {len(error_indices)} error(s). "
-          f"Trimmed to {len(trimmed)} lines (from index {context_start} to {context_end}).")
+    logger.info(
+        f"[REDUCER] ERROR branch: found {len(error_indices)} error(s). "
+        f"Trimmed to {len(trimmed)} lines (from index {context_start} to {context_end})."
+    )
 
     return {"has_error": True, "payload": trimmed}
 
@@ -67,6 +78,28 @@ def branch_on_error(logs: list[dict]) -> dict:
 # ======================================================================
 # Stage 3 -- Drain3 Clustering
 # ======================================================================
+
+def _get_template_miner():
+    """Return the process-wide TemplateMiner singleton, building it (and
+    reading the persisted state file) at most once per process (2.5).
+
+    Caller must already hold _drain3_intraprocess_lock / the FileLock.
+    """
+    global _template_miner_instance
+    if _template_miner_instance is not None:
+        return _template_miner_instance
+
+    from drain3 import TemplateMiner
+    from drain3.template_miner_config import TemplateMinerConfig
+    from drain3.file_persistence import FilePersistence
+
+    os.makedirs(DRAIN3_STATE_DIR, exist_ok=True)
+    state_file = os.path.join(DRAIN3_STATE_DIR, "drain3_state.bin")
+    persistence = FilePersistence(state_file)
+    config = TemplateMinerConfig()
+    _template_miner_instance = TemplateMiner(persistence, config)
+    return _template_miner_instance
+
 
 def cluster_logs(logs: list[dict], catalog: Optional[TemplateCatalog] = None) -> list[dict]:
     """Cluster log messages using Drain3 with persisted state.
@@ -82,10 +115,6 @@ def cluster_logs(logs: list[dict], catalog: Optional[TemplateCatalog] = None) ->
         "examples": list[str]
     }
     """
-    from drain3 import TemplateMiner
-    from drain3.template_miner_config import TemplateMinerConfig
-    from drain3.file_persistence import FilePersistence
-
     os.makedirs(DRAIN3_STATE_DIR, exist_ok=True)
     state_file = os.path.join(DRAIN3_STATE_DIR, "drain3_state.bin")
     lock_file = state_file + ".lock"
@@ -94,10 +123,7 @@ def cluster_logs(logs: list[dict], catalog: Optional[TemplateCatalog] = None) ->
     # thread/process can interleave a read-modify-write on the shared parse
     # tree (0.2), and so the cluster set below reflects only this call's logs.
     with _drain3_intraprocess_lock, FileLock(lock_file, timeout=30):
-        # Use file persistence so template IDs stay stable across runs
-        persistence = FilePersistence(state_file)
-        config = TemplateMinerConfig()
-        template_miner = TemplateMiner(persistence, config)
+        template_miner = _get_template_miner()
 
         # Track per-cluster metadata as we feed logs
         # cluster_id -> {first_seen, last_seen, examples, count}
@@ -162,7 +188,7 @@ def cluster_logs(logs: list[dict], catalog: Optional[TemplateCatalog] = None) ->
     # Sort by first_seen timestamp (not frequency -- the LLM needs the sequence)
     clusters_output.sort(key=lambda c: c["first_seen"])
 
-    print(f"[REDUCER] Clustered {len(logs)} logs into {len(clusters_output)} templates.")
+    logger.info(f"[REDUCER] Clustered {len(logs)} logs into {len(clusters_output)} templates.")
     return clusters_output
 
 
@@ -244,9 +270,11 @@ def apply_evidence_guardrails(
                 "source": "flow_boundary_last",
             })
 
-    print(f"[REDUCER] Guardrails: {len(decision_lines)} decision-vocab lines, "
-          f"{len(boundary_lines)} boundary lines, "
-          f"{sum(1 for c in processed if c.get('classification') == 'rare')} rare templates.")
+    logger.info(
+        f"[REDUCER] Guardrails: {len(decision_lines)} decision-vocab lines, "
+        f"{len(boundary_lines)} boundary lines, "
+        f"{sum(1 for c in processed if c.get('classification') == 'rare')} rare templates."
+    )
 
     return {
         "clusters": processed,

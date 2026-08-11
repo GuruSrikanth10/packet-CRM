@@ -1,5 +1,6 @@
 import json
 import shutil
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -105,7 +106,7 @@ def test_dlq_path_updates_status_json():
     try:
         with patch("src.api.routes.get_agent", return_value=mock_agent), \
              patch("src.api.routes.publish_to_dlq"):
-            res = process_rejection(MessagePayload(**_payload_with_event_id(event_id)))
+            res = asyncio.run(process_rejection(MessagePayload(**_payload_with_event_id(event_id))))
 
         assert res["status"] == "dlq"
         storage = get_casebook_storage()
@@ -249,7 +250,7 @@ def test_routes_falls_back_to_truncated_logs_when_s3_unset(monkeypatch):
 
     try:
         with patch("src.api.routes.get_agent", return_value=mock_agent):
-            res = process_rejection(MessagePayload(**_payload_with_event_id(event_id)))
+            res = asyncio.run(process_rejection(MessagePayload(**_payload_with_event_id(event_id))))
 
         assert res["status"] == "processed"
         storage = get_casebook_storage()
