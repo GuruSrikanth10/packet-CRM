@@ -26,3 +26,4 @@ langchain-mistralai
 cachetools
 httpx
 pytest
+kubernetes
