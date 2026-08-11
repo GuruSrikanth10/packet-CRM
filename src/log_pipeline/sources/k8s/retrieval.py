@@ -25,6 +25,7 @@ from typing import Callable, Iterator, Optional
 from src.log_pipeline.sources.k8s import client as k8s_client_module
 from src.log_pipeline.sources.k8s import fixtures
 from src.log_pipeline.sources.k8s.discovery import PodTarget
+from src.log_pipeline import redaction
 from src.log_pipeline.sources.k8s.filtering import KeepAllSelector
 from src.log_pipeline.sources.k8s.parser import (
     ParseStats,
@@ -56,6 +57,7 @@ class PodFetchOutcome:
     #: *matching* line is naturally recent, so using it would fire a rotation
     #: gap on almost every fetch.
     oldest_line_timestamp: Optional[str] = None
+    redaction_counts: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -70,6 +72,7 @@ class RetrievalOutcome:
     pods_failed: int = 0
     oldest_line_timestamp: Optional[str] = None
     earliest_pod_start = None
+    redaction_counts: dict = field(default_factory=dict)
 
 
 # ======================================================================
@@ -215,7 +218,7 @@ def _read_instance(target: PodTarget, window: TimeWindow, previous: bool,
 
 
 def read_pod_logs(target: PodTarget, window: TimeWindow,
-                  selector=None) -> PodFetchOutcome:
+                  selector=None, allowlist=None) -> PodFetchOutcome:
     """Read current -- and, after a restart, previous -- logs for one target."""
     selector = selector if selector is not None else KeepAllSelector()
     outcome = PodFetchOutcome(target=target)
@@ -293,6 +296,12 @@ def read_pod_logs(target: PodTarget, window: TimeWindow,
             {"pod_name": target.pod_name, "container": target.container},
         ))
 
+    # Redact AFTER identifier filtering (the raw id had to stay matchable)
+    # and BEFORE the records escape this function toward persistence.
+    outcome.redaction_counts = redaction.redact_records(
+        outcome.records, allowlist=allowlist
+    )
+
     logger.debug(
         "Pod log read",
         pod_name=target.pod_name,
@@ -323,7 +332,7 @@ def _merge_stats(into: ParseStats, other: ParseStats):
 # ======================================================================
 
 def read_all(targets: list, window: TimeWindow,
-             selector_factory=None) -> RetrievalOutcome:
+             selector_factory=None, allowlist=None) -> RetrievalOutcome:
     """Read every target with bounded parallelism.
 
     Sequential reads across 10+ replicas would be too slow inside a request
@@ -343,6 +352,7 @@ def read_all(targets: list, window: TimeWindow,
             lambda t: read_pod_logs(
                 t, window,
                 selector_factory() if selector_factory else KeepAllSelector(),
+                allowlist=allowlist,
             ),
             targets,
         ))
@@ -362,6 +372,10 @@ def read_all(targets: list, window: TimeWindow,
             outcome.earliest_pod_start is None or started < outcome.earliest_pod_start
         ):
             outcome.earliest_pod_start = started
+        for label, count in (result.redaction_counts or {}).items():
+            outcome.redaction_counts[label] = (
+                outcome.redaction_counts.get(label, 0) + count
+            )
         _merge_stats(outcome.stats, result.stats)
 
     outcome.records.sort(key=_ordering_key)

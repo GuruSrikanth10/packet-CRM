@@ -630,7 +630,8 @@ criteria are met.**
 | 3 | **Complete** | `k8s/parser.py`, `k8s/retrieval.py`. 59 tests, including the `branch_on_error` regression guard. |
 | 4 | **Complete** | `k8s/filtering.py` (identifier matching, context windows), `k8s/gaps.py` (detection + banner). 33 tests. Retrieval's boolean line filter became a stateful selector, since context windows need lookback. |
 | 5 | **Complete** | `src/tools/fetch_pod_logs.py` operator CLI. 16 tests. Rotation detection was corrected during this phase: it now uses the *unfiltered* stream boundary and is suppressed when the pod is younger than the missing span (see 5.8). |
-| 6-10 | Not started | |
+| 6 | **Complete** | `src/log_pipeline/redaction.py`, wired into retrieval after filtering and before return. 20 tests including the over-redaction guard. |
+| 7-10 | Not started | |
 
 Full suite: 191 passed.
 
