@@ -13,8 +13,10 @@ import json
 import os
 
 from src.log_pipeline.catalog import TemplateCatalog
-from src.log_pipeline.fetcher import fetch_logs
 from src.log_pipeline.reducer import branch_on_error, cluster_logs, apply_evidence_guardrails
+from src.log_pipeline.sources.base import LogSource
+from src.log_pipeline.sources.elastic import ElasticLogSource
+from src.log_pipeline.types import FetchContext, TimeWindow
 from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -31,6 +33,16 @@ def _get_catalog() -> TemplateCatalog:
     return _cached_catalog
 
 
+def _get_source() -> LogSource:
+    """Return the Stage 1 log source.
+
+    Phase 9 replaces this with `LOG_SOURCE` chain dispatch. Until then it is
+    unconditionally Elasticsearch, preserving today's behaviour. Not cached --
+    the source is stateless, so construction is free.
+    """
+    return ElasticLogSource()
+
+
 def reduce_logs(event_id: str) -> str:
     """Run the full log reduction pipeline for an event_id.
 
@@ -41,9 +53,14 @@ def reduce_logs(event_id: str) -> str:
     catalog = _get_catalog()
 
     # ------------------------------------------------------------------
-    # Stage 1: Fetch
+    # Stage 1: Fetch (through the LogSource seam -- see sources/base.py)
     # ------------------------------------------------------------------
-    raw_logs = fetch_logs(event_id, catalog=catalog)
+    fetch_result = _get_source().fetch(
+        event_id,
+        TimeWindow.default(),
+        FetchContext(event_id=event_id, catalog=catalog),
+    )
+    raw_logs = fetch_result.records
 
     if not raw_logs:
         return f"No logs found for ID: {event_id}"
