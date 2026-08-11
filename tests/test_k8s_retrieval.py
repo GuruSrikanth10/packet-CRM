@@ -286,7 +286,11 @@ def test_unavailable_client_fails_cleanly():
 # Filter seam (Phase 4 supplies the real identifier filter)
 # ======================================================================
 
-def test_line_filter_is_applied(monkeypatch, tmp_path):
+def test_selector_is_applied(monkeypatch, tmp_path):
+    from src.log_pipeline.sources.k8s.filtering import (
+        ContextWindowSelector, build_matcher,
+    )
+
     _write_fixture(tmp_path, "enu", "pod-a", current="\n".join([
         f"{KUBELET_TS} INFO keep evt-123",
         f"{KUBELET_TS} INFO drop this one",
@@ -294,9 +298,8 @@ def test_line_filter_is_applied(monkeypatch, tmp_path):
     ]) + "\n")
     monkeypatch.setenv("K8S_FIXTURE_DIR", str(tmp_path))
 
-    outcome = retrieval.read_pod_logs(
-        _target(), TimeWindow.default(), line_filter=lambda line: "evt-123" in line
-    )
+    selector = ContextWindowSelector(build_matcher(["evt-123"]), before=0, after=0)
+    outcome = retrieval.read_pod_logs(_target(), TimeWindow.default(), selector=selector)
 
     assert len(outcome.records) == 2
     assert all("evt-123" in r["message"] for r in outcome.records)

@@ -25,6 +25,7 @@ from typing import Callable, Iterator, Optional
 from src.log_pipeline.sources.k8s import client as k8s_client_module
 from src.log_pipeline.sources.k8s import fixtures
 from src.log_pipeline.sources.k8s.discovery import PodTarget
+from src.log_pipeline.sources.k8s.filtering import KeepAllSelector
 from src.log_pipeline.sources.k8s.parser import ParseStats, parse_line
 from src.log_pipeline.types import EvidenceGap, GapType, TimeWindow
 from src.utils.logging_config import get_logger
@@ -32,9 +33,6 @@ from src.utils.logging_config import get_logger
 logger = get_logger(__name__)
 
 _CHUNK_SIZE = 65536
-
-#: Keep every line. Phase 4 supplies a real identifier filter here.
-KEEP_ALL: Callable[[str], bool] = lambda _line: True
 
 
 @dataclass
@@ -161,35 +159,34 @@ def _open_stream(target: PodTarget, window: TimeWindow, previous: bool):
 
 
 def _read_instance(target: PodTarget, window: TimeWindow, previous: bool,
-                   line_filter: Callable[[str], bool]) -> tuple:
-    """Read one container instance. Returns (records, stats, bytes, truncated)."""
+                   selector) -> tuple:
+    """Read one container instance. Returns (records, stats, bytes, truncated).
+
+    `selector` is stateful and fed every line in order, returning the lines to
+    emit -- that is what lets a match pull in the preceding context lines it
+    needs. It is reset per instance so a previous container's trailing context
+    cannot leak into the current one.
+    """
     records, stats, total_bytes, truncated = [], ParseStats(), 0, False
     instance = "previous" if previous else "current"
+    selector.reset()
 
     for line, total_bytes, hit_cap in _open_stream(target, window, previous):
-        if not line.strip():
-            if hit_cap:
-                truncated = True
-                break
-            continue
+        if line.strip():
+            for emitted in selector.feed(line):
+                record, level_ok, was_json = parse_line(
+                    emitted, default_app=target.container
+                )
+                record["pod_name"] = target.pod_name
+                record["container"] = target.container
+                record["container_instance"] = instance
+                records.append(record)
 
-        if not line_filter(line):
-            if hit_cap:
-                truncated = True
-                break
-            continue
-
-        record, level_ok, was_json = parse_line(line, default_app=target.container)
-        record["pod_name"] = target.pod_name
-        record["container"] = target.container
-        record["container_instance"] = instance
-        records.append(record)
-
-        stats.total += 1
-        if level_ok:
-            stats.level_parsed += 1
-        if was_json:
-            stats.json_lines += 1
+                stats.total += 1
+                if level_ok:
+                    stats.level_parsed += 1
+                if was_json:
+                    stats.json_lines += 1
 
         if hit_cap:
             truncated = True
@@ -199,8 +196,9 @@ def _read_instance(target: PodTarget, window: TimeWindow, previous: bool,
 
 
 def read_pod_logs(target: PodTarget, window: TimeWindow,
-                  line_filter: Callable[[str], bool] = KEEP_ALL) -> PodFetchOutcome:
+                  selector=None) -> PodFetchOutcome:
     """Read current -- and, after a restart, previous -- logs for one target."""
+    selector = selector if selector is not None else KeepAllSelector()
     outcome = PodFetchOutcome(target=target)
 
     # Previous first: those lines precede the restart chronologically, and
@@ -208,7 +206,7 @@ def read_pod_logs(target: PodTarget, window: TimeWindow,
     if target.restarted:
         try:
             records, stats, read_bytes, truncated = _read_instance(
-                target, window, previous=True, line_filter=line_filter
+                target, window, previous=True, selector=selector
             )
             outcome.records.extend(records)
             outcome.bytes_read += read_bytes
@@ -234,7 +232,7 @@ def read_pod_logs(target: PodTarget, window: TimeWindow,
 
     try:
         records, stats, read_bytes, truncated = _read_instance(
-            target, window, previous=False, line_filter=line_filter
+            target, window, previous=False, selector=selector
         )
         outcome.records.extend(records)
         outcome.bytes_read += read_bytes
@@ -295,7 +293,7 @@ def _merge_stats(into: ParseStats, other: ParseStats):
 # ======================================================================
 
 def read_all(targets: list, window: TimeWindow,
-             line_filter: Callable[[str], bool] = KEEP_ALL) -> RetrievalOutcome:
+             selector_factory=None) -> RetrievalOutcome:
     """Read every target with bounded parallelism.
 
     Sequential reads across 10+ replicas would be too slow inside a request
@@ -308,7 +306,16 @@ def read_all(targets: list, window: TimeWindow,
 
     workers = min(_concurrency(), len(targets))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="k8s-logs") as pool:
-        results = list(pool.map(lambda t: read_pod_logs(t, window, line_filter), targets))
+        # Each target gets its OWN selector: the selector is stateful, and
+        # sharing one across concurrent pods would interleave their context
+        # buffers and emit lines against the wrong pod.
+        results = list(pool.map(
+            lambda t: read_pod_logs(
+                t, window,
+                selector_factory() if selector_factory else KeepAllSelector(),
+            ),
+            targets,
+        ))
 
     for result in results:
         outcome.pods_queried += 1

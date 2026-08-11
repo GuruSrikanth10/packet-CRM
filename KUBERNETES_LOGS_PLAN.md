@@ -628,8 +628,10 @@ criteria are met.**
 | 1 | **Complete** | `types.py`, `sources/base.py`, `sources/elastic.py`; `reduce_logs` routes through the seam. `fetcher.py` untouched. 16 tests. |
 | 2 | **Complete** | `k8s/client.py`, `k8s/fixtures.py`, `k8s/discovery.py`; `kubernetes` added to requirements; config in `.env.example`. 26 tests. |
 | 3 | **Complete** | `k8s/parser.py`, `k8s/retrieval.py`. 59 tests, including the `branch_on_error` regression guard. |
-| 4 | In progress | Filtering, context windows, evidence gaps. |
+| 4 | **Complete** | `k8s/filtering.py` (identifier matching, context windows), `k8s/gaps.py` (detection + banner). 33 tests. Retrieval's boolean line filter became a stateful selector, since context windows need lookback. |
 | 5-10 | Not started | Phase 5 is the second decision gate (real-cluster validation). |
+
+Full suite: 191 passed.
 
 Phases 2+ were built ahead of the Phase 0 decision gate at the user's explicit
 direction. Nothing is wired into the packet path yet: the pipeline still uses
