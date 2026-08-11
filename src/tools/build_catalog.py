@@ -108,6 +108,26 @@ def main():
     catalog.save()
     print(f"\n[BUILD_CATALOG] Done. Catalog saved to {args.output} with {catalog.size} templates.")
 
+    # Sanity check: before 0.1's Drain3 cross-flow leak fix, every template
+    # ever seen (across every flow, not just the ones sampled here) got fed
+    # into this pct calculation, which pushed nearly everything over the
+    # boilerplate threshold. A catalog where the vast majority of templates
+    # are classified boilerplate is a symptom of that leak recurring (or of
+    # a sample that's too homogeneous to be representative), not a healthy
+    # catalog -- flag it loudly instead of silently shipping it (1.2).
+    if catalog.size > 0:
+        boilerplate_count = sum(
+            1 for tid in template_stats if catalog.get_classification(tid) == "boilerplate"
+        )
+        boilerplate_share = boilerplate_count / catalog.size
+        print(f"[BUILD_CATALOG] Boilerplate share: {boilerplate_share:.1%} ({boilerplate_count}/{catalog.size})")
+        if boilerplate_share > 0.40:
+            print(
+                f"[BUILD_CATALOG] WARNING: {boilerplate_share:.1%} of templates classified as "
+                "boilerplate is implausibly high. Verify the Drain3 state file isn't leaking "
+                "templates across flows (see reducer.cluster_logs) before trusting this catalog."
+            )
+
 
 if __name__ == "__main__":
     main()

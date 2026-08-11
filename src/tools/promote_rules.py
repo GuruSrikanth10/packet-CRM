@@ -41,9 +41,13 @@ def promote_rules():
             return
             
         print(f"Found {len(lines)} pending rules.")
-        
-        # We process them sequentially
+
+        # We process them sequentially. Only lines that are actually
+        # promoted get removed below -- skipped rules, rules that errored,
+        # and anything a running agent appends to pending_file during this
+        # (potentially long, interactive) loop must all survive (1.7).
         promoted_count = 0
+        promoted_raw_lines = set()
         for i, line in enumerate(lines):
             try:
                 entry = json.loads(line.strip())
@@ -51,29 +55,36 @@ def promote_rules():
                 print(f"Event ID: {entry.get('eventId')}")
                 print(f"Reasoning: {entry.get('reviewer_reasoning')}")
                 print(f"Proposed Rule: {entry.get('proposed_rule')}")
-                
+
                 choice = input("\nPromote this rule? (y/N): ").strip().lower()
                 if choice == 'y':
                     # Append to InvestigatorAgent.md
                     with open(target_file, "a", encoding="utf-8") as f_target:
                         f_target.write(f"\n- CRITICAL RULE: {entry.get('proposed_rule')}\n")
-                        
+
                     # Commit via git
                     commit_msg = f"Add learning rule from event {entry.get('eventId')}"
                     subprocess.run(["git", "add", target_file], check=True)
                     subprocess.run(["git", "commit", "-m", commit_msg], check=True)
                     print("Rule promoted and committed!")
                     promoted_count += 1
+                    promoted_raw_lines.add(line.strip())
                 else:
                     print("Rule skipped.")
             except Exception as e:
                 print(f"Error processing rule {i+1}: {e}")
-                
-        # Clear the pending file after processing, acquiring lock briefly
+
+        # Rewrite the pending file, keeping every entry that was not
+        # promoted. Re-read fresh (rather than reusing the stale `lines`
+        # from the initial read) so anything appended concurrently during
+        # this interactive session is preserved too.
         with FileLock(file_lock_path, timeout=10):
+            with open(pending_file, "r", encoding="utf-8") as f:
+                current_lines = f.readlines()
+            remaining_lines = [ln for ln in current_lines if ln.strip() not in promoted_raw_lines]
             with open(pending_file, "w", encoding="utf-8") as f:
-                pass
-                
+                f.writelines(remaining_lines)
+
         print(f"\nFinished. Promoted {promoted_count} rules.")
     finally:
         promo_lock.release()

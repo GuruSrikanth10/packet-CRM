@@ -14,7 +14,8 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
             
         os.makedirs(self.base_dir, exist_ok=True)
         
-    def _get_dir(self, event_id: str) -> Path:
+    def _resolve_dir(self, event_id: str) -> Path:
+        """Resolve the casebook directory for event_id without creating it."""
         base_resolved = self.base_dir.resolve()
         target_dir = (self.base_dir / f"casebook_{event_id}").resolve()
 
@@ -25,6 +26,16 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
         except ValueError:
             raise ValueError(f"Resolved casebook directory escapes storage root: {target_dir}")
 
+        return target_dir
+
+    def _get_dir(self, event_id: str) -> Path:
+        """Resolve and create the casebook directory for event_id.
+
+        Only save() should create directories -- load()/exists() calling
+        this used to create an empty casebook_<id>/ directory for every
+        existence check, including events that were skipped entirely (1.17).
+        """
+        target_dir = self._resolve_dir(event_id)
         os.makedirs(target_dir, exist_ok=True)
         return target_dir
 
@@ -33,18 +44,18 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
         final_path = target_dir / filename
         tmp_path = target_dir / f"{filename}.tmp"
         lock_path = target_dir / f"{filename}.lock"
-        
+
         # Enforce schema version for backwards compatibility
         if "schema_version" not in casebook:
             casebook["schema_version"] = "1.0"
-        
+
         with FileLock(str(lock_path), timeout=10):
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(casebook, f, indent=4, ensure_ascii=False)
             os.replace(tmp_path, final_path)
-            
+
     def load(self, event_id: str, filename: str = "casebook.json") -> Optional[dict]:
-        target_dir = self._get_dir(event_id)
+        target_dir = self._resolve_dir(event_id)
         final_path = target_dir / filename
         lock_path = target_dir / f"{filename}.lock"
         

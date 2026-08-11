@@ -1,6 +1,7 @@
 import os
-import functools
+from typing import Optional
 import pandas as pd
+from cachetools import TTLCache
 from langchain_core.tools import tool
 from sqlalchemy import create_engine
 import pymysql
@@ -10,6 +11,27 @@ import pybreaker
 
 _DB_CACHE = None
 _LIVE_DB_ENGINE = None
+
+# A plain functools.lru_cache here would cache for the process lifetime,
+# including failure strings -- one transient MySQL blip would then poison
+# that reason code until restart, and live rule edits would never take
+# effect (1.1). TTLCache bounds both problems: entries expire on their own.
+_RULE_CACHE_TTL_SECONDS = int(os.environ.get("RULE_CACHE_TTL_SECONDS", "600"))
+_rule_cache: TTLCache = TTLCache(maxsize=256, ttl=_RULE_CACHE_TTL_SECONDS)
+
+# Results that reflect a broken lookup (DB unreachable, misconfigured mock
+# file) rather than a legitimate answer for this reason_code. These must
+# never be cached -- caching them would keep serving the failure to every
+# caller of this reason_code until the TTL expires.
+_UNCACHEABLE_RESULT_PREFIXES = (
+    "Failed to query live DB",
+    "Mock database is empty",
+    "Could not find a valid Reason Code column",
+)
+
+
+def _is_uncacheable_result(result: str) -> bool:
+    return any(result.startswith(p) for p in _UNCACHEABLE_RESULT_PREFIXES)
 
 def get_live_db_engine():
     global _LIVE_DB_ENGINE
@@ -80,9 +102,22 @@ def lookup_error_code(error_code: str) -> str:
 @tool
 @db_breaker
 @retry_transient
-@functools.lru_cache(maxsize=128)
 def lookup_rule_by_reason_code(reason_code: str) -> str:
     """Lookup the exact corresponding rule (including ruleId, payload, etc.) for a given reason code."""
+    cached_result = _rule_cache.get(reason_code)
+    if cached_result is not None:
+        print(f"[TOOL] Cache hit for rule lookup: {reason_code}")
+        return cached_result
+
+    result = _lookup_rule_by_reason_code_impl(reason_code)
+
+    if not _is_uncacheable_result(result):
+        _rule_cache[reason_code] = result
+
+    return result
+
+
+def _lookup_rule_by_reason_code_impl(reason_code: str) -> str:
     print(f"\n[TOOL] lookup_rule_by_reason_code triggered for: {reason_code}")
     use_mock = get_bool_env("USE_MOCK_DB", True)
     if use_mock:
@@ -135,28 +170,34 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
 @tool
 @es_breaker
 @retry_transient
-def fetch_elastic_logs(event_id: str) -> str:
+def fetch_elastic_logs(event_id: str) -> Optional[str]:
     """Fetch and reduce logs from Elastic using the 6-stage log reduction pipeline.
-    
+
     Stages:
       1. Paginated ES fetch with source-filtering and catalog-driven must_not.
       2. Branch on ERROR presence (stuck path vs approve/reject path).
       3. Drain3 clustering with persisted state for stable template IDs.
       4. Evidence assembly guardrails (decision-vocabulary, rare templates, boundaries).
-    
-    Returns a compact, evidence-preserving string for LLM context injection.
+
+    Returns a compact, evidence-preserving string for LLM context injection,
+    or None if logs could not be fetched/processed. Callers must check for
+    None rather than pattern-matching an error-prefixed string -- there were
+    previously two different failure-string prefixes ("Failed to query..."
+    and "Failed to process logs...") and callers only ever checked for one
+    of them, so the other silently flowed downstream as if it were log
+    content (1.6).
     """
     print(f"\n[TOOL] fetch_elastic_logs triggered for: {event_id}")
-    
+
     try:
         from src.log_pipeline.pipeline import reduce_logs
         return reduce_logs(event_id)
     except pybreaker.CircuitBreakerError:
         print("[TOOL] ES Circuit breaker is OPEN. Failing fast.")
-        return f"Failed to query Elastic: Circuit Breaker Open"
+        return None
     except Exception as e:
         print(f"[TOOL] Log reduction pipeline failed: {e}")
-        return f"Failed to process logs: {e}"
+        return None
 
 @tool
 def fetch_kubernetes_logs(pod_id: str) -> str:
@@ -187,7 +228,12 @@ def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, cat
         endpoint = f"{base_url}/api/v1/forceReplay"
         print(f"[TOOL] Auto-replay enabled. Firing POST to {endpoint}")
         try:
-            response = requests.post(endpoint, params=payload, timeout=10)
+            # Sent as a JSON body with an auth header rather than query
+            # params -- query params land in server access logs, which would
+            # leak notificationEmail/notificationMobile there (1.8).
+            ois_api_key = os.environ.get("OIS_API_KEY")
+            headers = {"X-API-Key": ois_api_key} if ois_api_key else {}
+            response = requests.post(endpoint, json=payload, headers=headers, timeout=10)
             response.raise_for_status()
             return f"Successfully auto-replayed packet {id}: {response.text}"
         except Exception as e:

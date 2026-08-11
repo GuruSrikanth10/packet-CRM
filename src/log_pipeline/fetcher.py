@@ -12,6 +12,11 @@ import json
 from typing import Optional
 
 from src.log_pipeline.catalog import TemplateCatalog
+from src.utils.env import get_bool_env
+
+# Hard cap on total documents pulled per event_id -- without this, a noisy
+# event can pull an unbounded number of rows into memory (1.10).
+LOG_MAX_DOCUMENTS = int(os.environ.get("LOG_MAX_DOCUMENTS", "50000"))
 
 
 def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None) -> list[dict]:
@@ -83,7 +88,16 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None) -> list
     if es_user and es_pass:
         auth_args["basic_auth"] = (es_user, es_pass)
 
-    es_client = Elasticsearch(es_host, verify_certs=False, **auth_args)
+    # Certificate verification defaults ON -- it was previously disabled
+    # unconditionally with no override, and no request timeout was set (1.9).
+    es_verify_certs = get_bool_env("ES_VERIFY_CERTS", True)
+    es_request_timeout = float(os.environ.get("ES_REQUEST_TIMEOUT_SECONDS", "30"))
+    es_client = Elasticsearch(
+        es_host,
+        verify_certs=es_verify_certs,
+        request_timeout=es_request_timeout,
+        **auth_args,
+    )
 
     # Build query --------------------------------------------------------
     must_clauses = [
@@ -149,6 +163,16 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None) -> list
                 "app_name": source.get("application_name", "unknown-service"),
             })
             search_after_values = hit["sort"]
+
+        if len(logs) >= LOG_MAX_DOCUMENTS:
+            print(f"[FETCHER] Hit LOG_MAX_DOCUMENTS cap ({LOG_MAX_DOCUMENTS}); truncating results for {event_id}.")
+            logs = logs[:LOG_MAX_DOCUMENTS]
+            break
+
+        # A short page means this was the last one -- no point issuing one
+        # more search_after request just to receive an empty page (1.10).
+        if len(hits) < page_size:
+            break
 
     print(f"[FETCHER] Fetched {len(logs)} logs from Elasticsearch.")
     return logs

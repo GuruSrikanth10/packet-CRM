@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import threading
 import concurrent.futures
 from fastapi import APIRouter, Depends, HTTPException, Security, Request
 from fastapi.security import APIKeyHeader
@@ -33,7 +34,7 @@ def _get_agent_invoke_timeout_seconds() -> float:
     """
     packet_timeout = float(os.environ.get("PACKET_TIMEOUT_SECONDS", "300"))
     default_budget = max(packet_timeout - 30, 30)
-    return float(os.environ.get("agent_invoke_timeout_seconds", default_budget))
+    return float(os.environ.get("AGENT_INVOKE_TIMEOUT_SECONDS", default_budget))
 
 router = APIRouter()
 
@@ -44,6 +45,10 @@ API_KEYS = [os.environ.get("PACKET_CRM_API_KEY", "dev-secret-key")]
 RATE_LIMIT = 10
 RATE_WINDOW = 60
 _rate_limits = {}
+# FastAPI runs sync dependencies like this one in a threadpool, so concurrent
+# requests from different IPs (or racing requests from the same IP) can
+# interleave a read-modify-write on _rate_limits without a lock (1.19).
+_rate_limits_lock = threading.Lock()
 
 def get_api_key(api_key_header: str = Security(API_KEY_HEADER)):
     if api_key_header in API_KEYS:
@@ -53,24 +58,25 @@ def get_api_key(api_key_header: str = Security(API_KEY_HEADER)):
 def rate_limiter(request: Request):
     client_ip = request.client.host
     current_time = time.time()
-    
-    # Periodically evict stale IPs to prevent unbounded memory growth
-    if len(_rate_limits) > 1000:
-        stale_ips = [ip for ip, ts_list in _rate_limits.items() 
-                     if not ts_list or (current_time - max(ts_list)) > RATE_WINDOW]
-        for ip in stale_ips:
-            del _rate_limits[ip]
-    
-    # Initialize or clean up old entries
-    if client_ip not in _rate_limits:
-        _rate_limits[client_ip] = []
-        
-    _rate_limits[client_ip] = [t for t in _rate_limits[client_ip] if current_time - t < RATE_WINDOW]
-    
-    if len(_rate_limits[client_ip]) >= RATE_LIMIT:
-        raise HTTPException(status_code=429, detail="Too Many Requests")
-        
-    _rate_limits[client_ip].append(current_time)
+
+    with _rate_limits_lock:
+        # Periodically evict stale IPs to prevent unbounded memory growth
+        if len(_rate_limits) > 1000:
+            stale_ips = [ip for ip, ts_list in _rate_limits.items()
+                         if not ts_list or (current_time - max(ts_list)) > RATE_WINDOW]
+            for ip in stale_ips:
+                del _rate_limits[ip]
+
+        # Initialize or clean up old entries
+        if client_ip not in _rate_limits:
+            _rate_limits[client_ip] = []
+
+        _rate_limits[client_ip] = [t for t in _rate_limits[client_ip] if current_time - t < RATE_WINDOW]
+
+        if len(_rate_limits[client_ip]) >= RATE_LIMIT:
+            raise HTTPException(status_code=429, detail="Too Many Requests")
+
+        _rate_limits[client_ip].append(current_time)
 
 @router.get("/health")
 def health_check():
@@ -225,12 +231,17 @@ def process_rejection(signal: MessagePayload):
         log.error("Unhandled exception during agent processing", exc_info=True, state="DLQ")
         publish_to_dlq(signal_dict, error_msg)
 
-        # Mark as FAILED_PERMANENT in storage so it doesn't get re-run on redelivery
-        storage.save(event_id, {
+        # Mark as DLQ in storage so it doesn't get re-run on redelivery. Both
+        # files must move to a terminal status together -- leaving
+        # status.json at IN_PROGRESS here previously left it stuck forever,
+        # since only casebook.json was written (1.5).
+        dlq_status = {
             "packet_metadata": {"eid": event_id},
             "packet_status": {"status": "DLQ"},
             "resolution": {"synthesis": f"Failed with {type(e).__name__}: {str(e)}"}
-        })
+        }
+        storage.save(event_id, dlq_status)
+        storage.save(event_id, dlq_status, filename="status.json")
         return {"status": "dlq", "event_id": event_id, "error": str(e)}
     finally:
         # Don't block the response on a hung/slow invocation still running in
@@ -275,14 +286,29 @@ def process_rejection(signal: MessagePayload):
     # The original logs fetch string is in result.get("logs") if we passed it back, 
     # but the orchestrator state keeps it inside the graph state memory.
     # To get it, we need to extract from `result`. Wait, `agent.invoke` returns the final state dict!
-    raw_logs = result.get("logs", "")
+    # fetch_elastic_logs returns None (not an error-prefixed string) on
+    # failure, so a plain falsiness check is sufficient and doesn't miss
+    # failure modes with a different message prefix (1.6).
+    raw_logs = result.get("logs")
     processed_logs = None
-    
-    if not raw_logs or raw_logs == "Log fetching disabled." or raw_logs.startswith("Failed to query"):
+
+    if not raw_logs or raw_logs == "Log fetching disabled.":
         processed_logs = None
     elif len(raw_logs) > 5000:
         print("[API] Logs are too large for JSON, uploading to S3...")
-        processed_logs = upload_logs_to_s3(event_id, raw_logs)
+        uploaded_url = upload_logs_to_s3(event_id, raw_logs)
+        if uploaded_url:
+            processed_logs = uploaded_url
+        else:
+            # S3 not configured or the upload failed -- previously this
+            # silently substituted a fake s3://mock-bucket/... URL while
+            # discarding the actual log text (1.12). Keep a truncated copy
+            # inline instead of losing the evidence entirely.
+            log.warning(
+                "S3 upload unavailable; embedding truncated logs inline instead of an S3 URL",
+                state="LOGS_TRUNCATED",
+            )
+            processed_logs = raw_logs[:5000] + "\n...[TRUNCATED: S3 upload unavailable, see raw_logs.txt on disk for the full trace]"
     else:
         processed_logs = raw_logs
         

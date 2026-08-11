@@ -6,14 +6,22 @@ import os
 # the two don't compound into surprising multi-minute retry storms.
 LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "60"))
 
+# The only two tiers any caller passes (see agent_orchestrator.get_agent).
+# A typo'd or stale tier name (e.g. "medium") used to silently fall through
+# to the "simple" branch via the bare `else` below (1.4) -- fail fast instead.
+_VALID_TIERS = ("complex", "simple")
+
 def get_llm(tier: str = "complex"):
     """
     Centralized LLM factory.
     If USE_HF=true, uses Hugging Face Inference Endpoints as a free fallback.
     Otherwise, uses the local/proxy OpenAI-compatible endpoint.
     """
+    if tier not in _VALID_TIERS:
+        raise ValueError(f"Unknown LLM tier '{tier}'. Valid tiers: {_VALID_TIERS}")
+
     use_hf = os.environ.get("USE_HF", "false").lower() == "true"
-    
+
     if use_hf:
         try:
             from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint

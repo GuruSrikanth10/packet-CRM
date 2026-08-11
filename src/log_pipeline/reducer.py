@@ -17,6 +17,7 @@ from src.log_pipeline.config import (
     DECISION_VOCABULARY_REGEX,
     DRAIN3_STATE_DIR,
     ERROR_CONTEXT_LINES,
+    ERROR_TRAILING_LINES,
     RARE_TEMPLATE_THRESHOLD,
 )
 from src.log_pipeline.catalog import TemplateCatalog
@@ -46,15 +47,19 @@ def branch_on_error(logs: list[dict]) -> dict:
     if not error_indices:
         return {"has_error": False, "payload": []}
 
-    # Take ERROR lines + preceding N context lines
+    # Take ERROR lines + preceding N context lines, and a bounded trailing
+    # window after the last error. Previously this kept everything from the
+    # first error to the end of the trace -- on a cascading failure that is
+    # effectively the whole log (1.11).
     first_error_idx = error_indices[0]
+    last_error_idx = error_indices[-1]
     context_start = max(0, first_error_idx - ERROR_CONTEXT_LINES)
+    context_end = min(len(logs), last_error_idx + 1 + ERROR_TRAILING_LINES)
 
-    # Include everything from context_start to end (errors may cascade)
-    trimmed = logs[context_start:]
+    trimmed = logs[context_start:context_end]
 
     print(f"[REDUCER] ERROR branch: found {len(error_indices)} error(s). "
-          f"Trimmed to {len(trimmed)} lines (from index {context_start}).")
+          f"Trimmed to {len(trimmed)} lines (from index {context_start} to {context_end}).")
 
     return {"has_error": True, "payload": trimmed}
 
@@ -169,7 +174,7 @@ def apply_evidence_guardrails(
     clusters: list[dict],
     raw_logs: list[dict],
     catalog: Optional[TemplateCatalog] = None,
-) -> list[dict]:
+) -> dict:
     """Post-process clusters to enforce evidence retention rules.
 
     Regardless of catalog classification, always force full-text retention for:

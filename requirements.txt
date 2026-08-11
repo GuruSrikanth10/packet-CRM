@@ -22,3 +22,7 @@ pybreaker
 structlog
 langgraph-checkpoint-sqlite
 drain3
+langchain-mistralai
+cachetools
+httpx
+pytest

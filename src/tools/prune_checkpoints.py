@@ -83,7 +83,7 @@ def main():
     conn.execute("VACUUM") # Reclaim disk space
     conn.close()
     
-    print("\n✅ Pruning Complete!")
+    print("\nPruning Complete!")
     print(f"Deleted {deleted_checkpoints} rows from checkpoints")
     print(f"Deleted {deleted_writes} rows from checkpoints_writes")
     print(f"Deleted {deleted_blobs} rows from checkpoints_blobs (if applicable)")

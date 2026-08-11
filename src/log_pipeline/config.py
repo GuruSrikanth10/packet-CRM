@@ -13,6 +13,11 @@ import re
 # How many INFO lines preceding the first ERROR to keep as context.
 ERROR_CONTEXT_LINES = int(os.environ.get("LOG_ERROR_CONTEXT_LINES", "200"))
 
+# How many lines after the last ERROR to keep as trailing context. Without a
+# cap, a cascading failure keeps everything from the first error to the end
+# of the trace, which is effectively the whole log (1.11).
+ERROR_TRAILING_LINES = int(os.environ.get("LOG_ERROR_TRAILING_LINES", "200"))
+
 # ---------------------------------------------------------------------------
 # Stage 3 -- Drain3 clustering
 # ---------------------------------------------------------------------------

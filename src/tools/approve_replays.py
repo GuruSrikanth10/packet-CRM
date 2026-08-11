@@ -30,32 +30,42 @@ def main():
         
     base_url = os.environ.get("OIS_FEIGN_BASE_URL", "http://10.10.79.62:31261/ois/hold/v1")
     endpoint = f"{base_url}/api/v1/forceReplay"
+    ois_api_key = os.environ.get("OIS_API_KEY")
+    headers = {"X-API-Key": ois_api_key} if ois_api_key else {}
+    if not ois_api_key:
+        print("Warning: OIS_API_KEY is not set; replay calls will be sent unauthenticated.")
 
     print(f"Loading pending replays from {queue_file}...")
-    
+
     replays = []
+    replay_raw_lines = []
     with FileLock(lock_file, timeout=10):
         with open(queue_file, "r", encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if line:
-                    replays.append(json.loads(line))
-                    
+                stripped = line.strip()
+                if stripped:
+                    replays.append(json.loads(stripped))
+                    replay_raw_lines.append(stripped)
+
     if not replays:
         print("Queue is empty.")
         return
 
-    remaining_replays = []
-    
+    # Track which raw lines were actually consumed (successfully replayed,
+    # or explicitly discarded) so the final rewrite below only removes those
+    # -- anything appended to the queue file by a live investigation while
+    # this interactive loop is running must survive (1.7/1.8).
+    consumed_raw_lines = set()
+
     for i, replay in enumerate(replays):
         payload = replay.get("payload", {})
         packet_id = payload.get("id", "UNKNOWN")
         category = payload.get("category", "")
-        
+        raw_line = replay_raw_lines[i]
+
         if args.filter_category and args.filter_category.lower() != category.lower():
-            remaining_replays.append(replay)
             continue
-            
+
         print("\n" + "="*50)
         print(f"Replay Request {i+1}/{len(replays)}")
         print(f"Timestamp: {replay.get('timestamp')}")
@@ -63,35 +73,43 @@ def main():
         print(f"Category: {category}")
         print(f"Priority: {payload.get('priority')}")
         print("="*50)
-        
+
         if args.approve_all:
             action = 'y'
             print("Auto-approving due to --approve-all flag.")
         else:
             action = input("Approve and execute this replay? (y/n/skip): ").strip().lower()
-        
+
         if action == 'y':
             print(f"Firing HTTP POST to {endpoint}...")
             try:
-                response = requests.post(endpoint, params=payload, timeout=10)
+                # Sent as a JSON body with an auth header rather than query
+                # params -- query params land in server access logs, which
+                # would leak notificationEmail/notificationMobile there (1.8).
+                response = requests.post(endpoint, json=payload, headers=headers, timeout=10)
                 response.raise_for_status()
-                print(f"✅ Success: {response.text}")
+                print(f"Success: {response.text}")
+                consumed_raw_lines.add(raw_line)
             except Exception as e:
-                print(f"❌ Failed: {e}")
+                print(f"Failed: {e}")
                 print("Keeping in queue to try again later.")
-                remaining_replays.append(replay)
         elif action == 'n':
             print("Discarding request.")
+            consumed_raw_lines.add(raw_line)
         else:
             print("Skipping request.")
-            remaining_replays.append(replay)
-            
-    # Write back remaining replays
+
+    # Rewrite the queue, keeping every entry that wasn't consumed above.
+    # Re-read fresh (rather than reusing the stale `replays` from the
+    # initial read) so anything a live investigation queued via
+    # queue_for_replay while this interactive loop was running survives (1.8).
     with FileLock(lock_file, timeout=10):
+        with open(queue_file, "r", encoding="utf-8") as f:
+            current_lines = f.readlines()
+        remaining_lines = [ln for ln in current_lines if ln.strip() not in consumed_raw_lines]
         with open(queue_file, "w", encoding="utf-8") as f:
-            for r in remaining_replays:
-                f.write(json.dumps(r) + "\n")
-                
+            f.writelines(remaining_lines)
+
     print("\nQueue processing complete.")
 
 if __name__ == "__main__":
