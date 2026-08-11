@@ -9,6 +9,10 @@ from sqlalchemy.exc import OperationalError
 db_breaker = pybreaker.CircuitBreaker(fail_max=3, reset_timeout=60)
 es_breaker = pybreaker.CircuitBreaker(fail_max=3, reset_timeout=60)
 llm_breaker = pybreaker.CircuitBreaker(fail_max=3, reset_timeout=60)
+# The Kubernetes source retries per-status rather than per-exception-type
+# (see log_pipeline/sources/k8s/retry.py); the breaker still guards against a
+# cluster that is down entirely.
+k8s_breaker = pybreaker.CircuitBreaker(fail_max=3, reset_timeout=60)
 
 # langchain-openai raises openai/httpx exceptions on transient failures, none
 # of which are requests/urllib3/ES/SQLAlchemy errors. Without these, LLM

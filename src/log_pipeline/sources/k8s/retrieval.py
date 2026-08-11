@@ -18,7 +18,8 @@ Two mandatory call parameters, both easy to omit and expensive to get wrong:
       running the LangGraph agents.
 """
 import os
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Optional
 
@@ -91,6 +92,13 @@ def _request_timeout() -> float:
         return float(os.environ.get("K8S_REQUEST_TIMEOUT_SECONDS", "30"))
     except ValueError:
         return 30.0
+
+
+def _total_fetch_timeout() -> float:
+    try:
+        return float(os.environ.get("K8S_TOTAL_FETCH_TIMEOUT_SECONDS", "60"))
+    except ValueError:
+        return 60.0
 
 
 def _concurrency() -> int:
@@ -344,18 +352,57 @@ def read_all(targets: list, window: TimeWindow,
         return outcome
 
     workers = min(_concurrency(), len(targets))
+    deadline = time.monotonic() + _total_fetch_timeout()
+    results, timed_out = [], False
+
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="k8s-logs") as pool:
         # Each target gets its OWN selector: the selector is stateful, and
         # sharing one across concurrent pods would interleave their context
         # buffers and emit lines against the wrong pod.
-        results = list(pool.map(
-            lambda t: read_pod_logs(
-                t, window,
+        futures = {
+            pool.submit(
+                read_pod_logs,
+                target,
+                window,
                 selector_factory() if selector_factory else KeepAllSelector(),
-                allowlist=allowlist,
-            ),
-            targets,
-        ))
+                allowlist,
+            ): target
+            for target in targets
+        }
+
+        # A wall-clock deadline across the whole fan-out. A slow cluster
+        # degrades to partial results plus a TRUNCATED gap rather than
+        # consuming the packet's entire AGENT_INVOKE_TIMEOUT_SECONDS budget.
+        for future in as_completed(futures):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                results.append(future.result())
+            except Exception as e:
+                logger.warning(
+                    "Pod read raised",
+                    pod_name=futures[future].pod_name,
+                    error=f"{type(e).__name__}: {e}",
+                )
+                outcome.pods_failed += 1
+
+        if timed_out:
+            unfinished = sum(1 for f in futures if not f.done())
+            logger.warning(
+                "Kubernetes fetch hit the wall-clock deadline",
+                unfinished_pods=unfinished,
+                budget_seconds=_total_fetch_timeout(),
+            )
+            outcome.gaps.append(EvidenceGap(
+                GapType.TRUNCATED,
+                f"the {_total_fetch_timeout()}s fetch budget expired with "
+                f"{unfinished} pod(s) unread; their logs are not represented below.",
+                {"unfinished_pods": unfinished},
+            ))
+            for future in futures:
+                future.cancel()
 
     for result in results:
         outcome.pods_queried += 1
