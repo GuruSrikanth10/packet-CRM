@@ -145,3 +145,7 @@ class FetchContext:
     namespace: Optional[str] = None
     app: Optional[str] = None
     catalog: Optional["TemplateCatalog"] = None
+    #: Additional identifiers to match on (e.g. refId alongside eventId).
+    #: We do not yet know which one the services actually log, so a caller
+    #: that has both should supply both.
+    extra_identifiers: tuple = ()

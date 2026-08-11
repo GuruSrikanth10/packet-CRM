@@ -633,7 +633,8 @@ criteria are met.**
 | 6 | **Complete** | `src/log_pipeline/redaction.py`, wired into retrieval after filtering and before return. 20 tests including the over-redaction guard. |
 | 7 | **Complete** | `k8s/retry.py` (per-status predicate + jittered backoff), `k8s_breaker`, wall-clock fetch deadline. 26 tests. |
 | 8 | **Complete** | `src/log_pipeline/snapshot.py` (atomic JSONL + meta, gap replay), `src/tools/prune_casesheets.py`. 18 tests. |
-| 9-10 | Not started | |
+| 9 | **Complete** | `k8s/source.py`, `sources/chain.py`, pipeline dispatch on `LOG_SOURCE` (**default `elastic`**), gap banner ahead of the trace, `pod_name` rendered, `fetch_kubernetes_logs` mock retired. 26 tests. |
+| 10 | Not started | |
 
 Full suite: 191 passed.
 

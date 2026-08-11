@@ -14,8 +14,8 @@ import os
 
 from src.log_pipeline.catalog import TemplateCatalog
 from src.log_pipeline.reducer import branch_on_error, cluster_logs, apply_evidence_guardrails
-from src.log_pipeline.sources.base import LogSource
-from src.log_pipeline.sources.elastic import ElasticLogSource
+from src.log_pipeline.sources import chain as source_chain
+from src.log_pipeline.sources.k8s import gaps as k8s_gaps
 from src.log_pipeline.types import FetchContext, TimeWindow
 from src.utils.logging_config import get_logger
 
@@ -33,14 +33,16 @@ def _get_catalog() -> TemplateCatalog:
     return _cached_catalog
 
 
-def _get_source() -> LogSource:
-    """Return the Stage 1 log source.
+def _default_window() -> TimeWindow:
+    """Look-back window for sources that honour one.
 
-    Phase 9 replaces this with `LOG_SOURCE` chain dispatch. Until then it is
-    unconditionally Elasticsearch, preserving today's behaviour. Not cached --
-    the source is stateless, so construction is free.
+    Elasticsearch ignores it (its query has no time bound); the Kubernetes
+    source uses it for `since_seconds`.
     """
-    return ElasticLogSource()
+    try:
+        return TimeWindow(hours=float(os.environ.get("K8S_DEFAULT_SINCE_HOURS", "2")))
+    except ValueError:
+        return TimeWindow.default()
 
 
 def reduce_logs(event_id: str) -> str:
@@ -55,15 +57,18 @@ def reduce_logs(event_id: str) -> str:
     # ------------------------------------------------------------------
     # Stage 1: Fetch (through the LogSource seam -- see sources/base.py)
     # ------------------------------------------------------------------
-    fetch_result = _get_source().fetch(
+    fetch_result = source_chain.fetch_with_fallback(
         event_id,
-        TimeWindow.default(),
+        _default_window(),
         FetchContext(event_id=event_id, catalog=catalog),
     )
     raw_logs = fetch_result.records
 
+    gap_banner = k8s_gaps.render_banner(fetch_result.gaps)
+
     if not raw_logs:
-        return f"No logs found for ID: {event_id}"
+        empty = f"No logs found for ID: {event_id}"
+        return f"{gap_banner}\n{empty}" if gap_banner else empty
 
     total_fetched = len(raw_logs)
     log = logger.bind(event_id=event_id)
@@ -76,9 +81,9 @@ def reduce_logs(event_id: str) -> str:
     if total_fetched < 50:
         lines = [f"--- Log Trace for ID: {event_id} ---"]
         for log in raw_logs:
-            lines.append(f"[{log['timestamp']}] [{log['app_name']}] [{log['level']}] {log['message']}")
+            lines.append(f"[{log['timestamp']}] [{_origin(log)}] [{log['level']}] {log['message']}")
         lines.append(f"--- End of Trace ({total_fetched} logs total) ---")
-        formatted = "\n".join(lines)
+        formatted = _with_banner(gap_banner, "\n".join(lines))
         _save_reduced_logs(event_id, formatted)
         return formatted
 
@@ -89,7 +94,10 @@ def reduce_logs(event_id: str) -> str:
 
     if branch_result["has_error"]:
         # Stuck path: format the trimmed context directly
-        formatted = _format_error_path(event_id, branch_result["payload"], total_fetched, log_file_path)
+        formatted = _with_banner(
+            gap_banner,
+            _format_error_path(event_id, branch_result["payload"], total_fetched, log_file_path),
+        )
         _save_reduced_logs(event_id, formatted)
         return formatted
 
@@ -106,7 +114,10 @@ def reduce_logs(event_id: str) -> str:
     # ------------------------------------------------------------------
     # Format for LLM injection
     # ------------------------------------------------------------------
-    formatted = _format_normal_path(event_id, assembled, total_fetched, log_file_path)
+    formatted = _with_banner(
+        gap_banner,
+        _format_normal_path(event_id, assembled, total_fetched, log_file_path),
+    )
     _save_reduced_logs(event_id, formatted)
     return formatted
 
@@ -114,6 +125,25 @@ def reduce_logs(event_id: str) -> str:
 # ======================================================================
 # Formatting helpers
 # ======================================================================
+
+def _with_banner(banner: str, body: str) -> str:
+    """Put the evidence-gap banner ahead of the trace.
+
+    The LLM must see that the trace is incomplete before it reads the
+    trace, not after.
+    """
+    return f"{banner}\n\n{body}" if banner else body
+
+
+def _origin(log: dict) -> str:
+    """Render pod attribution when present.
+
+    Without it a merged multi-replica trace gives the LLM no way to tell
+    which replica a line came from -- which matters when replicas disagree.
+    """
+    pod = log.get('pod_name')
+    return f"{log.get('app_name','')}@{pod}" if pod else str(log.get('app_name',''))
+
 
 def _format_error_path(event_id: str, trimmed_logs: list[dict],
                        total_fetched: int, log_file_path: str) -> str:
@@ -126,7 +156,7 @@ def _format_error_path(event_id: str, trimmed_logs: list[dict],
     ]
     for log in trimmed_logs:
         marker = " *** " if log.get("level", "").upper() == "ERROR" else "     "
-        lines.append(f"{marker}[{log['timestamp']}] [{log['level']}] {log['message']}")
+        lines.append(f"{marker}[{log['timestamp']}] [{_origin(log)}] [{log['level']}] {log['message']}")
     lines.append("")
     lines.append("--- End of ERROR context ---")
     return "\n".join(lines)
@@ -196,7 +226,7 @@ def _save_raw_logs(event_id: str, logs: list[dict]) -> str:
         log_file_path = os.path.join(log_dir, "raw_logs.txt")
         with open(log_file_path, "w", encoding="utf-8") as f:
             for log in logs:
-                f.write(f"[{log['timestamp']}] [{log['app_name']}] [{log['level']}] {log['message']}\n")
+                f.write(f"[{log['timestamp']}] [{_origin(log)}] [{log['level']}] {log['message']}\n")
         logger.bind(event_id=event_id).info(f"[PIPELINE] Saved raw logs to {log_file_path}")
         return log_file_path
     except Exception as e:

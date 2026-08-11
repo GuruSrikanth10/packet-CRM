@@ -241,11 +241,6 @@ def fetch_elastic_logs(event_id: str) -> Optional[str]:
         return None
 
 @tool
-def fetch_kubernetes_logs(pod_id: str) -> str:
-    """Fetch logs from Kubernetes for a given pod or event identifier."""
-    return f"[MOCK] Kubelet logs for {pod_id}: container killed due to OOMKilled state after biometric memory spike."
-
-@tool
 def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, category: str, fromSedaStart: bool, notificationEmail: str, notificationMobile: str) -> str:
     """Queue a packet for replay through the OIS pipeline."""
     logger.info(f"[TOOL] queue_for_replay triggered for ID: {id}")
@@ -310,7 +305,6 @@ _TOOLS_MAP = {
     "lookup_error_code": lookup_error_code,
     "lookup_rule_by_reason_code": lookup_rule_by_reason_code,
     "fetch_elastic_logs": fetch_elastic_logs,
-    "fetch_kubernetes_logs": fetch_kubernetes_logs,
     "queue_for_replay": queue_for_replay
 }
 
