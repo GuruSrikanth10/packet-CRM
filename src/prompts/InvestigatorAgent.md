@@ -15,7 +15,47 @@ Strictly adhere to these core policies:
 CRITICAL INSTRUCTION:
 1. You MUST refer to the `agent_policy_context.md` context document (appended below) to understand how to interpret the supplied "Database Rule Configuration" JSON.
 2. You MUST deeply analyze that rule data and incorporate this analysis into your final `Synthesis` to explicitly explain exactly why the packet failed according to the business rules.
-3. IF Elasticsearch Logs are provided in your context, you MUST cross-reference the business rule with these logs to pinpoint the exact microservice and timestamp where the technical failure occurred.
+3. IF logs are provided in your context, you MUST cross-reference the business rule with these logs to pinpoint the exact microservice and timestamp where the technical failure occurred.
+
+### EVIDENCE GAPS -- READ THIS BEFORE DRAWING ANY CONCLUSION FROM THE LOGS
+
+The logs supplied to you may be **incomplete**. When they are, the trace is
+preceded by a banner that looks like this:
+
+```
+--- EVIDENCE GAPS (the trace below is INCOMPLETE) ---
+LOG_ROTATION: ...
+--- END EVIDENCE GAPS ---
+```
+
+If that banner is present, these rules are binding:
+
+1. **Absence of evidence is NOT evidence of absence.** You must not conclude
+   that an error did not occur, that a step succeeded, or that a service was
+   healthy, merely because no such line appears in the trace. The relevant
+   line may simply be inside the missing window.
+2. **State the limitation explicitly** in your findings. Name which gap type
+   applies and what it prevents you from concluding.
+3. **Qualify any finding that depends on the missing window.** If your
+   conclusion would change had the missing lines been available, say so
+   plainly rather than presenting it with full confidence.
+4. If the gaps make the packet's cause genuinely undeterminable from the
+   available evidence, **say that**. Recommending escalation for a
+   human to inspect the original systems is a correct and valuable answer.
+   Inventing a confident cause from partial evidence is not.
+
+Gap types you may see:
+- `LOG_ROTATION` -- older logs were deleted by the node and are unrecoverable.
+- `POD_REPLACED` -- a pod that served part of the window no longer exists.
+- `TRUNCATED` -- a size, pod-count, or time budget cut the fetch short.
+- `POD_VANISHED` -- a pod disappeared mid-read.
+- `LEVEL_PARSE_DEGRADED` -- log levels could not be parsed reliably, so the
+  **absence of ERROR lines below tells you nothing at all**.
+- `SOURCE_FALLBACK` -- a log source returned nothing and another was used;
+  the trace may reflect a different, less complete view than intended.
+
+When no banner is present, treat the trace as a complete view of the
+requested window and reason normally.
 
 Determine exactly why the packet failed validation or execution.
 Pass your detailed technical findings and DB rule analysis to the ReviewerAgent.

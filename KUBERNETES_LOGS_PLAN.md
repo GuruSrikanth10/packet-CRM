@@ -1,7 +1,11 @@
 # Packet-CRM: Kubernetes Log Source -- Engineering Design
 
-Design date: 2026-08-11. Status: **design approved for Phase 0 only. Do not
-build Phase 2+ before the Phase 0 decision gate is cleared.**
+Design date: 2026-08-11. Status: **Phases 1-10 implemented. Phase 0 (the
+Elasticsearch diagnostic) is still outstanding -- its tooling is built but has
+not been run against live infrastructure, so Section 12 remains unfilled.**
+
+The implementation ships dark: `LOG_SOURCE` defaults to `elastic`, so the
+packet path behaves exactly as it did before until an operator opts in.
 
 **How to use this document.** Sections 1-8 are the design. Section 9 is the
 implementation plan, broken into self-contained phases. Each phase lists the
@@ -634,9 +638,9 @@ criteria are met.**
 | 7 | **Complete** | `k8s/retry.py` (per-status predicate + jittered backoff), `k8s_breaker`, wall-clock fetch deadline. 26 tests. |
 | 8 | **Complete** | `src/log_pipeline/snapshot.py` (atomic JSONL + meta, gap replay), `src/tools/prune_casesheets.py`. 18 tests. |
 | 9 | **Complete** | `k8s/source.py`, `sources/chain.py`, pipeline dispatch on `LOG_SOURCE` (**default `elastic`**), gap banner ahead of the trace, `pod_name` rendered, `fetch_kubernetes_logs` mock retired. 26 tests. |
-| 10 | Not started | |
+| 10 | **Complete** | `InvestigatorAgent.md` and `ReviewerAgent.md` gained binding evidence-gap guidance. 14 tests pin the prompts to the banner and gap types the code actually emits. |
 
-Full suite: 191 passed.
+Full suite: 313 passed.
 
 Phases 2+ were built ahead of the Phase 0 decision gate at the user's explicit
 direction. Nothing is wired into the packet path yet: the pipeline still uses
