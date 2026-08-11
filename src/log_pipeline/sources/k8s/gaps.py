@@ -48,33 +48,44 @@ def _parse_record_timestamp(raw: str) -> Optional[datetime]:
         return None
 
 
-def detect_rotation_gap(records: list, window: TimeWindow,
+def detect_rotation_gap(oldest_observed: Optional[str], window: TimeWindow,
+                        earliest_pod_start: Optional[datetime] = None,
                         now: Optional[datetime] = None) -> Optional[EvidenceGap]:
     """Detect logs rotated off the node before we could read them.
 
-    If the oldest line we got back is materially newer than the start of the
-    window we asked for, the kubelet had already discarded the earlier part.
-    That data is unrecoverable -- roughly 10MB x 5 files per container means a
-    chatty service can lose a two-hour window in minutes.
+    `oldest_observed` MUST be the oldest line seen in the raw stream, before
+    identifier filtering. Using the oldest *matching* line instead would fire
+    this gap on nearly every fetch -- a matching line is naturally recent --
+    and a banner that cries wolf every time trains the agents to ignore it,
+    destroying the entire mechanism.
+
+    Two conditions must both hold:
+      * the stream starts later than the window we asked for, and
+      * the pod was already running before that point.
+
+    The second matters: if the pod itself only started inside the window, its
+    logs were not rotated -- there was simply nothing earlier to read, and
+    POD_REPLACED already describes that situation correctly.
     """
-    if not records:
+    if not oldest_observed:
         return None
 
     now = _as_aware(now) or datetime.now(timezone.utc)
-
-    timestamps = [
-        ts for ts in (_parse_record_timestamp(r.get("timestamp", "")) for r in records)
-        if ts is not None
-    ]
-    if not timestamps:
+    oldest = _parse_record_timestamp(oldest_observed)
+    if oldest is None:
         return None
 
-    oldest = min(timestamps)
     requested_start = window.start_time(now)
+    slack = _rotation_slack()
 
-    # A minute of slack absorbs clock skew and the gap between the request
+    # A minute of slack absorbs clock skew and the delay between the request
     # being issued and the first line being written.
-    if oldest <= requested_start + _rotation_slack():
+    if oldest <= requested_start + slack:
+        return None
+
+    pod_start = _as_aware(earliest_pod_start)
+    if pod_start is not None and pod_start >= oldest - slack:
+        # The pod is younger than the missing span, so nothing was rotated.
         return None
 
     return EvidenceGap(

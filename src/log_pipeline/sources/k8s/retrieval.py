@@ -26,7 +26,11 @@ from src.log_pipeline.sources.k8s import client as k8s_client_module
 from src.log_pipeline.sources.k8s import fixtures
 from src.log_pipeline.sources.k8s.discovery import PodTarget
 from src.log_pipeline.sources.k8s.filtering import KeepAllSelector
-from src.log_pipeline.sources.k8s.parser import ParseStats, parse_line
+from src.log_pipeline.sources.k8s.parser import (
+    ParseStats,
+    parse_line,
+    split_kubelet_timestamp,
+)
 from src.log_pipeline.types import EvidenceGap, GapType, TimeWindow
 from src.utils.logging_config import get_logger
 
@@ -47,6 +51,11 @@ class PodFetchOutcome:
     truncated: bool = False
     ok: bool = True
     error: Optional[str] = None
+    #: Timestamp of the oldest line OBSERVED, before identifier filtering.
+    #: Rotation must be judged from the raw stream boundary: the oldest
+    #: *matching* line is naturally recent, so using it would fire a rotation
+    #: gap on almost every fetch.
+    oldest_line_timestamp: Optional[str] = None
 
 
 @dataclass
@@ -59,6 +68,8 @@ class RetrievalOutcome:
     bytes_read: int = 0
     pods_queried: int = 0
     pods_failed: int = 0
+    oldest_line_timestamp: Optional[str] = None
+    earliest_pod_start = None
 
 
 # ======================================================================
@@ -169,10 +180,18 @@ def _read_instance(target: PodTarget, window: TimeWindow, previous: bool,
     """
     records, stats, total_bytes, truncated = [], ParseStats(), 0, False
     instance = "previous" if previous else "current"
+    oldest_seen = None
     selector.reset()
 
     for line, total_bytes, hit_cap in _open_stream(target, window, previous):
         if line.strip():
+            if oldest_seen is None:
+                # Streams are chronological, so the first line observed is the
+                # oldest the kubelet still holds. Captured pre-filter.
+                observed, _ = split_kubelet_timestamp(line)
+                if observed:
+                    oldest_seen = observed
+
             for emitted in selector.feed(line):
                 record, level_ok, was_json = parse_line(
                     emitted, default_app=target.container
@@ -192,7 +211,7 @@ def _read_instance(target: PodTarget, window: TimeWindow, previous: bool,
             truncated = True
             break
 
-    return records, stats, total_bytes, truncated
+    return records, stats, total_bytes, truncated, oldest_seen
 
 
 def read_pod_logs(target: PodTarget, window: TimeWindow,
@@ -205,9 +224,10 @@ def read_pod_logs(target: PodTarget, window: TimeWindow,
     # they are usually the most valuable in the whole trace.
     if target.restarted:
         try:
-            records, stats, read_bytes, truncated = _read_instance(
+            records, stats, read_bytes, truncated, oldest = _read_instance(
                 target, window, previous=True, selector=selector
             )
+            outcome.oldest_line_timestamp = _older(outcome.oldest_line_timestamp, oldest)
             outcome.records.extend(records)
             outcome.bytes_read += read_bytes
             outcome.truncated = outcome.truncated or truncated
@@ -231,9 +251,10 @@ def read_pod_logs(target: PodTarget, window: TimeWindow,
             )
 
     try:
-        records, stats, read_bytes, truncated = _read_instance(
+        records, stats, read_bytes, truncated, oldest = _read_instance(
             target, window, previous=False, selector=selector
         )
+        outcome.oldest_line_timestamp = _older(outcome.oldest_line_timestamp, oldest)
         outcome.records.extend(records)
         outcome.bytes_read += read_bytes
         outcome.truncated = outcome.truncated or truncated
@@ -282,6 +303,15 @@ def read_pod_logs(target: PodTarget, window: TimeWindow,
     return outcome
 
 
+def _older(current: Optional[str], candidate: Optional[str]) -> Optional[str]:
+    """Return whichever RFC3339 timestamp string sorts earlier."""
+    if candidate is None:
+        return current
+    if current is None:
+        return candidate
+    return min(current, candidate)
+
+
 def _merge_stats(into: ParseStats, other: ParseStats):
     into.total += other.total
     into.level_parsed += other.level_parsed
@@ -324,6 +354,14 @@ def read_all(targets: list, window: TimeWindow,
         outcome.records.extend(result.records)
         outcome.gaps.extend(result.gaps)
         outcome.bytes_read += result.bytes_read
+        outcome.oldest_line_timestamp = _older(
+            outcome.oldest_line_timestamp, result.oldest_line_timestamp
+        )
+        started = result.target.start_time
+        if started is not None and (
+            outcome.earliest_pod_start is None or started < outcome.earliest_pod_start
+        ):
+            outcome.earliest_pod_start = started
         _merge_stats(outcome.stats, result.stats)
 
     outcome.records.sort(key=_ordering_key)

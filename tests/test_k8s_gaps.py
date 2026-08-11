@@ -169,14 +169,16 @@ def test_selector_state_does_not_leak_between_container_instances(monkeypatch, t
 # Rotation gap
 # ======================================================================
 
-def _record(ts):
-    return {"timestamp": ts, "level": "INFO", "message": "x", "app_name": "a"}
+OLD_POD_START = NOW - timedelta(days=1)
 
 
-def test_rotation_gap_detected_when_oldest_line_is_too_new():
-    """Asked for 2h, oldest line is 45m old: the kubelet discarded the rest."""
-    records = [_record((NOW - timedelta(minutes=45)).isoformat())]
-    gap = gaps_module.detect_rotation_gap(records, TimeWindow(hours=2), now=NOW)
+def test_rotation_gap_detected_when_stream_starts_too_late():
+    """Asked for 2h, the pod's stream starts 45m ago, and the pod is a day
+    old: the kubelet discarded everything before that."""
+    oldest = (NOW - timedelta(minutes=45)).isoformat()
+    gap = gaps_module.detect_rotation_gap(
+        oldest, TimeWindow(hours=2), earliest_pod_start=OLD_POD_START, now=NOW
+    )
 
     assert gap is not None
     assert gap.gap_type == GapType.LOG_ROTATION
@@ -184,23 +186,52 @@ def test_rotation_gap_detected_when_oldest_line_is_too_new():
 
 
 def test_no_rotation_gap_when_window_is_covered():
-    records = [_record((NOW - timedelta(hours=2)).isoformat())]
-    assert gaps_module.detect_rotation_gap(records, TimeWindow(hours=2), now=NOW) is None
+    oldest = (NOW - timedelta(hours=2)).isoformat()
+    assert gaps_module.detect_rotation_gap(
+        oldest, TimeWindow(hours=2), earliest_pod_start=OLD_POD_START, now=NOW
+    ) is None
 
 
-def test_no_rotation_gap_without_records():
-    assert gaps_module.detect_rotation_gap([], TimeWindow(hours=2), now=NOW) is None
+def test_no_rotation_gap_without_any_observed_lines():
+    assert gaps_module.detect_rotation_gap(
+        None, TimeWindow(hours=2), earliest_pod_start=OLD_POD_START, now=NOW
+    ) is None
 
 
 def test_rotation_ignores_unparseable_timestamps():
-    records = [_record("not-a-timestamp")]
-    assert gaps_module.detect_rotation_gap(records, TimeWindow(hours=2), now=NOW) is None
+    assert gaps_module.detect_rotation_gap(
+        "not-a-timestamp", TimeWindow(hours=2),
+        earliest_pod_start=OLD_POD_START, now=NOW,
+    ) is None
 
 
-def test_rotation_slack_absorbs_clock_skew(monkeypatch):
+def test_rotation_slack_absorbs_clock_skew():
     """A few seconds of drift must not raise a spurious rotation gap."""
-    records = [_record((NOW - timedelta(hours=2) + timedelta(seconds=30)).isoformat())]
-    assert gaps_module.detect_rotation_gap(records, TimeWindow(hours=2), now=NOW) is None
+    oldest = (NOW - timedelta(hours=2) + timedelta(seconds=30)).isoformat()
+    assert gaps_module.detect_rotation_gap(
+        oldest, TimeWindow(hours=2), earliest_pod_start=OLD_POD_START, now=NOW
+    ) is None
+
+
+def test_no_rotation_gap_when_the_pod_is_younger_than_the_missing_span():
+    """A pod that only started 45m ago did not have its logs rotated -- there
+    was simply nothing earlier to read. POD_REPLACED describes that instead;
+    reporting rotation too would be actively misleading."""
+    started = NOW - timedelta(minutes=45)
+    oldest = (NOW - timedelta(minutes=44)).isoformat()
+
+    assert gaps_module.detect_rotation_gap(
+        oldest, TimeWindow(hours=2), earliest_pod_start=started, now=NOW
+    ) is None
+
+
+def test_rotation_still_reported_when_pod_start_is_unknown():
+    """Without a start time we cannot rule rotation out, so we report it --
+    an unreported gap is worse than an over-reported one."""
+    oldest = (NOW - timedelta(minutes=45)).isoformat()
+    assert gaps_module.detect_rotation_gap(
+        oldest, TimeWindow(hours=2), earliest_pod_start=None, now=NOW
+    ) is not None
 
 
 # ======================================================================

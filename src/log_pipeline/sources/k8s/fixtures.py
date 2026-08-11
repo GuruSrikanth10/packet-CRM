@@ -58,6 +58,13 @@ def parse_label_selector(selector: Optional[str]) -> dict:
     return parsed
 
 
+#: Default fixture pod start time: deliberately far in the past so a pod
+#: without an explicit `start_time` never trips POD_REPLACED. Defaulting to
+#: "now" would make every fixture look freshly started and fire that gap in
+#: unrelated tests. Tests that want POD_REPLACED set `start_time` explicitly.
+_DEFAULT_FIXTURE_START = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
 def _parse_timestamp(raw: Optional[str]) -> Optional[datetime]:
     if not raw:
         return None
@@ -110,7 +117,7 @@ def _build_pod(namespace: str, pod_dir: Path):
         status=V1PodStatus(
             phase=meta.get("phase", "Running"),
             start_time=_parse_timestamp(meta.get("start_time"))
-            or datetime.now(timezone.utc),
+            or _DEFAULT_FIXTURE_START,
             container_statuses=container_statuses,
         ),
     )
