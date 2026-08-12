@@ -197,8 +197,12 @@ def test_adapter_output_matches_calling_the_fetcher_directly(monkeypatch, tmp_pa
 # ======================================================================
 
 def test_reduce_logs_reports_no_logs_found_when_empty(monkeypatch):
+    """Pinned to the elastic-only leg specifically (LOG_SOURCE default is now
+    kubernetes,elastic -- see chain.py -- and an unconfigured Kubernetes leg
+    would otherwise add a SOURCE_FALLBACK gap this test isn't about)."""
     from src.log_pipeline import pipeline as pipeline_module
 
+    monkeypatch.setenv("LOG_SOURCE", "elastic")
     with patch("src.log_pipeline.sources.elastic.fetch_logs", return_value=[]):
         out = pipeline_module.reduce_logs("evt-empty")
 

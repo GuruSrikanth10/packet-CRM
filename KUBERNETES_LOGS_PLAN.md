@@ -4,8 +4,15 @@ Design date: 2026-08-11. Status: **Phases 1-10 implemented. Phase 0 (the
 Elasticsearch diagnostic) is still outstanding -- its tooling is built but has
 not been run against live infrastructure, so Section 12 remains unfilled.**
 
-The implementation ships dark: `LOG_SOURCE` defaults to `elastic`, so the
-packet path behaves exactly as it did before until an operator opts in.
+**Update (2026-08-12): the default was flipped to `kubernetes,elastic`**
+(operator decision, made without Phase 0/5 real-cluster validation -- see the
+caveat in section 12). It no longer ships fully dark: on any deployment where
+`K8S_DEFAULT_NAMESPACE`/`KUBECONFIG_PATH` are unset, the Kubernetes leg fails
+fast on missing config and every fetch falls straight through to
+Elasticsearch, so behaviour is unchanged in practice until those are filled
+in -- but the moment they are, Kubernetes becomes the first thing tried on
+every single packet, without Open Questions 1-3 having been answered from a
+real cluster first.
 
 **How to use this document.** Sections 1-8 are the design. Section 9 is the
 implementation plan, broken into self-contained phases. Each phase lists the
@@ -234,10 +241,10 @@ source; multiple values mean fallback in order.
 
 | `LOG_SOURCE` | Behaviour |
 |---|---|
-| `elastic` | Today's behaviour. **Default**, so this ships dark. |
-| `kubernetes` | Kubernetes only. |
-| `kubernetes,elastic` | Try Kubernetes; fall back to Elasticsearch. |
+| `kubernetes,elastic` | Try Kubernetes; fall back to Elasticsearch. **Default.** |
 | `elastic,kubernetes` | Try Elasticsearch; fall back to Kubernetes. |
+| `elastic` | Elasticsearch only (behaviour prior to the Kubernetes source). |
+| `kubernetes` | Kubernetes only, no fallback. |
 
 **Fallback triggers when a source returns `ok=False` (failed) or an empty
 record set.** Both mean "we did not get logs here," which is the operative
@@ -558,7 +565,7 @@ denser than the ES projection, so disk exhaustion arrives sooner. A companion
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LOG_SOURCE` | `elastic` | Ordered chain, e.g. `kubernetes,elastic` |
+| `LOG_SOURCE` | `kubernetes,elastic` | Ordered chain; set to `elastic` to disable the Kubernetes leg entirely |
 | `LOG_SNAPSHOT_REUSE` | `true` | Reuse persisted snapshot instead of refetching |
 | `ES_MOCK_FILE` | *(unset)* | **Unchanged.** Local Kibana CSV for the ES source |
 | `KUBECONFIG_PATH` | *(unset)* | Remote kubeconfig; in-cluster tried first |
@@ -637,7 +644,7 @@ criteria are met.**
 | 6 | **Complete** | `src/log_pipeline/redaction.py`, wired into retrieval after filtering and before return. 20 tests including the over-redaction guard. |
 | 7 | **Complete** | `k8s/retry.py` (per-status predicate + jittered backoff), `k8s_breaker`, wall-clock fetch deadline. 26 tests. |
 | 8 | **Complete** | `src/log_pipeline/snapshot.py` (atomic JSONL + meta, gap replay), `src/tools/prune_casesheets.py`. 18 tests. |
-| 9 | **Complete** | `k8s/source.py`, `sources/chain.py`, pipeline dispatch on `LOG_SOURCE` (**default `elastic`**), gap banner ahead of the trace, `pod_name` rendered, `fetch_kubernetes_logs` mock retired. 26 tests. |
+| 9 | **Complete** (default later flipped, 2026-08-12) | `k8s/source.py`, `sources/chain.py`, pipeline dispatch on `LOG_SOURCE` (shipped **default `elastic`**, since changed to **default `kubernetes,elastic`** -- see the update note at the top of this document), gap banner ahead of the trace, `pod_name` rendered, `fetch_kubernetes_logs` mock retired. 26+ tests. |
 | 10 | **Complete** | `InvestigatorAgent.md` and `ReviewerAgent.md` gained binding evidence-gap guidance. 14 tests pin the prompts to the banner and gap types the code actually emits. |
 
 Full suite: 313 passed.
@@ -814,7 +821,7 @@ assumption above against the real cluster before anything depends on them.
 
 ---
 
-### Phase 9 -- Chain integration (goes live, default off)
+### Phase 9 -- Chain integration (goes live)
 
 **Goal.** Wire the source chain into the pipeline behind config.
 
@@ -825,7 +832,11 @@ assumption above against the real cluster before anything depends on them.
   `src/log_pipeline/pipeline.py` formatters (render `pod_name`);
   `src/tools/tool_registry.py` (retire the `fetch_kubernetes_logs` mock);
   `ARCHITECTURE.md`.
-- **Config:** `LOG_SOURCE` (**default `elastic`** -- ships dark).
+- **Config:** `LOG_SOURCE`. Shipped defaulting to `elastic` (dark); changed to
+  default `kubernetes,elastic` on 2026-08-12 per an explicit operator
+  decision -- see the update note at the top of this document for the caveat
+  that Open Questions 1-3 were still unanswered from a real cluster at that
+  point.
 - **Tests:** `tests/test_log_source_chain.py` -- all four chain values;
   scenarios 21, 22, 23; degradation matrix 6.3; `ES_MOCK_FILE` still drives the
   ES leg of a chain.
@@ -918,6 +929,20 @@ tests/fixtures/k8s/<namespace>/<pod-name>/
 and a kubeconfig with cluster access; neither is reachable from the development
 machine. Fill this section in after running the tool, then resolve the decision
 gate in Section 2.
+
+**Operational note (2026-08-12):** `LOG_SOURCE` now defaults to
+`kubernetes,elastic` (an explicit operator decision -- see the update note at
+the top of this document) even though this section is still empty and Phase
+5's Open Questions 1-3 have not been answered against a real cluster. Today
+that is low-risk everywhere the Kubernetes leg is unconfigured: discovery
+fails fast on a missing namespace and falls straight through to
+Elasticsearch. **The risk activates the moment `KUBECONFIG_PATH` and
+`K8S_DEFAULT_NAMESPACE` are filled in** -- from that point on, every single
+packet tries Kubernetes first, and if the identifier, namespace, or selector
+turn out to be wrong, every packet pays up to `K8S_TOTAL_FETCH_TIMEOUT_SECONDS`
+(default 60s) before falling back to Elasticsearch instead of going straight
+there. Run `src/tools/fetch_pod_logs.py` against the real cluster (Phase 5)
+*before* filling in cluster credentials in any shared environment.
 
 ### 12.1 Query variant hit counts
 

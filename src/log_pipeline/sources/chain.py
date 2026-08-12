@@ -4,10 +4,17 @@ Ordered source chain with fallback (KUBERNETES_LOGS_PLAN.md 4.4).
 `LOG_SOURCE` is an ordered, comma-separated chain. A single value means a
 single source; several mean fallback in order:
 
-    elastic               today's behaviour (the default)
-    kubernetes            Kubernetes only
-    kubernetes,elastic    try Kubernetes, fall back to Elasticsearch
+    kubernetes,elastic    try Kubernetes, fall back to Elasticsearch (the default)
     elastic,kubernetes    the reverse
+    elastic               Elasticsearch only (pre-Kubernetes-source behaviour)
+    kubernetes            Kubernetes only, no fallback
+
+Default is Kubernetes-first: pod logs are the more complete source for the
+recent window (Elasticsearch is the one known to drop lines -- see
+KUBERNETES_LOGS_PLAN.md section 2), and a misconfigured or unreachable
+cluster fails fast (client resolution is cached after the first attempt; see
+sources/k8s/client.py) so this degrades to today's Elasticsearch-only
+behaviour with negligible added latency when Kubernetes isn't set up.
 
 Fallback triggers when a source fails (`ok=False`) OR returns no records --
 both mean "we did not get logs here", which is the operative condition.
@@ -34,7 +41,7 @@ from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_CHAIN = "elastic"
+DEFAULT_CHAIN = "kubernetes,elastic"
 
 
 def _build_source(name: str) -> Optional[LogSource]:

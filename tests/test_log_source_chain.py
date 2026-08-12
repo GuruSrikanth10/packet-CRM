@@ -68,9 +68,9 @@ class _FakeSource:
 # Chain parsing
 # ======================================================================
 
-def test_default_chain_is_elastic_only():
+def test_default_chain_is_kubernetes_then_elastic():
     names = [s.name for s in chain.configured_chain()]
-    assert names == ["elastic"]
+    assert names == ["kubernetes", "elastic"]
 
 
 @pytest.mark.parametrize("value,expected", [
@@ -97,9 +97,9 @@ def test_entirely_unusable_chain_falls_back_to_elastic(monkeypatch):
     assert [s.name for s in chain.configured_chain()] == ["elastic"]
 
 
-def test_empty_chain_falls_back_to_elastic(monkeypatch):
+def test_blank_log_source_falls_back_to_the_default_chain(monkeypatch):
     monkeypatch.setenv("LOG_SOURCE", "   ")
-    assert [s.name for s in chain.configured_chain()] == ["elastic"]
+    assert [s.name for s in chain.configured_chain()] == ["kubernetes", "elastic"]
 
 
 # ======================================================================
