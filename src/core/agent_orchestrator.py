@@ -10,10 +10,11 @@ from langgraph.prebuilt import create_react_agent
 
 from src.utils.llm_utils import get_llm
 from src.utils.env import get_bool_env
-from src.tools.tool_registry import get_tool_by_name
+from src.tools.tool_registry import get_tool_by_name, lookup_rule_by_reason_code
 from src.utils.resilience import retry_transient, llm_breaker
 from src.utils.logging_config import get_logger
 from src.utils.paths import CHECKPOINT_DB_PATH
+from src.utils.runbook_store import get_runbook, generate_rule_fingerprint
 
 logger = get_logger(__name__)
 
@@ -47,6 +48,9 @@ class GraphState(TypedDict):
     synthesis: str
     messages: list
     retry_count: int
+    runbook_id: str
+    resolution_source: str
+    shadow_runbook_resolution: str
 
 _agent = None
 
@@ -92,6 +96,59 @@ def get_agent():
         logs = tool.invoke(event_id)
         log.info("Logs retrieved")
         return {"logs": logs}
+
+    def runbook_lookup_node(state: GraphState):
+        mode = os.environ.get("RUNBOOK_MODE", "off").lower()
+        if mode == "off":
+            return {"resolution_source": "agent"}
+            
+        payload = state.get("payload", {})
+        event_id = payload.get("eventId", "unknown")
+        log = logger.bind(event_id=event_id)
+        
+        exec_summary = payload.get("packetExecutionSummary") or {}
+        error_data = exec_summary.get("errorData") or []
+        reason_code = None
+        for err in error_data:
+            if err and err.get("errorReasonCode"):
+                reason_code = err.get("errorReasonCode")
+                break
+                
+        if not reason_code:
+            return {"resolution_source": "agent"}
+            
+        packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
+        runbook = get_runbook(reason_code, packet_type)
+        if not runbook:
+            return {"resolution_source": "agent"}
+            
+        runbook_id = runbook["runbook_id"]
+        version = runbook["version"]
+        
+        # Check fingerprint
+        db_etype = "UPDATE" if packet_type == "U" else ("ENROLMENT" if packet_type == "E" else "UPDATE")
+        rule = lookup_rule_by_reason_code(reason_code, db_etype)
+        
+        if rule:
+            current_fp = generate_rule_fingerprint(rule)
+            if current_fp != runbook["rule_fingerprint"]:
+                log.warning("Fingerprint mismatch", runbook_id=runbook_id, expected=runbook["rule_fingerprint"], actual=current_fp)
+                return {"resolution_source": "agent"}
+        
+        res_source = f"runbook:{runbook_id}@v{version}"
+        synthesis_json = json.dumps(runbook["resolution"])
+        
+        log.info("Runbook hit", runbook_id=runbook_id, version=version, mode=mode)
+        
+        if mode == "shadow":
+            return {"resolution_source": "agent", "shadow_runbook_resolution": synthesis_json}
+            
+        return {"resolution_source": res_source, "synthesis": synthesis_json, "runbook_id": runbook_id}
+
+    def check_runbook_hit(state: GraphState):
+        if state.get("resolution_source", "").startswith("runbook:"):
+            return "end"
+        return "investigate"
 
     # Create agents once during graph construction, not per invocation.
     investigator_agent = create_react_agent(llm, tools=[])
@@ -301,19 +358,40 @@ def get_agent():
             ]})
 
         res = invoke_synthesis()
+        synthesis_content = res["messages"][-1].content
         log.info("Synthesis finished")
-        return {"synthesis": res["messages"][-1].content, "messages": res["messages"]}
+        
+        shadow_res = state.get("shadow_runbook_resolution")
+        if shadow_res:
+            try:
+                agent_res = json.loads(synthesis_content)
+                rb_res = json.loads(shadow_res)
+                if agent_res.get("action") != rb_res.get("action"):
+                    log.warning(
+                        "Shadow divergence", 
+                        runbook_id=state.get("runbook_id", "unknown"),
+                        runbook_action=rb_res.get("action"), 
+                        agent_action=agent_res.get("action"),
+                        runbook_synthesis=rb_res.get("synthesis"),
+                        agent_synthesis=agent_res.get("synthesis")
+                    )
+            except Exception as e:
+                log.error("Failed to compare shadow divergence", error=str(e))
+                
+        return {"synthesis": synthesis_content, "messages": res["messages"], "resolution_source": "agent"}
 
     # Build Graph
     workflow = StateGraph(GraphState)
     workflow.add_node("fetch_logs", fetch_logs_node)
+    workflow.add_node("runbook_lookup", runbook_lookup_node)
     workflow.add_node("investigate", investigator_node)
     workflow.add_node("review", reviewer_node)
     workflow.add_node("synthesize", synthesis_node)
     workflow.add_node("escalate", escalate_node)
     
     workflow.add_edge(START, "fetch_logs")
-    workflow.add_edge("fetch_logs", "investigate")
+    workflow.add_edge("fetch_logs", "runbook_lookup")
+    workflow.add_conditional_edges("runbook_lookup", check_runbook_hit, {"end": END, "investigate": "investigate"})
     workflow.add_edge("investigate", "review")
     workflow.add_conditional_edges("review", check_approval, {"synthesis": "synthesize", "investigator": "investigate", "escalate": "escalate"})
     workflow.add_edge("synthesize", END)

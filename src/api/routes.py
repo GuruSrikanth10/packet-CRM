@@ -384,6 +384,7 @@ async def process_rejection(signal: MessagePayload):
             }
         },
         "resolution": {
+            "source": result.get("resolution_source", "agent"),
             "synthesis": investigation_result.get("synthesis"),
             "action": investigation_result.get("action"),
             "resident_action": investigation_result.get("resident_action")

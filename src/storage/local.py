@@ -47,7 +47,7 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
 
         # Enforce schema version for backwards compatibility
         if "schema_version" not in casebook:
-            casebook["schema_version"] = "1.0"
+            casebook["schema_version"] = "1.1"
 
         with FileLock(str(lock_path), timeout=10):
             with open(tmp_path, "w", encoding="utf-8") as f:
