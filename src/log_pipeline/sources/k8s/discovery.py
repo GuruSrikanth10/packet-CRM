@@ -2,8 +2,26 @@
 Pod and container discovery (KUBERNETES_LOGS_PLAN.md 5.2).
 
 No Kubernetes API aggregates logs across a Deployment, so the source lists
-pods by label selector and iterates. This module decides *which* pods and
+pods within a namespace and iterates. This module decides *which* pods and
 *which* containers within them.
+
+The ServiceAccount this runs as has namespace-scoped RBAC only: `get` on a
+named `namespaces` object and `list`/`get` on `pods` *within* a namespace it
+already knows the name of. There is no cluster-wide `list namespaces` or
+`list pods --all-namespaces` access, so a namespace is never enumerated or
+guessed -- it must already be resolved (via `K8S_DEFAULT_NAMESPACE` /
+`K8S_SERVICE_MAP`) and its accessibility is verified with a single targeted
+`read_namespace` call before anything is listed within it. This mirrors a
+validated reference pattern run against the real cluster under this exact
+RBAC grant.
+
+That same constraint shapes pod matching. Label-based selection assumes every
+target pod carries a reliable, known label -- an assumption the validated
+reference does not make: it lists every pod in the namespace and matches by
+substring against the pod name instead. `PodMatchSpec` supports both, with
+name-substring as the default because it is the mode actually proven to work
+here; label selection remains available as an explicit per-service opt-in via
+`K8S_SERVICE_MAP` for services known to be labelled reliably.
 """
 import json
 import os
@@ -22,6 +40,28 @@ logger = get_logger(__name__)
 SKIPPED_PHASES = frozenset({"Pending"})
 
 DEFAULT_SIDECAR_DENYLIST = "istio-proxy,linkerd-proxy,vault-agent"
+
+MATCH_MODE_LABEL = "label"
+MATCH_MODE_NAME_CONTAINS = "name_contains"
+
+
+@dataclass(frozen=True)
+class PodMatchSpec:
+    """How to find the pods for a service, within an already-known namespace.
+
+    `label`         -- server-side `label_selector=` on `list_namespaced_pod`.
+    `name_contains`  -- lists every pod in the namespace (no selector) and
+                        keeps those whose name contains `value`, client-side.
+                        This is the validated pattern and the default mode.
+    """
+
+    mode: str
+    value: str
+
+    def describe(self) -> str:
+        if self.mode == MATCH_MODE_LABEL:
+            return f"label selector '{self.value}'"
+        return f"pod name contains '{self.value}'"
 
 
 @dataclass(frozen=True)
@@ -73,11 +113,13 @@ def _service_map() -> dict:
 
 def resolve_service(app: Optional[str] = None,
                     namespace: Optional[str] = None) -> tuple:
-    """Resolve a logical app name to (namespace, label_selector).
+    """Resolve a logical app name to (namespace, PodMatchSpec).
 
-    `K8S_SERVICE_MAP` keeps selector syntax out of Kafka payloads and lets an
-    operator correct a mapping without a code change. Falls back to the
-    conventional `app=<name>`.
+    `K8S_SERVICE_MAP` keeps this out of Kafka payloads and lets an operator
+    correct a mapping without a code change. A per-service entry may set
+    `label_selector` to opt into server-side label matching; otherwise the
+    default is `name_contains` on the app name itself, matching the
+    validated reference pattern.
     """
     app = app or os.environ.get("K8S_DEFAULT_APP") or "enu-biometric"
     mapping = _service_map().get(app, {})
@@ -87,8 +129,13 @@ def resolve_service(app: Optional[str] = None,
         or mapping.get("namespace")
         or os.environ.get("K8S_DEFAULT_NAMESPACE")
     )
-    selector = mapping.get("label_selector") or f"app={app}"
-    return resolved_namespace, selector
+
+    if mapping.get("label_selector"):
+        match_spec = PodMatchSpec(MATCH_MODE_LABEL, mapping["label_selector"])
+    else:
+        match_spec = PodMatchSpec(MATCH_MODE_NAME_CONTAINS, mapping.get("name_contains") or app)
+
+    return resolved_namespace, match_spec
 
 
 def _sidecar_denylist() -> set:
@@ -153,28 +200,75 @@ def _sort_key(pod):
     return started
 
 
-def _list_pods(namespace: str, selector: str, request_timeout: float):
-    """List pods from fixtures when configured, otherwise from the API."""
+def _verify_namespace(namespace: str, request_timeout: float) -> tuple:
+    """Confirm the namespace is readable before listing anything inside it.
+
+    Mirrors the validated reference pattern's `v1.read_namespace(name=...)`.
+    The ServiceAccount here has no `list namespaces` access -- only `get` on
+    a namespace whose name is already known -- so this is always a targeted
+    read of one name, never an enumeration. Returns (ok, reason).
+    """
     if fixtures.is_active():
-        return fixtures.list_pods(namespace, selector)
+        if fixtures.namespace_exists(namespace):
+            return True, None
+        return False, f"namespace '{namespace}' not found in fixtures"
+
+    api = k8s_client_module.get_client()
+    if api is None:
+        return False, k8s_client_module.unavailable_reason()
+
+    try:
+        api.read_namespace(name=namespace, _request_timeout=request_timeout)
+        return True, None
+    except Exception as e:
+        status = getattr(e, "status", None)
+        if status == 403:
+            logger.error("Kubernetes RBAC denied namespace read",
+                         namespace=namespace, verb="get")
+        elif status == 404:
+            logger.error("Kubernetes namespace not found", namespace=namespace)
+        else:
+            logger.error("Kubernetes namespace read failed",
+                         namespace=namespace, error=f"{type(e).__name__}: {e}")
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _list_pods(namespace: str, match_spec: PodMatchSpec, request_timeout: float):
+    """List pods from fixtures when configured, otherwise from the API.
+
+    `name_contains` mode lists every pod in the (already-verified) namespace
+    with no `label_selector` -- this is still a namespace-scoped `list`, not
+    a cluster-wide one -- and filters by name client-side, mirroring the
+    validated reference pattern exactly.
+    """
+    if fixtures.is_active():
+        return fixtures.list_pods(namespace, match_spec)
 
     api = k8s_client_module.get_client()
     if api is None:
         return None
 
-    response = api.list_namespaced_pod(
+    list_kwargs = dict(
         namespace=namespace,
-        label_selector=selector,
         timeout_seconds=int(request_timeout),
         _request_timeout=request_timeout,
     )
-    return list(response.items or [])
+    if match_spec.mode == MATCH_MODE_LABEL:
+        list_kwargs["label_selector"] = match_spec.value
+
+    response = api.list_namespaced_pod(**list_kwargs)
+    pods = list(response.items or [])
+
+    if match_spec.mode == MATCH_MODE_NAME_CONTAINS:
+        pods = [p for p in pods if match_spec.value in (p.metadata.name or "")]
+
+    return pods
 
 
 def discover_targets(namespace: Optional[str] = None,
                      app: Optional[str] = None) -> DiscoveryResult:
     """Find every (pod, container) to read for this service."""
-    resolved_namespace, selector = resolve_service(app=app, namespace=namespace)
+    resolved_namespace, match_spec = resolve_service(app=app, namespace=namespace)
 
     if not resolved_namespace:
         return DiscoveryResult(
@@ -189,8 +283,20 @@ def discover_targets(namespace: Optional[str] = None,
         )
 
     request_timeout = float(os.environ.get("K8S_REQUEST_TIMEOUT_SECONDS", "30"))
+
+    # Verify the namespace is readable before listing anything in it -- this
+    # ServiceAccount has no cluster-wide access, so a 403/404 here is
+    # reported distinctly rather than surfacing as a confusing failure from
+    # the pod list call that follows.
+    ns_ok, ns_reason = _verify_namespace(resolved_namespace, request_timeout)
+    if not ns_ok:
+        return DiscoveryResult(
+            ok=False,
+            reason=ns_reason or f"namespace '{resolved_namespace}' not accessible",
+        )
+
     try:
-        pods = _list_pods(resolved_namespace, selector, request_timeout)
+        pods = _list_pods(resolved_namespace, match_spec, request_timeout)
     except Exception as e:
         # A 403 here is an RBAC misconfiguration, not a transient fault. It is
         # surfaced distinctly rather than folded into an empty result.
@@ -265,7 +371,8 @@ def discover_targets(namespace: Optional[str] = None,
     logger.info(
         "Kubernetes pods discovered",
         namespace=resolved_namespace,
-        selector=selector,
+        match_mode=match_spec.mode,
+        match_value=match_spec.value,
         pod_count=len(eligible),
         skipped_pending=skipped_pending,
         truncated=truncated,
@@ -274,9 +381,10 @@ def discover_targets(namespace: Optional[str] = None,
 
     if not targets:
         logger.warning(
-            "No pods matched -- check namespace and label selector",
+            "No pods matched -- check namespace and match spec",
             namespace=resolved_namespace,
-            selector=selector,
+            match_mode=match_spec.mode,
+            match_value=match_spec.value,
         )
 
     return DiscoveryResult(

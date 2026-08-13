@@ -123,8 +123,21 @@ def _build_pod(namespace: str, pod_dir: Path):
     )
 
 
-def list_pods(namespace: str, label_selector: Optional[str] = None) -> list:
-    """Return fixture pods in `namespace` matching `label_selector`."""
+def namespace_exists(namespace: str) -> bool:
+    """Mirror the live `read_namespace` pre-flight check against fixtures."""
+    directory = fixture_dir()
+    if directory is None:
+        return False
+    return (directory / namespace).is_dir()
+
+
+def list_pods(namespace: str, match_spec) -> list:
+    """Return fixture pods in `namespace` matching `match_spec`.
+
+    `match_spec` is duck-typed (`.mode` / `.value`) rather than imported from
+    `discovery.py`, which already imports this module -- importing the type
+    back would create a cycle.
+    """
     directory = fixture_dir()
     if directory is None:
         return []
@@ -133,10 +146,19 @@ def list_pods(namespace: str, label_selector: Optional[str] = None) -> list:
     if not ns_dir.is_dir():
         return []
 
-    wanted = parse_label_selector(label_selector)
+    mode = getattr(match_spec, "mode", "label")
+    value = getattr(match_spec, "value", None)
+
     pods = []
     for pod_dir in sorted(p for p in ns_dir.iterdir() if p.is_dir()):
+        if mode == "name_contains":
+            if value and value not in pod_dir.name:
+                continue
+            pods.append(_build_pod(namespace, pod_dir))
+            continue
+
         pod = _build_pod(namespace, pod_dir)
+        wanted = parse_label_selector(value)
         labels = pod.metadata.labels or {}
         if all(labels.get(k) == v for k, v in wanted.items()):
             pods.append(pod)

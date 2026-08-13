@@ -62,9 +62,9 @@ def _run_discovery(args):
     result = discovery.discover_targets(namespace=args.namespace, app=args.app)
 
     _print_header("DISCOVERY")
-    namespace, selector = discovery.resolve_service(app=args.app, namespace=args.namespace)
+    namespace, match_spec = discovery.resolve_service(app=args.app, namespace=args.namespace)
     print(f"  namespace       : {namespace}")
-    print(f"  label selector  : {selector}")
+    print(f"  pod match       : {match_spec.describe()}")
     print(f"  cluster         : {_describe_connection()}")
 
     if not result.ok:
@@ -168,7 +168,7 @@ def main():
         return 0 if result.targets else 2
 
     if not result.targets:
-        print("\nNo pods matched. Check the namespace and label selector.")
+        print("\nNo pods matched. Check the namespace and pod match spec.")
         return 2
 
     import os

@@ -277,7 +277,7 @@ def test_kubernetes_only_chain_end_to_end(monkeypatch, tmp_path):
     from src.log_pipeline import pipeline
 
     fixtures_root = tmp_path / "k8s"
-    _write_k8s_fixture(fixtures_root, "enu", "pod-a", [
+    _write_k8s_fixture(fixtures_root, "enu", "enu-biometric-a", [
         f"{KUBELET_TS} INFO processing evt-k8s",
         f"{KUBELET_TS} ERROR dedup rejected evt-k8s",
     ])
@@ -293,7 +293,7 @@ def test_kubernetes_only_chain_end_to_end(monkeypatch, tmp_path):
 
     assert "dedup rejected evt-k8s" in out
     # Pod attribution is rendered so the LLM can tell replicas apart.
-    assert "pod-a" in out
+    assert "enu-biometric-a" in out
 
 
 def test_chain_falls_back_from_kubernetes_to_elastic_end_to_end(monkeypatch, tmp_path):
@@ -301,7 +301,7 @@ def test_chain_falls_back_from_kubernetes_to_elastic_end_to_end(monkeypatch, tmp
 
     # Kubernetes has pods but nothing matching the identifier.
     fixtures_root = tmp_path / "k8s"
-    _write_k8s_fixture(fixtures_root, "enu", "pod-a", [f"{KUBELET_TS} INFO unrelated"])
+    _write_k8s_fixture(fixtures_root, "enu", "enu-biometric-a", [f"{KUBELET_TS} INFO unrelated"])
     monkeypatch.setenv("K8S_FIXTURE_DIR", str(fixtures_root))
     monkeypatch.setenv("K8S_DEFAULT_NAMESPACE", "enu")
     monkeypatch.setattr(

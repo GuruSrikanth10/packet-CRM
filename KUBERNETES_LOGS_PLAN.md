@@ -14,6 +14,18 @@ in -- but the moment they are, Kubernetes becomes the first thing tried on
 every single packet, without Open Questions 1-3 having been answered from a
 real cluster first.
 
+**Update (2026-08-13): pod discovery adapted to a namespace-scoped-only RBAC
+model.** A validated reference script (working, in-cluster, against a
+different namespace/service) confirmed the ServiceAccount pattern in use here
+cannot `list` namespaces or pods cluster-wide -- only a targeted `get` on an
+already-known namespace, and a `list` scoped to it. Discovery now does a
+`read_namespace` pre-flight before listing anything (5.2), and pod matching
+defaults to a client-side name-substring match (`PodMatchSpec`) rather than a
+server-side label selector, since the reference pattern lists every pod in
+the namespace with no selector at all. Label-selector matching is still
+available as an opt-in per app via `K8S_SERVICE_MAP`. See 5.2, 6.5, and 7 for
+the updated design, RBAC, and config surface.
+
 **How to use this document.** Sections 1-8 are the design. Section 9 is the
 implementation plan, broken into self-contained phases. Each phase lists the
 exact files it touches, the config it adds, its tests, its exit criteria, and
@@ -291,10 +303,34 @@ Security:
 ### 5.2 Pod discovery
 
 No Kubernetes API aggregates logs across a Deployment; the tool lists and
-iterates.
+iterates. The ServiceAccounts available in this cluster are namespace-scoped
+only -- there is no `list namespaces` or `list pods --all-namespaces`
+permission, confirmed against a real, working reference script pulling logs
+for `centralized-rule-engine` in the `ankalan` namespace. Two consequences
+follow directly from that constraint:
 
-- **Selector resolution.** `app` maps to `(namespace, label_selector)` via
-  `K8S_SERVICE_MAP`, defaulting to `app=<name>`.
+- **The namespace must always be resolved up front, never discovered.** Before
+  listing anything, a targeted `v1.read_namespace(name=namespace)` verifies
+  the namespace exists and is reachable with the current credentials. A 403
+  here means RBAC denial; a 404 means the namespace name is wrong -- both are
+  distinct, both are logged distinctly, and both short-circuit discovery
+  before `_list_pods` is attempted.
+- **Pod matching defaults to a client-side name substring, not a label
+  selector.** The reference pattern lists every pod in the namespace with no
+  `label_selector` and matches with `search_string in pod.metadata.name`,
+  because the real services here don't guarantee consistent labels. This is
+  modelled as `PodMatchSpec(mode, value)`:
+  - `mode="name_contains"` (the default) -- lists the namespace with no
+    selector kwarg at all, then keeps pods whose name contains `value`
+    client-side. Still a namespace-scoped `list`, not a cluster-wide one.
+  - `mode="label"` (opt-in) -- passes `label_selector=value` to
+    `list_namespaced_pod` server-side, for a service that does have reliable
+    labels.
+  `resolve_service(app, namespace)` returns `(namespace, PodMatchSpec)`.
+  `K8S_SERVICE_MAP` selects the mode per app: a `"label_selector"` key opts
+  into label mode; a `"name_contains"` key overrides the substring (default
+  is the app name itself); neither key falls back to `name_contains` on
+  `app`.
 - **Phase filter.** Skip only `Pending` (no logs exist yet). **Explicitly
   include `Failed` and `Succeeded`** -- a terminated pod frequently holds the
   exact crash evidence needed. Filtering to `Running` is the most common
@@ -519,7 +555,7 @@ Structured `structlog` events with `event_id` bound, per 2.8:
 | Event | Level | Fields |
 |---|---|---|
 | `log_source_selected` | info | `chain`, `attempted`, `winner` |
-| `k8s_fetch_started` | info | `namespace`, `selector`, `since_hours` |
+| `k8s_fetch_started` | info | `namespace`, `match_mode`, `match_value`, `since_hours` |
 | `k8s_pods_discovered` | info | `pod_count`, `skipped_pending`, `truncated` |
 | `k8s_pod_fetched` | debug | `pod_name`, `container`, `bytes`, `lines`, `matched`, `latency_ms` |
 | `k8s_previous_fetched` | debug | `pod_name`, `restart_count` |
@@ -540,12 +576,22 @@ Least-privilege RBAC, scoped per namespace:
 ```yaml
 rules:
   - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
+  - apiGroups: [""]
     resources: ["pods"]
     verbs: ["list"]
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
 ```
+
+`namespaces:get` backs the pre-flight `read_namespace` check (5.2) -- it is a
+`get` on the one already-known namespace, not `list`, and grants no ability to
+enumerate other namespaces. `pods:list` is bound via a `RoleBinding`
+(namespace-scoped), never a `ClusterRoleBinding`; the ServiceAccount cannot
+list pods or namespaces outside the namespace it's bound to, matching the
+real-world constraint this design was adapted to (5.2).
 
 No `watch`, no cluster-wide binding, no other resources. A `403` is surfaced
 distinctly, never retried, never swallowed into an empty result. Pod-log access
@@ -572,7 +618,7 @@ denser than the ES projection, so disk exhaustion arrives sooner. A companion
 | `K8S_CONTEXT` | *(unset)* | Context when the kubeconfig has several |
 | `K8S_DEFAULT_NAMESPACE` | *(unset)* | Namespace when caller passes none |
 | `K8S_DEFAULT_APP` | `enu-biometric` | Matches today's ES filter |
-| `K8S_SERVICE_MAP` | `{}` | JSON `app -> {namespace, label_selector}` |
+| `K8S_SERVICE_MAP` | `{}` | JSON `app -> {namespace, name_contains \| label_selector}`; `name_contains` (client-side substring) is the default match mode, `label_selector` opts into server-side label matching |
 | `K8S_DEFAULT_SINCE_HOURS` | `2` | Look-back window |
 | `K8S_SEARCH_FIELDS` | `eventId,refId` | Identifiers to match on |
 | `K8S_MAX_PODS` | `20` | Fan-out cap |
@@ -600,7 +646,7 @@ All added to `.env.example` with comments, per 1.4. `requirements.txt` gains
 | # | Scenario | Handling |
 |---|---|---|
 | 1 | Single running pod | Direct read |
-| 2 | Multiple replicas | Selector list, bounded parallel fan-out, timestamp merge |
+| 2 | Multiple replicas | Namespace list, client-side name-match (or label selector), bounded parallel fan-out, timestamp merge |
 | 3 | Container restarted in place | Second call with `previous=True`, tagged |
 | 4 | Pod deleted and replaced | Unrecoverable; `POD_REPLACED` gap |
 | 5 | Logs rotated off node | Unrecoverable; `LOG_ROTATION` gap |
@@ -608,11 +654,11 @@ All added to `.env.example` with comments, per 1.4. `requirements.txt` gains
 | 7 | Pod `Pending` | No logs exist; skip silently |
 | 8 | Pod `Failed` / `Succeeded` | **Included** -- often holds the crash evidence |
 | 9 | Multi-container with sidecars | Denylist, else fetch each and tag |
-| 10 | Selector matches nothing | Empty + warning (usually wrong namespace/label) |
+| 10 | Match spec matches nothing | Empty + warning (usually wrong namespace/name_contains/label) |
 | 11 | Identifier absent from all logs | Successful empty result -- **not** a failure |
 | 12 | `403 Forbidden` | RBAC error; no retry; distinct log |
 | 13 | `404` between list and read | Skip pod, continue, `POD_VANISHED` gap |
-| 14 | Namespace missing | Hard config error; no retry |
+| 14 | Namespace missing | Caught by `read_namespace` pre-flight before listing; hard config error, no retry |
 | 15 | Very large volume | Byte/pod caps; `TRUNCATED` gap |
 | 16 | API server unreachable | Retry, then breaker opens |
 | 17 | Clock skew across nodes | Kubelet ts for ordering; `pod_name` for attribution |
@@ -912,7 +958,8 @@ tests/fixtures/k8s/<namespace>/<pod-name>/
 
 | Symptom | First checks |
 |---|---|
-| Empty results, `pod_count: 0` | Wrong namespace or label selector; verify `K8S_SERVICE_MAP` against `kubectl get pods --show-labels` |
+| Empty results, `pod_count: 0` | Wrong namespace, or `name_contains`/label selector doesn't match; verify `K8S_SERVICE_MAP` against `kubectl get pods -n <namespace>` (add `--show-labels` only if that app uses label mode) |
+| `k8s_rbac_denied` on discovery (before any pod list) | ServiceAccount lacks `namespaces:get` on that namespace -- the pre-flight check (5.2) failed |
 | Empty results, pods found | Identifier mismatch -- do the services log `eventId` or `refId`? Check `K8S_SEARCH_FIELDS` |
 | Always falling back to ES | K8s returning empty; check retention vs investigation lag, then the identifier |
 | `LOG_ROTATION` gaps constantly | Retention shorter than lag; reduce `since_hours`, raise kubelet `containerLogMaxSize`, or lead the chain with `elastic` |
