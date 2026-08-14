@@ -18,10 +18,20 @@ from src.tools.tool_registry import (
     lookup_rule_text,
 )
 from src.log_pipeline.sources.k8s.filtering import identifiers_from_payload
+from src.models.synthesis import (
+    ACTIONS,
+    RESIDENT_ACTIONS,
+    apply_confidence_policy,
+    parse_synthesis,
+)
 from src.utils.resilience import retry_transient, llm_breaker
 from src.utils.logging_config import get_logger
 from src.utils.paths import CHECKPOINT_DB_PATH
-from src.utils.runbook_store import get_runbook, generate_rule_fingerprint
+from src.utils.runbook_store import (
+    generate_rule_fingerprint,
+    get_runbook,
+    is_serve_allowed,
+)
 
 logger = get_logger(__name__)
 
@@ -165,8 +175,15 @@ def get_agent():
             synthesis_json = json.dumps(runbook["resolution"])
 
             log.info("Runbook hit", runbook_id=runbook_id, version=version, mode=mode)
+            metrics.RUNBOOK_LOOKUPS.labels(outcome="hit").inc()
 
-            if mode == "shadow":
+            # A reason code not on the allowlist still runs the agents, but
+            # its runbook is compared against them -- which is how it earns
+            # its place on the allowlist (4.2).
+            if mode == "shadow" or not is_serve_allowed(reason_code):
+                if mode != "shadow":
+                    log.info("Runbook not yet cleared to serve; shadowing instead",
+                             runbook_id=runbook_id)
                 return {"resolution_source": "agent", "shadow_runbook_resolution": synthesis_json}
 
             return {"resolution_source": res_source, "synthesis": synthesis_json, "runbook_id": runbook_id}
@@ -411,6 +428,64 @@ def get_agent():
         metrics.record_llm_usage("synthesis", res)
         metrics.LLM_CALLS.labels(node="synthesis", outcome="ok").inc()
         synthesis_content = res["messages"][-1].content
+
+        # Validate against the declared contract, and repair once. A malformed
+        # response used to fall back to {"rejection_description": <raw text>},
+        # producing a casebook with action: null that looked identical to a
+        # packet the agents genuinely could not classify (4.3).
+        parsed, error = parse_synthesis(synthesis_content)
+        if parsed is None:
+            log.warning("Synthesis output failed validation; requesting a repair",
+                        error=error)
+            metrics.LLM_CALLS.labels(node="synthesis", outcome="invalid").inc()
+
+            repair_prompt = (
+                f"Your previous response was rejected: {error}\n\n"
+                f"Previous response:\n{synthesis_content}\n\n"
+                f"Return ONLY the corrected JSON object. `action` must be one "
+                f"of {list(ACTIONS)} and `resident_action` one of "
+                f"{list(RESIDENT_ACTIONS)}."
+            )
+
+            @llm_breaker
+            @retry_transient
+            def invoke_repair():
+                return synthesis_agent.invoke({"messages": [
+                    SystemMessage(content=synthesis_prompt),
+                    HumanMessage(content=repair_prompt)
+                ]})
+
+            res = invoke_repair()
+            metrics.record_llm_usage("synthesis", res)
+            synthesis_content = res["messages"][-1].content
+            parsed, error = parse_synthesis(synthesis_content)
+
+        if parsed is None:
+            # Two failures. Escalating is the only honest outcome: we have no
+            # validated action, and inventing one would be worse than saying so.
+            log.error("Synthesis output invalid after repair; escalating",
+                      error=error)
+            metrics.LLM_CALLS.labels(node="synthesis", outcome="unrepairable").inc()
+            synthesis_content = json.dumps({
+                "rejection_description": (
+                    "ESCALATED: the Synthesis agent did not produce a valid "
+                    f"resolution after a repair attempt. Last error: {error}"
+                ),
+                "synthesis": "ESCALATED TO HUMAN REVIEW (invalid agent output).",
+                "action": "MANUAL_REVIEW",
+                "resident_action": "PENDING",
+            })
+        else:
+            parsed, abstained, reason = apply_confidence_policy(
+                parsed, logs=state.get("logs", "")
+            )
+            if reason:
+                log.warning("Confidence policy applied", detail=reason,
+                            abstained=abstained)
+            if abstained:
+                metrics.LLM_CALLS.labels(node="synthesis", outcome="abstained").inc()
+            synthesis_content = parsed.model_dump_json()
+
         log.info("Synthesis finished")
         # How many Reviewer rejections this packet needed. A rising
         # distribution is the earliest signal of prompt or model regression.

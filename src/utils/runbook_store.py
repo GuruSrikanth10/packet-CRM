@@ -47,6 +47,28 @@ def runbook_cache_key(reason_code: str, enrolment_type) -> str:
     return f"{reason_code}__{normalize_enrolment_type(enrolment_type)}"
 
 
+def serve_allowlist() -> Optional[set]:
+    """Reason codes cleared to short-circuit the agents (4.2).
+
+    RUNBOOK_MODE is a global switch: flipping it to `serve` turns runbooks on
+    for every reason code at once, including ones with no accuracy evidence
+    behind them. This narrows it, so a high-volume, well-understood code can
+    go first while everything else keeps running the agents.
+
+    Returns None when unset, meaning "no per-code restriction" -- the previous
+    behaviour, so existing deployments are unaffected.
+    """
+    raw = os.environ.get("RUNBOOK_SERVE_ALLOWLIST", "").strip()
+    if not raw:
+        return None
+    return {code.strip() for code in raw.split(",") if code.strip()}
+
+
+def is_serve_allowed(reason_code: str) -> bool:
+    allowed = serve_allowlist()
+    return True if allowed is None else reason_code in allowed
+
+
 def generate_rule_fingerprint(rule) -> str:
     """Generate a stable SHA256 fingerprint from parsed rule row(s).
 
