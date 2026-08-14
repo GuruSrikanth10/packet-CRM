@@ -8,7 +8,14 @@ class S3CasebookStorage(CasebookStorage):
         
     def save(self, event_id: str, casebook: dict, filename: str = "casebook.json") -> None:
         raise NotImplementedError("S3CasebookStorage is not yet implemented.")
-        
+
+    def save_terminal(self, event_id: str, casebook: dict) -> None:
+        raise NotImplementedError("S3CasebookStorage is not yet implemented.")
+
+    def terminal_status(self, event_id: str) -> Optional[str]:
+        raise NotImplementedError("S3CasebookStorage is not yet implemented.")
+
+
     def load(self, event_id: str, filename: str = "casebook.json") -> Optional[dict]:
         raise NotImplementedError("S3CasebookStorage is not yet implemented.")
         

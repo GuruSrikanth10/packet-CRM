@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from typing import Optional
 from filelock import FileLock
-from src.storage.base import CasebookStorage
+from src.storage.base import CasebookStorage, TERMINAL_STATUSES
 
 class LocalFilesystemCasebookStorage(CasebookStorage):
     def __init__(self, base_dir: str = None):
@@ -54,6 +54,36 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
                 json.dump(casebook, f, indent=4, ensure_ascii=False)
             os.replace(tmp_path, final_path)
 
+    def save_terminal(self, event_id: str, casebook: dict) -> None:
+        """Write casebook.json then status.json for one terminal outcome.
+
+        casebook.json is written first: if the process dies between the two
+        writes, a stale IN_PROGRESS status.json goes stale on its own after
+        MAX_IN_PROGRESS_AGE_SECONDS, whereas a terminal status.json with no
+        casebook behind it would suppress reprocessing forever.
+        """
+        self.save(event_id, casebook)
+
+        status = (casebook.get("packet_status") or {}).get("status")
+        self.save(event_id, {
+            "packet_metadata": {"eid": event_id},
+            "packet_status": {"status": status},
+            "resolution": {
+                "synthesis": (casebook.get("resolution") or {}).get("synthesis")
+            },
+        }, filename="status.json")
+
+    def terminal_status(self, event_id: str) -> Optional[str]:
+        """Return the terminal status found in either file, or None."""
+        for filename in ("status.json", "casebook.json"):
+            data = self.load(event_id, filename=filename)
+            if not data:
+                continue
+            status = (data.get("packet_status") or {}).get("status")
+            if status in TERMINAL_STATUSES:
+                return status
+        return None
+
     def load(self, event_id: str, filename: str = "casebook.json") -> Optional[dict]:
         target_dir = self._resolve_dir(event_id)
         final_path = target_dir / filename
@@ -75,8 +105,6 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
             return False
             
         if terminal_only:
-            status = data.get("packet_status", {}).get("status")
-            # Usually COMPLETED, REJECTED, NEEDS_MANUAL_REVIEW, FAILED_PERMANENT are terminal
-            return status in ("COMPLETED", "REJECTED", "NEEDS_MANUAL_REVIEW", "FAILED_PERMANENT", "DLQ", "FAILED_TIMEOUT")
-        
+            return data.get("packet_status", {}).get("status") in TERMINAL_STATUSES
+
         return True

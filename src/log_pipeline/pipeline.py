@@ -12,6 +12,7 @@ Flow:
 import json
 import os
 
+from src.log_pipeline import redaction
 from src.log_pipeline.catalog import TemplateCatalog
 from src.log_pipeline.reducer import branch_on_error, cluster_logs, apply_evidence_guardrails
 from src.log_pipeline.sources import chain as source_chain
@@ -45,12 +46,19 @@ def _default_window() -> TimeWindow:
         return TimeWindow.default()
 
 
-def reduce_logs(event_id: str) -> str:
+def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
     """Run the full log reduction pipeline for an event_id.
+
+    `extra_identifiers` are additional correlation ids (refId, srn) that the
+    Kubernetes source matches lines against alongside `event_id`, and that
+    redaction allowlists so they survive scrubbing. Wired to the payload in
+    Phase C (F11); defaults to empty so callers that don't have them work
+    unchanged.
 
     Returns a formatted string suitable for LLM context injection.
     Raw logs are also persisted to disk for audit.
     """
+    extra_identifiers = tuple(v for v in (extra_identifiers or ()) if v)
     # Load catalog (cached -- only reads disk once)
     catalog = _get_catalog()
 
@@ -60,7 +68,8 @@ def reduce_logs(event_id: str) -> str:
     fetch_result = source_chain.fetch_with_fallback(
         event_id,
         _default_window(),
-        FetchContext(event_id=event_id, catalog=catalog),
+        FetchContext(event_id=event_id, catalog=catalog,
+                     extra_identifiers=extra_identifiers),
     )
     raw_logs = fetch_result.records
 
@@ -73,6 +82,33 @@ def reduce_logs(event_id: str) -> str:
     total_fetched = len(raw_logs)
     log = logger.bind(event_id=event_id)
     log.info(f"[PIPELINE] Fetched {total_fetched} logs.")
+
+    # ------------------------------------------------------------------
+    # Redaction -- after fetch, before ANY persistence.
+    # ------------------------------------------------------------------
+    # This is the one seam every source passes through, so redacting here
+    # covers Elasticsearch too. It previously ran only inside the Kubernetes
+    # retrieval path, and since LOG_SOURCE's Kubernetes leg fails fast when no
+    # cluster is configured, in practice most deployments wrote entirely
+    # unredacted resident data to raw_logs.txt, into the casebook's
+    # rejection_logs field, and on to S3 (F10).
+    #
+    # The Kubernetes source still redacts internally before writing its own
+    # snapshot -- that is a separate persistence point, reached before this
+    # one. Redaction is idempotent (redacted text has no PII left to match),
+    # so the second pass over those records is a no-op that simply counts 0.
+    #
+    # The identifiers we searched on are the allowlist: they are operational
+    # correlation ids, not resident PII, and scrubbing them would destroy the
+    # investigation.
+    redaction_counts = redaction.redact_records(
+        raw_logs, allowlist=[event_id, *(extra_identifiers or ())]
+    )
+    if redaction_counts:
+        log.info("[PIPELINE] Redacted PII before persistence", **{
+            f"redacted_{label.lower()}": count
+            for label, count in redaction_counts.items()
+        })
 
     # Persist raw logs to disk for audit
     log_file_path = _save_raw_logs(event_id, raw_logs)

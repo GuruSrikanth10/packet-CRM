@@ -162,21 +162,21 @@ def test_semaphore_released_once_when_submit_never_happens():
 # polled batch, so a crash mid-batch can't silently lose later messages.
 # ======================================================================
 
-def test_skip_path_commits_only_this_message_offset():
-    """A message skipped without dispatch commits immediately -- and commits
-    only its own offset, never the whole polled batch.
+def test_skip_path_records_only_this_message_offset():
+    """A message skipped without dispatch becomes committable immediately --
+    and contributes only its own offset, never the whole polled batch.
 
-    This is the surviving half of the original 0.10 guarantee. The *enqueue*
-    path no longer commits here at all (see the deferred-commit test below),
-    but the skip paths still do, and they are exactly where a bare
-    `consumer.commit()` would have advanced past messages later in the batch.
+    Skips go through the same OffsetTracker as completions rather than
+    committing inline. Committing a skip inline had the identical ordering
+    hazard as an out-of-order completion: skipping offset 100 while offset 99
+    was still in flight would commit 101 and strand 99 (F3).
     """
     import src.utils.kafkaConsumer as kc
     from kafka.structs import OffsetAndMetadata
 
     fake_consumer = MagicMock()
 
-    # packetStatus != REJECTED -> skipped and committed without dispatch.
+    # packetStatus != REJECTED -> skipped without dispatch.
     skipped_signal = dict(DUMMY_PAYLOAD)
     skipped_signal["packetExecutionSummary"] = {
         "packetStatus": "PROCESSED",
@@ -187,11 +187,15 @@ def test_skip_path_commits_only_this_message_offset():
 
     with patch.object(kc, "consumer", fake_consumer), \
          patch.object(kc, "_worker_pool") as fake_pool, \
+         patch.object(kc, "_offset_tracker", kc.OffsetTracker()) as tracker, \
          patch.object(kc, "get_casebook_storage"):
         kc._handle_one_message(tp, msg)
 
-    fake_pool.submit.assert_not_called()
-    fake_consumer.commit.assert_called_once_with({tp: OffsetAndMetadata(100, None, -1)})
+        fake_pool.submit.assert_not_called()
+        # Nothing is committed inline...
+        fake_consumer.commit.assert_not_called()
+        # ...but this offset alone is now safe to commit.
+        assert tracker.take_committable() == {tp: OffsetAndMetadata(100, None, -1)}
 
 
 def test_dispatched_message_defers_its_commit_to_completion():
