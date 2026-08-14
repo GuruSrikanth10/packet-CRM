@@ -16,6 +16,7 @@ sequenceDiagram
     participant API as FastAPI (/process-rejection)
     participant M as RejectionManagerAgent
     participant RB as Runbook Store
+    participant LF as LogFilterAgent
     participant I as InvestigatorAgent
     participant R as ReviewerAgent
     participant S as SynthesisAgent
@@ -36,6 +37,12 @@ sequenceDiagram
     else No Runbook or RUNBOOK_MODE=off/shadow
         M->>T: lookup_rule_by_reason_code (pre-fetched in Python)
         T-->>M: Rule row(s), filtered by enrolmentType
+        
+        opt ENABLE_LOG_FILTER_AGENT=true
+            M->>LF: Dispatch raw sliding-window logs
+            LF-->>M: Cleaned logs (cross-packet noise removed)
+        end
+        
         M->>I: Dispatch payload + logs + rule for Investigation
         I-->>M: Return detailed technical findings
         
@@ -103,6 +110,7 @@ packet-CRM/
 │   ├── models/
 │   │   └── schemas.py              # Strict Pydantic data validation schemas
 │   ├── prompts/
+│   │   ├── LogFilterAgent.md       # Log Filter agent context window sanitization instructions
 │   │   ├── InvestigatorAgent.md    # Investigator context and instructions
 │   │   ├── ReviewerAgent.md        # Reviewer context and validation logic
 │   │   ├── SynthesisAgent.md       # Synthesis output contract (strict JSON keys)
@@ -226,7 +234,8 @@ The architecture incorporates several resilience mechanisms to prevent runaway c
 The intelligence of the system relies on a multi-agent hierarchy. Both the Investigator and Synthesis agents are strictly instructed to reference the business logic outlined in `agent_policy_context.md` to understand success criteria and parse deviations correctly.
 - **Dynamic Context Injection**: The Python orchestrator dynamically intercepts and filters database rules (e.g., checking the `enrolmentType` from the payload) before injecting the exact correct rule into the agent's prompt to avoid LLM hallucinations.
 - **RejectionManager (not an LLM)**: The conductor is the compiled `StateGraph` itself, not an agent. Routing is plain Python, so the sequence of steps cannot be altered by a model.
-- **InvestigatorAgent**: The detective. It correlates error codes (`reasonCode`) with the internal business rule (`ruleId`) that the orchestrator pre-fetched for it, cross-references the reduced Elasticsearch trace, and determines the technical failure. It holds no tools of its own.
+- **LogFilterAgent**: (Optional). Because logs are fetched from Kubernetes using a sliding window (e.g., 5 lines before, 20 lines after a match), the resulting block often contains log lines and errors from highly concurrent, unrelated packets. If `ENABLE_LOG_FILTER_AGENT=true`, this agent reads the block and cleanly deletes any errors belonging to other `eventId`s or `refId`s before the investigation begins.
+- **InvestigatorAgent**: The detective. It correlates error codes (`reasonCode`) with the internal business rule (`ruleId`) that the orchestrator pre-fetched for it, cross-references the reduced Elasticsearch trace, and determines the technical failure. It holds no tools of its own. It is explicitly hardened against "Context Confusion," meaning it is strictly instructed to verify the `eventId` of any ERROR log before trusting it, preventing cross-packet hallucinations when the LogFilterAgent is disabled.
 - **ReviewerAgent**: The auditor. It checks the Investigator's homework to eliminate hallucinations.
 - **SynthesisAgent**: The resolution writer. Once the investigation is validated, this agent synthesizes the findings into plain English, categorizes the remediation steps into strict enums (e.g., `NEW_PACKET`, `REPLAY`), and generates the analytical JSON block.
 

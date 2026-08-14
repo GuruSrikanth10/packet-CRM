@@ -81,6 +81,7 @@ def get_agent():
     investigator_prompt = load_prompt("InvestigatorAgent.md")
     reviewer_prompt = load_prompt("ReviewerAgent.md")
     synthesis_prompt = load_prompt("SynthesisAgent.md")
+    log_filter_prompt = load_prompt("LogFilterAgent.md")
     
     def fetch_logs_node(state: GraphState):
         event_id = state.get("payload", {}).get("eventId", "")
@@ -148,10 +149,13 @@ def get_agent():
     def check_runbook_hit(state: GraphState):
         if state.get("resolution_source", "").startswith("runbook:"):
             return "end"
+        if os.environ.get("ENABLE_LOG_FILTER_AGENT", "false").lower() == "true":
+            return "filter"
         return "investigate"
 
     # Create agents once during graph construction, not per invocation.
     investigator_agent = create_react_agent(llm, tools=[])
+    log_filter_agent = create_react_agent(llm, tools=[])
     queue_tool = get_tool_by_name("queue_for_replay")
     synthesis_agent = create_react_agent(llm, tools=[queue_tool])
 
@@ -188,6 +192,35 @@ def get_agent():
     # 2.2: the Reviewer is a bounded verdict task, a natural fit for the
     # cheaper "simple" tier, which was otherwise constructed and unused.
     reviewer_agent = create_react_agent(simple_llm, tools=[add_learning_rule])
+
+    def filter_logs_node(state: GraphState):
+        event_id = state.get("payload", {}).get("eventId", "unknown")
+        log = logger.bind(event_id=event_id)
+        
+        logs = state.get("logs", "")
+        if not logs or logs == "Log fetching disabled.":
+            return {}
+            
+        log.info("Log Filter node started", state="FILTERING")
+        
+        prompt = (
+            f"Target Event ID: {event_id}\n\n"
+            f"Raw Logs:\n{logs}\n\n"
+            "Return ONLY the clean log string, stripping out any errors that do not belong to the Target Event ID."
+        )
+        
+        @llm_breaker
+        @retry_transient
+        def invoke_filter():
+            return log_filter_agent.invoke({"messages": [
+                SystemMessage(content=log_filter_prompt),
+                HumanMessage(content=prompt)
+            ]})
+            
+        res = invoke_filter()
+        filtered_logs = res["messages"][-1].content
+        log.info("Log Filter node finished")
+        return {"logs": filtered_logs}
 
     def investigator_node(state: GraphState):
         payload = state.get("payload", {})
@@ -384,6 +417,7 @@ def get_agent():
     workflow = StateGraph(GraphState)
     workflow.add_node("fetch_logs", fetch_logs_node)
     workflow.add_node("runbook_lookup", runbook_lookup_node)
+    workflow.add_node("filter_logs", filter_logs_node)
     workflow.add_node("investigate", investigator_node)
     workflow.add_node("review", reviewer_node)
     workflow.add_node("synthesize", synthesis_node)
@@ -391,7 +425,8 @@ def get_agent():
     
     workflow.add_edge(START, "fetch_logs")
     workflow.add_edge("fetch_logs", "runbook_lookup")
-    workflow.add_conditional_edges("runbook_lookup", check_runbook_hit, {"end": END, "investigate": "investigate"})
+    workflow.add_conditional_edges("runbook_lookup", check_runbook_hit, {"end": END, "filter": "filter_logs", "investigate": "investigate"})
+    workflow.add_edge("filter_logs", "investigate")
     workflow.add_edge("investigate", "review")
     workflow.add_conditional_edges("review", check_approval, {"synthesis": "synthesize", "investigator": "investigate", "escalate": "escalate"})
     workflow.add_edge("synthesize", END)

@@ -57,5 +57,11 @@ Gap types you may see:
 When no banner is present, treat the trace as a complete view of the
 requested window and reason normally.
 
+### LOG NOISE AND CONTEXT CONFUSION -- CRITICAL
+
+Because logs are fetched from highly concurrent microservices using a sliding window, **the log trace will contain logs and errors belonging to OTHER packets/requests**. 
+You MUST verify that any ERROR or failure you attribute to the current packet actually belongs to it. 
+If an ERROR line explicitly mentions a `refId`, `eventId`, or `uid` that does NOT match the Kafka payload you were provided, you MUST completely ignore it. It is noise from a concurrent request.
+
 Determine exactly why the packet failed validation or execution.
 Pass your detailed technical findings and DB rule analysis to the ReviewerAgent.
