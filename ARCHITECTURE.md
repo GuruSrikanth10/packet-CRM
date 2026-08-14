@@ -15,6 +15,7 @@ sequenceDiagram
     participant C as Background Consumer
     participant API as FastAPI (/process-rejection)
     participant M as RejectionManagerAgent
+    participant RB as Runbook Store
     participant I as InvestigatorAgent
     participant R as ReviewerAgent
     participant S as SynthesisAgent
@@ -28,25 +29,31 @@ sequenceDiagram
     API->>API: Validate via Pydantic (MessagePayload)
     API->>M: Invoke Orchestrator
     
-    M->>T: lookup_rule_by_reason_code (pre-fetched in Python)
-    T-->>M: Rule row(s), filtered by enrolmentType
-    M->>I: Dispatch payload + logs + rule for Investigation
-    I-->>M: Return detailed technical findings
-    
-    M->>R: Dispatch findings for Validation
-    R->>R: Validate logic and accuracy
-    
-    alt Mistake Detected
-        R->>T: add_learning_rule()
-        T->>FS: Stages proposal to src/prompts/pending_rules.jsonl
-        R-->>M: Return corrective feedback (loop back to I)
-    else Validated
-        R-->>M: Reply "APPROVED"
+    M->>RB: Lookup runbook by (reason_code, enrolment_type)
+    alt Runbook Hit (RUNBOOK_MODE=serve)
+        RB-->>M: Return pre-built resolution
+        M-->>API: Short-circuit with runbook resolution
+    else No Runbook or RUNBOOK_MODE=off/shadow
+        M->>T: lookup_rule_by_reason_code (pre-fetched in Python)
+        T-->>M: Rule row(s), filtered by enrolmentType
+        M->>I: Dispatch payload + logs + rule for Investigation
+        I-->>M: Return detailed technical findings
+        
+        M->>R: Dispatch findings for Validation
+        R->>R: Validate logic and accuracy
+        
+        alt Mistake Detected
+            R->>T: add_learning_rule()
+            T->>FS: Stages proposal to src/prompts/pending_rules.jsonl
+            R-->>M: Return corrective feedback (loop back to I)
+        else Validated
+            R-->>M: Reply "APPROVED"
+        end
+        
+        M->>S: Dispatch for Synthesis
+        S->>T: queue_for_replay (only if Action is REPLAY/QC_REPLAY)
+        S-->>M: Return strict analytical JSON
     end
-    
-    M->>S: Dispatch for Synthesis
-    S->>T: queue_for_replay (only if Action is REPLAY/QC_REPLAY)
-    S-->>M: Return strict analytical JSON
     
     M-->>API: Pass analytical JSON to backend
     API->>API: Extract metadata & construct hierarchical Casebook
@@ -69,7 +76,23 @@ packet-CRM/
 ├── test_payload.py                 # Static Pydantic validation smoke test
 ├── rules.csv                       # Rules export used by check_drift.py
 ├── tests/
-│   └── test_resilience.py          # Resilience/idempotency/DLQ regression tests
+│   ├── test_resilience.py          # Resilience/idempotency/DLQ regression tests
+│   ├── test_phase0_fixes.py        # Phase 0 correctness regression tests
+│   ├── test_phase1_fixes.py        # Phase 1 reliability regression tests
+│   ├── test_phase2_fixes.py        # Phase 2 optimization regression tests
+│   ├── test_runbooks.py            # Runbook store, validator, and serving tests
+│   ├── test_log_sources.py         # LogSource Protocol and ElasticLogSource tests
+│   ├── test_log_source_chain.py    # Fallback chain (LOG_SOURCE) tests
+│   ├── test_log_snapshot.py        # Evidence snapshot persistence tests
+│   ├── test_redaction.py           # PII redaction tests
+│   ├── test_prompt_gap_guidance.py # Prompt evidence-gap banner tests
+│   ├── test_es_diagnostic.py       # ES diagnostic tool tests
+│   ├── test_fetch_pod_logs_cli.py  # fetch_pod_logs CLI tests
+│   ├── test_k8s_discovery.py       # Kubernetes pod/namespace discovery tests
+│   ├── test_k8s_gaps.py            # Kubernetes evidence gap detection tests
+│   ├── test_k8s_parser.py          # Kubernetes log line parser tests
+│   ├── test_k8s_retrieval.py       # Kubernetes pod log retrieval tests
+│   └── test_k8s_retry.py           # Kubernetes HTTP retry logic tests
 ├── src/
 │   ├── main_api.py                 # FastAPI entry point (uvicorn, port 8000)
 │   ├── main_consumer.py            # Kafka consumer entry point (separate process)
@@ -83,44 +106,66 @@ packet-CRM/
 │   │   ├── InvestigatorAgent.md    # Investigator context and instructions
 │   │   ├── ReviewerAgent.md        # Reviewer context and validation logic
 │   │   ├── SynthesisAgent.md       # Synthesis output contract (strict JSON keys)
-│   │   └── pending_rules.jsonl     # Staged self-learning proposals (human-gated)
+│   │   └── RunbookGenerator.md     # LLM prompt for generic runbook template generation
+│   ├── runbooks/
+│   │   ├── draft/                  # LLM-generated runbook drafts (pending human review)
+│   │   └── final/                  # Human-approved runbook templates (served online)
 │   ├── storage/
 │   │   ├── base.py                 # CasebookStorage Protocol
 │   │   ├── local.py                # Atomic .tmp + filelock local filesystem backend
 │   │   ├── s3.py                   # S3 backend (stub, NotImplementedError)
 │   │   └── factory.py              # Backend selection via CASEBOOK_STORAGE_BACKEND
-│   ├── db/
-│   │   └── pending_replays.jsonl   # Human-in-the-loop replay queue
 │   ├── tools/
 │   │   ├── tool_registry.py        # Custom Python tools (DB lookup, logs, replay queue)
-│   │   ├── approve_replays.py      # CLI script for humans to approve packet replays
-│   │   ├── promote_rules.py        # CLI script to promote + git-commit learned rules
-│   │   ├── check_drift.py          # rules.csv schema drift detector
-│   │   ├── build_catalog.py        # Stage 0: Offline template catalog builder
-│   │   ├── eval_harness.py         # Stage 6: Evaluation harness for pipeline accuracy
-│   │   └── prune_checkpoints.py    # SQLite checkpoint pruning utility
+│   │   ├── approve_replays.py      # CLI: approve queued packet replays
+│   │   ├── promote_rules.py        # CLI: promote + git-commit learned rules
+│   │   ├── check_drift.py          # CLI: rules.csv schema drift detector
+│   │   ├── build_catalog.py        # CLI: Stage 0 offline template catalog builder
+│   │   ├── eval_harness.py         # CLI: Stage 6 evaluation harness for pipeline accuracy
+│   │   ├── prune_checkpoints.py    # CLI: SQLite checkpoint pruning utility
+│   │   ├── prune_casesheets.py     # CLI: Old/orphaned casesheet cleanup
+│   │   ├── es_diagnostic.py        # CLI: Elasticsearch connectivity and query diagnostics
+│   │   ├── fetch_pod_logs.py       # CLI: Direct Kubernetes pod log retrieval
+│   │   ├── build_runbooks.py       # CLI: Mine casebooks to draft generic runbook templates
+│   │   └── promote_runbooks.py     # CLI: Human-gate review and promotion of runbook drafts
 │   ├── log_pipeline/
 │   │   ├── config.py               # Pipeline constants and tunables
+│   │   ├── types.py                # Canonical LogRecord TypedDict and shared types
 │   │   ├── catalog.py              # Stage 0: Template classification catalog
 │   │   ├── fetcher.py              # Stage 1: Source-filtered ES fetch + search_after
 │   │   ├── reducer.py              # Stages 2-4: ERROR branch, Drain3 clustering, guardrails
-│   │   └── pipeline.py             # Top-level orchestrator wiring Stages 1-4
+│   │   ├── pipeline.py             # Top-level orchestrator wiring Stages 1-4
+│   │   ├── redaction.py            # PII redaction for log records
+│   │   ├── snapshot.py             # Evidence snapshot persistence (raw_logs_k8s.jsonl)
+│   │   └── sources/
+│   │       ├── base.py             # LogSource Protocol definition
+│   │       ├── elastic.py          # ElasticLogSource: wraps fetcher.py
+│   │       ├── chain.py            # FallbackChain: ordered LOG_SOURCE cascade
+│   │       └── k8s/                # Kubernetes pod log source
+│   │           ├── source.py       # KubernetesLogSource entry point
+│   │           ├── client.py       # HTTP client for Kubernetes API
+│   │           ├── discovery.py    # Pod/namespace auto-discovery
+│   │           ├── retrieval.py    # Pod log fan-out and retrieval
+│   │           ├── parser.py       # Raw log line parser
+│   │           ├── gaps.py         # Evidence gap detection
+│   │           ├── retry.py        # HTTP retry with status-aware backoff
+│   │           ├── filtering.py    # Log filtering and deduplication
+│   │           └── fixtures.py     # Shared test fixtures for k8s tests
 │   └── utils/
 │       ├── env.py                  # Environment variable configuration
+│       ├── paths.py                # Centralized path constants (CHECKPOINT_DB_PATH, etc.)
 │       ├── config_validator.py     # Fail-fast boot-time configuration validation
 │       ├── logging_config.py       # structlog JSON logging setup
 │       ├── kafkaConsumer.py        # Background topic polling + bounded worker pool
 │       ├── llm_utils.py            # LLM factory (local OpenAI-compatible / Mistral / HF)
 │       ├── resilience.py           # tenacity retries + pybreaker circuit breakers
 │       ├── dlq_publisher.py        # Dead Letter Queue producer
-│       └── s3_uploader.py          # Uploads large Elastic logs to S3
+│       ├── s3_uploader.py          # Uploads large Elastic logs to S3
+│       ├── runbook_store.py        # Runbook load/save, TTL cache, fingerprinting, path guard
+│       └── runbook_validator.py    # Generic-text regex validator (no UUIDs/dates/SRNs)
 ├── local_casesheets/               # Generated: casebook_<eventId>/{casebook,status}.json, logs
-└── local_checkpoints/              # Generated: consumer heartbeat, drain3 state, catalog
+└── local_checkpoints/              # Generated: checkpoints.db, drain3_state/, consumer heartbeat
 ```
-
-> Note: the LangGraph SQLite checkpoint file is currently written to `src/checkpoints.db`,
-> while `/ready` and `prune_checkpoints.py` look for it under `local_checkpoints/`.
-> See section 5 (Known Gaps).
 
 ---
 
@@ -152,18 +197,19 @@ default OpenAI-compatible) actually reads, not a hardcoded `OPENAI_API_KEY`.
 Instead of relying on an unpredictable LLM to orchestrate the subagents, the system uses a highly robust, strictly deterministic Python `StateGraph` (via `langgraph`) in `src/core/agent_orchestrator.py`. This ensures the exact sequential execution of every step.
 
 1. **Log Fetcher Node**: (If `ENABLE_LOG_FETCHING=true`) Automatically triggers the `fetch_elastic_logs` tool to pull relevant Kibana traces using the `eventId`.
-2. **Investigator Node**: A React agent constructed with an **empty tool list**. All external lookups are performed deterministically in Python before the call: `lookup_rule_by_reason_code` is invoked by the node itself, the result is filtered by `enrolmentType`, and the rule text is injected into the prompt. This removes a whole class of tool-call hallucination and redundant DB round-trips. The prompt is projected down to only the fields the Investigator needs (`eventId`, `packetMetaData`, `packetExecutionSummary`, `flowMetaData.stage`) rather than the full raw Kafka message, and on a retry it sends only the delta -- the prior investigation plus the Reviewer's feedback -- instead of resending the full payload/logs/rule context again.
-3. **Reviewer Node**: A distinct React agent, built once at graph-construction time (not per review) and bound to the `simple` LLM tier, that acts as a strict QC validator holding one tool (`add_learning_rule`). The tool no longer closes over the current `event_id`/investigation text per call -- it reads them from a pair of `contextvars.ContextVar`s that `reviewer_node` sets before each invocation, since each packet already runs on its own dedicated thread.
-4. **Conditional Router & Loop Guard**: A pure Python control edge that checks the Reviewer's output via `is_reviewer_approved()`: the (markdown/whitespace-stripped) feedback must *start with* the literal token `APPROVED`, not merely contain it -- this closes the "NOT APPROVED"/"DISAPPROVED" false-positive that a substring match would produce. Otherwise it increments `retry_count`; once `retry_count >= MAX_INVESTIGATION_RETRIES` it routes to the `escalate` node (preventing infinite LLM loops), else it loops back to the Investigator Node. A fresh (non-resumed) invocation always starts `retry_count` at 0, so a redelivered packet can never resume a stale checkpoint with the retry budget already exhausted.
-5. **Synthesis Node**: The final agent that takes the approved, heavily vetted technical diagnosis and translates it into a human-readable JSON `Casebook`. It holds the `queue_for_replay` tool.
-6. **Log Processor & S3 Uploader**: After the graph completes, `routes.py` evaluates the reduced log text carried in graph state. Text under 5000 characters is embedded directly into the casebook `packet_status.rejection_data.rejection_logs` field. Larger payloads are uploaded to AWS S3 via `boto3` (`src/utils/s3_uploader.py`), and the resulting `s3://...` URL is embedded instead. `upload_logs_to_s3()` returns `None` (never a fake URL) when `S3_LOGS_BUCKET` is unset or the upload fails; `routes.py` then embeds a truncated copy of the log text inline instead of silently discarding the evidence behind a placeholder URL.
+2. **Runbook Lookup Node**: Checks `RUNBOOK_MODE` (off/serve/shadow). If `serve`, it looks up a final runbook by `(reason_code, enrolment_type)` in `src/runbooks/final/`, verifies the DB rule fingerprint hasn't changed, and short-circuits the graph directly to `END` with the pre-built resolution (no LLM calls). In `shadow` mode, it records the runbook match but lets the agents run normally; `synthesis_node` later compares the two results and logs any divergence. If `off` (the default) or no runbook matches, it falls through to the Investigator.
+3. **Investigator Node**: A React agent constructed with an **empty tool list**. All external lookups are performed deterministically in Python before the call: `lookup_rule_by_reason_code` is invoked by the node itself, the result is filtered by `enrolmentType`, and the rule text is injected into the prompt. This removes a whole class of tool-call hallucination and redundant DB round-trips. The prompt is projected down to only the fields the Investigator needs (`eventId`, `packetMetaData`, `packetExecutionSummary`, `flowMetaData.stage`) rather than the full raw Kafka message, and on a retry it sends only the delta -- the prior investigation plus the Reviewer's feedback -- instead of resending the full payload/logs/rule context again.
+4. **Reviewer Node**: A distinct React agent, built once at graph-construction time (not per review) and bound to the `simple` LLM tier, that acts as a strict QC validator holding one tool (`add_learning_rule`). The tool no longer closes over the current `event_id`/investigation text per call -- it reads them from a pair of `contextvars.ContextVar`s that `reviewer_node` sets before each invocation, since each packet already runs on its own dedicated thread.
+5. **Conditional Router & Loop Guard**: A pure Python control edge that checks the Reviewer's output via `is_reviewer_approved()`: the (markdown/whitespace-stripped) feedback must *start with* the literal token `APPROVED`, not merely contain it -- this closes the "NOT APPROVED"/"DISAPPROVED" false-positive that a substring match would produce. Otherwise it increments `retry_count`; once `retry_count >= MAX_INVESTIGATION_RETRIES` it routes to the `escalate` node (preventing infinite LLM loops), else it loops back to the Investigator Node. A fresh (non-resumed) invocation always starts `retry_count` at 0, so a redelivered packet can never resume a stale checkpoint with the retry budget already exhausted.
+6. **Synthesis Node**: The final agent that takes the approved, heavily vetted technical diagnosis and translates it into a human-readable JSON `Casebook`. It holds the `queue_for_replay` tool. In shadow mode, it also compares its output to the runbook's pre-built resolution and logs a warning on any `action` divergence.
+7. **Log Processor & S3 Uploader**: After the graph completes, `routes.py` evaluates the reduced log text carried in graph state. Text under 5000 characters is embedded directly into the casebook `packet_status.rejection_data.rejection_logs` field. Larger payloads are uploaded to AWS S3 via `boto3` (`src/utils/s3_uploader.py`), and the resulting `s3://...` URL is embedded instead. `upload_logs_to_s3()` returns `None` (never a fake URL) when `S3_LOGS_BUCKET` is unset or the upload fails; `routes.py` then embeds a truncated copy of the log text inline instead of silently discarding the evidence behind a placeholder URL.
 
 ### 3.4 Resilience & Hardening (Phase 1 & 2)
 The architecture incorporates several resilience mechanisms to prevent runaway costs, silent failures, file corruption, and pipeline deadlocks:
 - **Idempotency & Staleness Guards**: The API intercepts requests and validates against the `CasebookStorage` interface. `IN_PROGRESS` stubs are written immediately to a separate `status.json` file to prevent duplicate runs without polluting the final `casebook.json`. Upon successful completion, `status.json` is overwritten with the terminal status. If an `IN_PROGRESS` stub goes stale (exceeding `MAX_IN_PROGRESS_AGE_SECONDS`), the pipeline safely resumes from a LangGraph checkpoint or fresh start. Terminal statuses include `COMPLETED`, `REJECTED`, `NEEDS_MANUAL_REVIEW`, `FAILED_PERMANENT`, `DLQ`, and `FAILED_TIMEOUT`.
 - **6-Stage Log Reduction Pipeline (`src/log_pipeline/`)**: Elasticsearch logs are no longer dumped raw into the LLM context. Instead, they pass through a production-grade pipeline: Stage 1 (source-filtered fetch with `search_after` and an `_id` tiebreaker for broad ES version compatibility, a hard `LOG_MAX_DOCUMENTS` cap, TLS verification on by default (`ES_VERIFY_CERTS`), and local Kibana CSV mock support via `ES_MOCK_FILE` for offline testing), Stage 2 (branch on ERROR -- stuck packets skip clustering, with both a leading *and* trailing context window so a cascading failure can't pull in the entire trace), Stage 3 (Drain3 clustering with file-persisted state for stable template IDs, held as a process-wide `TemplateMiner` singleton so the state file is only read/deserialized once per process rather than per packet, serialized by a thread lock + cross-process `FileLock` so concurrent packets can't corrupt the shared parse tree, and scoped to emit only the clusters this call's own logs actually matched -- never another packet's templates), and Stage 4 (evidence assembly guardrails enforcing decision-vocabulary regex matches, rare-template retention, and flow-boundary context). An offline Stage 0 catalog (`build_catalog.py`) classifies templates as boilerplate/informative/decision-marker and flags an implausibly high boilerplate share, and a Stage 6 eval harness (`eval_harness.py`) validates pipeline accuracy before production use.
-- **Pluggable Log Sources (`src/log_pipeline/sources/`)**: Stage 1 sits behind a `LogSource` Protocol (mirroring `CasebookStorage`), so Stages 2-4 are source-agnostic -- any source emitting the canonical `LogRecord` (`timestamp`/`level`/`message`/`app_name`, defined in `src/log_pipeline/types.py`) works with Drain3 clustering, the guardrails, the S3 offload, and the casebook wiring unchanged. `ElasticLogSource` wraps the existing fetcher without modifying it, so the `ES_MOCK_FILE` CSV workflow is unchanged. A `KubernetesLogSource` that reads pod logs directly via the Kubernetes API is under construction (`sources/k8s/`) to cover cases where Elasticsearch has dropped lines; it returns evidence gaps (log rotation, replaced pods, truncation) as first-class data so the agents are told when a trace is incomplete rather than silently reasoning over a partial picture. **Elasticsearch remains the primary source and the system of record; the Kubernetes source is supplementary.** `LOG_SOURCE` is an ordered fallback chain (`elastic` by default, so behaviour is unchanged until an operator opts in; `kubernetes,elastic` tries pods first and falls back). Fallback triggers when a source fails *or* returns no records; sources are never merged, one wins per fetch, and a `SOURCE_FALLBACK` note records what was tried. The Kubernetes source redacts PII before anything is persisted, retries per HTTP status (never a 403), bounds the whole fan-out with a wall-clock deadline, and snapshots its first successful capture to `raw_logs_k8s.jsonl` so retries, DLQ replays, and checkpoint resumes reuse evidence that the kubelet has since discarded. Evidence gaps are rendered as a banner ahead of the trace so the agents see that a trace is incomplete before they read it. See `KUBERNETES_LOGS_PLAN.md`.
-- **Decoupled Consumer & Bounded Concurrency**: `main_consumer.py` isolates the Kafka polling loop and submits tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`). Offsets are committed per-message (not per-batch) immediately upon enqueuing, and the semaphore is only released once, tracked via an explicit `submitted` flag so a `commit()` failure after a successful `submit()` can't double-release it.
+- **Pluggable Log Sources (`src/log_pipeline/sources/`)**: Stage 1 sits behind a `LogSource` Protocol (mirroring `CasebookStorage`), so Stages 2-4 are source-agnostic -- any source emitting the canonical `LogRecord` (`timestamp`/`level`/`message`/`app_name`, defined in `src/log_pipeline/types.py`) works with Drain3 clustering, the guardrails, the S3 offload, and the casebook wiring unchanged. `ElasticLogSource` wraps the existing fetcher without modifying it, so the `ES_MOCK_FILE` CSV workflow is unchanged. See section 3.10 for the Kubernetes log source and the fallback chain architecture.
+- **Decoupled Consumer, Bounded Concurrency, & At-Least-Once Delivery**: `main_consumer.py` isolates the Kafka polling loop and submits tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`). To guarantee At-Least-Once delivery and prevent consumer rebalances during slow AI processing, the consumer is configured with `KAFKA_MAX_POLL_RECORDS` and a high `KAFKA_MAX_POLL_INTERVAL_MS`. Offsets are never committed immediately upon enqueuing; instead, background threads pass successfully completed offsets back to the main thread via a thread-safe `queue.Queue`, which the main polling loop safely commits. If a crash or 429 error occurs, the offset is not queued, and Kafka safely redelivers the packet.
 - **DLQ, Poison-pill, & Checkpointing**: LangGraph uses `SqliteSaver` (with WAL mode enabled) for scalable crash recovery. Structurally invalid Kafka messages (poison-pills) and unrecoverable pipeline crashes are immediately published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
 - **Pipeline Timeouts**: `PACKET_TIMEOUT_SECONDS` bounds the **consumer-side HTTP client** in `kafkaConsumer.py`. The API side is independently bounded too: `routes.py` runs `agent.invoke()` on a dedicated executor thread with its own budget (`AGENT_INVOKE_TIMEOUT_SECONDS`, defaulting to `PACKET_TIMEOUT_SECONDS - 30s`) so the server is authoritative about its own failure and returns `FAILED_TIMEOUT` before the consumer's deadline fires. Both the LLM clients (`LLM_TIMEOUT_SECONDS`, `max_retries=0`) and `agent.invoke` are bounded. If a terminal `FAILED_TIMEOUT`/`DLQ` status is already recorded by the time a slow invocation finally returns, that late result is discarded rather than overwriting it.
 - **Human-in-the-Loop Replays**: Agents cannot fire destructive API requests directly. Unless `ENABLE_AUTO_REPLAY=true`, replay actions invoked by the LLM are queued to `src/db/pending_replays.jsonl` under a `filelock` and require an operator to approve via `approve_replays.py`. Both the auto-replay call and `approve_replays.py` send the replay payload as an authenticated (`OIS_API_KEY`) JSON body rather than query params, so PII like `notificationEmail`/`notificationMobile` doesn't land in server access logs. `approve_replays.py` re-reads the queue file fresh before its final rewrite so replays queued mid-review by a live investigation aren't erased.
@@ -223,7 +269,7 @@ directory behind.
 To ensure zero hallucinations, `routes.py` deterministically extracts static metadata directly from the Kafka payload. All keys are `snake_case`. The output is a hierarchical JSON block formatted for downstream systems:
 - **packet_metadata** (`srn`, `eid`, `ref_id`, `source`, `packet_type`, `created_at`, ...)
 - **packet_status** (`status`, `service`, `sub_service`, `rejection_data`)
-- **resolution** (Generated by the `SynthesisAgent`: `synthesis`, `action`, `resident_action`)
+- **resolution** (`source`, `synthesis`, `action`, `resident_action` -- `source` is `"agent"` for LLM-generated or `"runbook:<id>@v<version>"` for runbook-served results)
 - **schema_version** (injected by the storage layer, currently `"1.1"`)
 
 `packet_metadata.is_mbu`, `update_type`, and `is_child` are currently emitted as `null`
@@ -234,6 +280,49 @@ For repeated rejections, the system implements a Runbook pattern to short-circui
 - **Drafting (Offline)**: `build_runbooks.py` mines `local_casesheets/` for completed resolutions sharing the same `errorReasonCode` and `enrolmentType`. It uses a strictly prompted LLM (the `simple` tier) to synthesize a generic resolution template that contains zero packet-specific values (enforced by a regex validator checking for UUIDs, dates, SRNs, etc.). The result is saved to `src/runbooks/draft/`.
 - **Promotion (Offline)**: `promote_runbooks.py` acts as a human review gate. Operators inspect the generic template and approve it. The tool checks for rule fingerprint staleness, bumps the version, and git-commits the final template to `src/runbooks/final/`.
 - **Serving (Online)**: A `runbook_lookup` node runs immediately after `fetch_logs`. If `RUNBOOK_MODE=serve` and a final runbook matches the current packet's reason code (with the `rule_fingerprint` matching the live DB rule), the graph short-circuits the agents and directly emits the runbook's generic resolution. To preserve auditability, `resolution.source` in the casebook is marked with `runbook:<id>@v<version>`. If `RUNBOOK_MODE=shadow`, the agents still run and any divergence is logged.
+
+### 3.10 Kubernetes Log Source (`src/log_pipeline/sources/k8s/`)
+Elasticsearch is the primary log source and system of record, but it can drop lines under heavy load or indexing delays. The Kubernetes log source reads pod logs directly from the kubelet API to cover those gaps. **It is supplementary, not a replacement.** The full design is documented in `KUBERNETES_LOGS_PLAN.md`.
+
+#### Fallback Chain (`LOG_SOURCE`)
+The `LOG_SOURCE` environment variable is an ordered, comma-separated chain that controls which sources are tried:
+- `kubernetes,elastic` (default) -- try pods first, fall back to Elasticsearch. With no cluster configured (`KUBECONFIG_PATH`/`K8S_DEFAULT_NAMESPACE` unset), the Kubernetes leg fails fast and every fetch falls straight through to Elasticsearch.
+- `elastic,kubernetes` -- the reverse.
+- `elastic` -- Elasticsearch only (behaviour prior to the Kubernetes source).
+- `kubernetes` -- Kubernetes only, no fallback.
+
+Fallback triggers when a source fails OR returns no records. Sources are never merged -- one wins per fetch. A `SOURCE_FALLBACK` evidence gap records what was tried. The chain is implemented in `src/log_pipeline/sources/chain.py`.
+
+#### Architecture
+The `KubernetesLogSource` (`sources/k8s/source.py`) ties together five internal modules:
+
+1. **Discovery** (`discovery.py`): Verifies the namespace with a targeted `read_namespace` pre-flight (the ServiceAccount cannot list namespaces or pods cluster-wide), then lists pods within it -- by default a client-side name-substring match (`PodMatchSpec`, `K8S_SERVICE_MAP`), or a server-side label selector where an app opts in -- filters out sidecars (`istio-proxy`, `linkerd-proxy`, `vault-agent`), skips `Pending` pods, and caps the target list at `K8S_MAX_PODS` (default 20). Reports `TRUNCATED_PODS` evidence gaps when the cap is reached.
+2. **Retrieval** (`retrieval.py`): Reads logs for each discovered `(pod, container)` pair using a concurrent `ThreadPoolExecutor` fan-out. Streams logs line-by-line (`_preload_content=False`) to avoid buffering hundreds of megabytes. Requests kubelet timestamps (`timestamps=True`) for reliable cross-pod ordering. Also reads `previous=True` logs for restarted containers so pre-crash evidence is not lost. The entire fan-out is bounded by a wall-clock deadline (`K8S_DEADLINE_SECONDS`).
+3. **Parser** (`parser.py`): Splits each line into a kubelet RFC3339Nano timestamp and a body, then extracts a structured `LogRecord` with `level`, `message`, and `app_name`. Tracks parse statistics (`ParseStats`) so degradation can be detected.
+4. **Filtering** (`filtering.py`): Applies client-side identifier matching (the kubelet API has no server-side grep). Matches by `eventId`, `refId`, and any extra identifiers. Uses a `KeepAllSelector` fallback when no identifier is available.
+5. **Gap Detection** (`gaps.py`): The mechanism that makes the source trustworthy. Detects four types of evidence gaps:
+   - **Log Rotation**: Oldest observed line is newer than the requested window start, meaning earlier logs were rotated off the node.
+   - **Pod Replacement**: A pod's `startTime` is after the requested window start, meaning the previous instance's logs are gone.
+   - **Parse Degradation**: More than 10% of lines failed level extraction, suggesting an unexpected log format.
+   - **Truncation**: The pod list exceeded `K8S_MAX_PODS`.
+
+   Gaps are rendered as a banner (`--- EVIDENCE GAPS (the trace below is INCOMPLETE) ---`) prepended to the text handed to the LLM, so the Investigator and Reviewer know to qualify their findings.
+
+#### PII Redaction (`src/log_pipeline/redaction.py`)
+Raw pod logs are unfiltered (unlike ES, which source-filters to four fields). In a biometric enrolment context they may carry Aadhaar numbers, VIDs, mobile numbers, or email addresses. Redaction runs after identifier filtering but before any persistence:
+
+```
+fetch -> filter by identifier -> extract context -> REDACT -> persist
+```
+
+Patterns matched (longest-first to prevent partial matches): 16-digit VIDs, 12-digit Aadhaar numbers, spaced Aadhaar (`NNNN NNNN NNNN`), 10-digit mobile numbers, email addresses. Operational identifiers (`eventId`, `refId`) are allowlisted so they remain matchable. Placeholders are retained rather than deleted, so the LLM can see that a value existed.
+
+#### Evidence Snapshot (`src/log_pipeline/snapshot.py`)
+Kubelet retention is short (roughly 10MB x 5 files per container), but investigations routinely happen much later -- consumer lag, DLQ replays, checkpoint resumes, and the Investigator retry loop all re-enter the fetch path. The first successful Kubernetes fetch is persisted as structured JSONL (`raw_logs_k8s.jsonl`) alongside a metadata file (`log_snapshot_meta.json`). Every later fetch reuses the snapshot. This makes retries deterministic and free, and preserves evidence that the kubelet has since discarded.
+
+#### HTTP Client & Retries
+- `client.py`: Thin wrapper over `urllib3` / `kubernetes.client` for the Kubernetes API.
+- `retry.py`: Status-aware backoff: retries on 429/5xx, never retries a 403 (RBAC misconfiguration should fail fast, not loop).
 
 ---
 
@@ -288,17 +377,30 @@ Because the application is built on FastAPI with populated metadata, interactive
    ```bash
    python3 test_payload.py                 # static Pydantic validation smoke test
    python3 local_run.py path/to/packet.json # POST a real packet to a running API
-   python3 -m pytest tests/ -q             # resilience regression suite
+   PYTHONPATH=. python3 -m pytest tests/ -q # full regression suite
    ```
 
 ### 4.3 Operator CLIs
 ```bash
-python3 -m src.tools.promote_rules       # review + git-commit staged learning rules
-python3 -m src.tools.approve_replays     # approve queued packet replays
-python3 -m src.tools.check_drift         # detect rules.csv schema drift
-python3 -m src.tools.prune_checkpoints --dry-run
-python3 -m src.tools.build_catalog --refids-file refids.txt
-python3 -m src.tools.eval_harness --test-cases test_cases.json
+# Self-learning & rules
+python3 -m src.tools.promote_rules          # review + git-commit staged learning rules
+python3 -m src.tools.approve_replays        # approve queued packet replays
+python3 -m src.tools.check_drift            # detect rules.csv schema drift
+
+# Runbooks
+python3 -m src.tools.build_runbooks --dry-run          # draft generic runbooks from casebooks
+python3 -m src.tools.promote_runbooks                  # review + approve runbook drafts
+python3 -m src.tools.promote_runbooks --list            # list drafts and check staleness
+
+# Maintenance & diagnostics
+python3 -m src.tools.prune_checkpoints --dry-run        # SQLite checkpoint pruning
+python3 -m src.tools.prune_casesheets --dry-run         # old casesheet cleanup
+python3 -m src.tools.es_diagnostic                     # Elasticsearch connectivity diagnostics
+python3 -m src.tools.fetch_pod_logs                    # direct Kubernetes pod log retrieval
+
+# Log pipeline
+python3 -m src.tools.build_catalog --refids-file refids.txt   # Stage 0 catalog builder
+python3 -m src.tools.eval_harness --test-cases test_cases.json # Stage 6 evaluation harness
 ```
 
 ---

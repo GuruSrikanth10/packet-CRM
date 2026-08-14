@@ -3,6 +3,7 @@ import json
 import logging
 import requests
 import threading
+import queue
 from concurrent.futures import ThreadPoolExecutor
 from kafka import KafkaConsumer
 from kafka.structs import OffsetAndMetadata
@@ -27,6 +28,9 @@ _worker_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_INVESTIGATIONS)
 # Create a bounded queue by acquiring semaphore BEFORE reading from Kafka
 _queue_semaphore = threading.Semaphore(MAX_CONCURRENT_INVESTIGATIONS)
 
+# Thread-safe queue to pass completed offsets back to the main polling thread for committing
+_offsets_to_commit = queue.Queue()
+
 def forward_signal_to_internal_endpoint(signal: dict):
     api_key = os.environ.get("PACKET_CRM_API_KEY", "dev-secret-key")
     headers = {"X-API-Key": api_key}
@@ -44,12 +48,14 @@ def forward_signal_to_internal_endpoint(signal: dict):
         raise
     return response
 
-def _process_and_commit(signal: dict):
+def _process_and_commit(signal: dict, message_offsets: dict = None):
     event_id = signal.get("eventId")
+    success = False
     try:
         logger.info("Forwarding event %s to internal endpoint", event_id)
         response = forward_signal_to_internal_endpoint(signal)
         logger.info("Forwarded event %s status=%s", event_id, response.status_code)
+        success = True
     except requests.exceptions.Timeout:
         logger.error(f"Timeout forwarding Kafka message Event ID: {event_id}")
         storage = get_casebook_storage()
@@ -60,9 +66,13 @@ def _process_and_commit(signal: dict):
         })
         from src.utils.dlq_publisher import publish_to_dlq
         publish_to_dlq(signal, "Pipeline timed out (PACKET_TIMEOUT_SECONDS exceeded)")
+        success = True  # Successfully handled via DLQ, so we should commit
     except Exception:
-        logger.exception(f"Error forwarding Kafka message Event ID: {event_id}")
+        logger.exception(f"Error forwarding Kafka message Event ID: {event_id}. Will not commit offset.")
     finally:
+        if success and message_offsets:
+            _offsets_to_commit.put(message_offsets)
+            print(f"[KAFKA] Event ID {event_id} completed. Offset queued for commit.")
         _queue_semaphore.release()
 
 def _handle_one_message(tp, msg):
@@ -117,13 +127,11 @@ def _handle_one_message(tp, msg):
         print(f"\n[KAFKA] Received REJECTED packet with Event ID: {event_id}")
         print(f"[KAFKA] Enqueueing for agentic analysis...")
 
-        _worker_pool.submit(_process_and_commit, signal)
+        _worker_pool.submit(_process_and_commit, signal, message_offsets)
         submitted = True
-
-        # Since we are decoupling, we commit the offset right after enqueueing.
-        # If the process crashes before completion, the DLQ / Checkpointer handles it.
-        consumer.commit(message_offsets)
-        print(f"[KAFKA] Enqueued and committed Event ID: {event_id}")
+        
+        # We no longer commit immediately here. The main thread will commit 
+        # from _offsets_to_commit once _process_and_commit finishes successfully.
     except Exception:
         payload_sample = payload[:500] if 'payload' in locals() else 'Decode failed'
         logger.exception(f"Error processing Kafka message. Raw payload: {payload_sample}")
@@ -141,6 +149,8 @@ def consume_forever():
             bootstrap_servers=kafkaConsumerBrokers,
             auto_offset_reset="earliest",
             enable_auto_commit=False,
+            max_poll_records=int(os.environ.get("KAFKA_MAX_POLL_RECORDS", MAX_CONCURRENT_INVESTIGATIONS)),
+            max_poll_interval_ms=int(os.environ.get("KAFKA_MAX_POLL_INTERVAL_MS", "900000")),
         )
     logger.info("Listening on topic=%s", kafkaConsumerTopicName)
     print("\n" + "="*50)
@@ -154,6 +164,16 @@ def consume_forever():
 
     import time
     while True:
+        # Drain and commit any offsets that were successfully processed
+        while not _offsets_to_commit.empty():
+            try:
+                offsets = _offsets_to_commit.get_nowait()
+                consumer.commit(offsets)
+            except queue.Empty:
+                break
+            except Exception as e:
+                logger.error(f"Error committing offset: {e}")
+
         # We use poll() to have a chance to update the heartbeat periodically even when idle
         records = consumer.poll(timeout_ms=5000)
 
