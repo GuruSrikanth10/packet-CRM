@@ -3,8 +3,6 @@ import json
 import contextvars
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.sqlite import SqliteSaver
-import sqlite3
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 
@@ -26,7 +24,7 @@ from src.models.synthesis import (
 )
 from src.utils.resilience import retry_transient, llm_breaker
 from src.utils.logging_config import get_logger
-from src.utils.paths import CHECKPOINT_DB_PATH
+from src.core.checkpointer import get_checkpointer
 from src.utils.runbook_store import (
     generate_rule_fingerprint,
     get_runbook,
@@ -529,11 +527,8 @@ def get_agent():
     workflow.add_edge("synthesize", END)
     workflow.add_edge("escalate", END)
     
-    os.makedirs(CHECKPOINT_DB_PATH.parent, exist_ok=True)
-    conn = sqlite3.connect(str(CHECKPOINT_DB_PATH), check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    checkpointer = SqliteSaver(conn)
-    _agent = workflow.compile(checkpointer=checkpointer)
+    # Backend is selectable so two API replicas can share checkpoints (4.7).
+    _agent = workflow.compile(checkpointer=get_checkpointer())
     
     logger.info("Deterministic Graph successfully constructed!")
     return _agent

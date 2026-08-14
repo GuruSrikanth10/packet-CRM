@@ -51,7 +51,46 @@ def validate_config():
         if not api_key or api_key == "dev-secret-key":
             errors.append("PACKET_CRM_API_KEY must be explicitly set to a secure value in production (cannot be empty or 'dev-secret-key').")
 
-    # 4. Storage and SQLite checkpointer paths are writable
+    # 4. Scale-out backends are fully configured when selected (4.7). A
+    # half-configured backend must fail at boot, not on the first packet.
+    backend = os.environ.get("CASEBOOK_STORAGE_BACKEND", "local").strip().lower()
+    if backend == "s3":
+        if not (os.environ.get("CASEBOOK_S3_BUCKET") or os.environ.get("S3_LOGS_BUCKET")):
+            errors.append(
+                "CASEBOOK_STORAGE_BACKEND=s3 requires CASEBOOK_S3_BUCKET "
+                "(or S3_LOGS_BUCKET) to be set."
+            )
+    elif backend != "local":
+        errors.append(
+            f"Unknown CASEBOOK_STORAGE_BACKEND '{backend}'; expected 'local' or 's3'."
+        )
+
+    checkpoint_backend = os.environ.get("CHECKPOINT_BACKEND", "sqlite").strip().lower()
+    if checkpoint_backend == "postgres":
+        if not os.environ.get("CHECKPOINT_POSTGRES_URI"):
+            errors.append(
+                "CHECKPOINT_BACKEND=postgres requires CHECKPOINT_POSTGRES_URI to be set."
+            )
+    elif checkpoint_backend != "sqlite":
+        errors.append(
+            f"Unknown CHECKPOINT_BACKEND '{checkpoint_backend}'; expected 'sqlite' or 'postgres'."
+        )
+
+    # Local filelock does not coordinate across pods, so a multi-replica
+    # deployment on local storage silently loses the idempotency guard.
+    if backend == "local" and checkpoint_backend == "sqlite":
+        replicas = os.environ.get("API_REPLICA_COUNT", "1")
+        try:
+            if int(replicas) > 1:
+                errors.append(
+                    "API_REPLICA_COUNT > 1 requires CASEBOOK_STORAGE_BACKEND=s3 and "
+                    "CHECKPOINT_BACKEND=postgres: local filelock and a local SQLite "
+                    "file do not coordinate across pods."
+                )
+        except ValueError:
+            pass
+
+    # 5. Storage and SQLite checkpointer paths are writable
     try:
         from src.storage.factory import get_casebook_storage
         storage = get_casebook_storage()

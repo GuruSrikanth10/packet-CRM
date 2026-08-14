@@ -29,3 +29,5 @@ pytest
 kubernetes
 # Optional: /metrics degrades to 501 and all counters no-op without it.
 prometheus-client
+# Optional: only needed for CHECKPOINT_BACKEND=postgres (multi-replica).
+# langgraph-checkpoint-postgres

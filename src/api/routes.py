@@ -227,19 +227,31 @@ def health_check():
 def readiness_check():
     import sqlite3
     from src.utils.paths import CHECKPOINT_DB_PATH
+    from src.core.checkpointer import backend_name as checkpoint_backend_name
+    from src.core.checkpointer import get_checkpointer
 
-    # Check SQLite connectivity. A missing DB file should fail the probe,
-    # not be silently created by sqlite3.connect().
+    # Check checkpoint storage. Probing SQLite unconditionally would report a
+    # Postgres-backed deployment as unready forever, since it has no local
+    # checkpoint file at all (4.7).
     db_ready = False
+    backend = checkpoint_backend_name()
     try:
-        if not CHECKPOINT_DB_PATH.exists():
-            raise FileNotFoundError(f"Checkpoint DB not found at {CHECKPOINT_DB_PATH}")
-        conn = sqlite3.connect(str(CHECKPOINT_DB_PATH))
-        conn.execute("SELECT 1")
-        conn.close()
-        db_ready = True
+        if backend == "postgres":
+            # Building the saver connects and runs setup(); if that succeeds
+            # the store is reachable.
+            get_checkpointer()
+            db_ready = True
+        else:
+            # A missing DB file should fail the probe, not be silently created
+            # by sqlite3.connect().
+            if not CHECKPOINT_DB_PATH.exists():
+                raise FileNotFoundError(f"Checkpoint DB not found at {CHECKPOINT_DB_PATH}")
+            conn = sqlite3.connect(str(CHECKPOINT_DB_PATH))
+            conn.execute("SELECT 1")
+            conn.close()
+            db_ready = True
     except Exception as e:
-        logger.error(f"Readiness check failed on DB: {e}")
+        logger.error(f"Readiness check failed on checkpoint store ({backend}): {e}")
 
     kafka_ready = _check_kafka_producer_ready()
 

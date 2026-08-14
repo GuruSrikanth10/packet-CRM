@@ -1,5 +1,13 @@
 # Packet-CRM: Audit Findings & Enhancement Plan
 
+> **Implementation status (2026-08-15).** Phases A-F are implemented on branch
+> `enhancement-plan-phases`, one commit per phase. Suite: **464 passing, 1
+> failing**. Three items are deliberately not done — see
+> [Section 7](#7-what-was-not-done) for exactly what and why. F1 was skipped at
+> the requester's instruction, so
+> `test_phase2_fixes.py::test_reviewer_built_once_with_simple_llm` is expected
+> to stay red until it is applied.
+
 Full-repository audit performed 2026-08-14 against commit `4524091`.
 Companion to `REMEDIATION_PLAN.md` (Phases 0-2, now historical). This document
 records what the *current* code does wrong, what it does inefficiently, and
@@ -667,6 +675,74 @@ runbook-served resolutions match agent accuracy on the codes they serve.
 
 **Exit criteria:** two replicas process a shared topic with no duplicate
 casebooks and no checkpoint contention.
+
+---
+
+## 7. What was NOT done
+
+Three items in this plan could not be completed from inside the repository.
+They are recorded here rather than quietly dropped.
+
+### 7.1 F1 — Reviewer LLM tier (skipped by instruction)
+
+`simple_llm = get_llm("complex")` at `agent_orchestrator.py:66` is unchanged,
+at the requester's explicit instruction. Consequence:
+`test_phase2_fixes.py::test_reviewer_built_once_with_simple_llm` fails, and
+every review call still bills at complex-tier rates. **This is the single
+cheapest fix in the document — one word — and the largest remaining
+per-packet cost.** The test was deliberately left failing rather than deleted
+or skipped, so the signal survives.
+
+### 7.2 `rules.csv` re-export (blocked: needs the source database)
+
+Still the single garbled column recorded as Known Gap #1. `check_drift.py`
+detects and reports it distinctly from a genuine schema change, but no code
+change can repair corrupted source data — it needs a clean re-export from the
+rules DB with proper quoting for the JSON in `rule_data`. Until then, rule
+injection quality caps agent quality regardless of prompt or model work.
+
+### 7.3 Template catalog build (blocked: needs live Elasticsearch)
+
+`build_catalog.py` requires real event IDs against a live ES cluster, which is
+not reachable from here. Until it runs, Stage 1's boilerplate `must_not`
+filter and Stage 4's classification are both no-ops — every template
+classifies as `unknown`, which is the safe default (nothing is dropped) but
+means the compression the pipeline was built for is not yet happening.
+
+### 7.4 Partially done: horizontal-scale validation
+
+The Phase F *code* is complete and unit-tested: `S3CasebookStorage` implements
+the full protocol, the checkpointer is selectable, and boot validation refuses
+a multi-replica deployment sitting on single-node storage. What has **not**
+been done is the live validation in the plan's exit criteria — two API
+replicas and two consumers against one topic — which needs a real S3 bucket,
+Postgres instance, and Kafka broker. Treat the scale-out path as
+implemented-but-unproven until that run happens.
+
+### 7.5 Partially done: `is_mbu` / `is_child` / `update_type`
+
+Still emitted as `null`. The mapping is not derivable from the payload alone,
+so this needs the upstream team, exactly as section 4.6 anticipated. The typed
+payload models around it are done.
+
+### 7.6 Deliberate deviation: the Elasticsearch time bound (F16)
+
+The plan said to derive the ES range filter from "the `TimeWindow` the source
+already receives and currently discards." That was not done as written. That
+window defaults to `K8S_DEFAULT_SINCE_HOURS=2`, sized for kubelet retention,
+and Elasticsearch is the system of record — investigations routinely run hours
+or days after the event via consumer lag, DLQ replays, staleness resumption
+and checkpoint resumes. Applying a 2-hour bound there would have silently
+dropped exactly the evidence those paths exist to recover. Implemented instead
+as a separate, opt-in `ES_SEARCH_WINDOW_DAYS`; unset means unbounded, i.e.
+today's behaviour.
+
+### 7.7 Pulled forward: F18
+
+Moved from Phase D into Phase B. F10 puts redaction on the Elasticsearch path,
+where `LOG_MAX_DOCUMENTS` is 50,000 — shipping F10 without F18 would have
+added 50k environment reads and regex recompilations per packet to the hot
+path, a problem this document had already identified.
 
 ---
 
