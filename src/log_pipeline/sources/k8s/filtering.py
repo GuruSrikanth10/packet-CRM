@@ -17,15 +17,56 @@ from collections import deque
 from typing import Callable, Optional
 
 
+#: Payload fields that may carry a correlation id worth grepping for.
+DEFAULT_SEARCH_FIELDS = ("eventId", "refId")
+
+
+def search_fields() -> tuple:
+    """Which payload fields supply identifier values (`K8S_SEARCH_FIELDS`).
+
+    This env var was documented in .env.example from the start but read
+    nowhere in the codebase, and `extra_identifiers` was never populated, so
+    only `eventId` was ever matched. If the services log `refId` instead, the
+    Kubernetes source returned zero lines and the chain silently fell through
+    to Elasticsearch with no signal that identifier matching was the reason
+    (F11).
+    """
+    raw = os.environ.get("K8S_SEARCH_FIELDS", "").strip()
+    if not raw:
+        return DEFAULT_SEARCH_FIELDS
+    fields = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return fields or DEFAULT_SEARCH_FIELDS
+
+
+def identifiers_from_payload(payload: dict) -> tuple:
+    """Pull every configured search field's value out of a Kafka payload.
+
+    Looks in `packetMetaData` first (where refId/srn live) and then at the
+    top level (where eventId lives), so one field list covers both.
+    """
+    if not payload:
+        return ()
+
+    packet_meta = payload.get("packetMetaData") or {}
+    values = []
+    for field in search_fields():
+        value = packet_meta.get(field)
+        if value in (None, ""):
+            value = payload.get(field)
+        if value in (None, ""):
+            continue
+        value = str(value)
+        if value not in values:
+            values.append(value)
+    return tuple(values)
+
+
 def resolve_search_values(identifier: str,
                           extra: Optional[list] = None) -> list:
     """Identifier values to match lines against.
 
-    `K8S_SEARCH_FIELDS` names which payload fields supply values (default
-    `eventId,refId`). Phase 9 plumbs the payload through so `refId` can be
-    added; until then the primary identifier plus any explicit extras are
-    used. Searching more than one value is cheap insurance against Open
-    Question 1 -- we do not yet know which id the services actually log.
+    Searching more than one value is cheap insurance against Open Question 1
+    -- we do not yet know which id the services actually log.
     """
     values = [identifier] if identifier else []
     for value in (extra or []):

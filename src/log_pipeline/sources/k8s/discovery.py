@@ -31,6 +31,7 @@ from typing import Optional
 
 from src.log_pipeline.sources.k8s import client as k8s_client_module
 from src.log_pipeline.sources.k8s import fixtures
+from src.log_pipeline.sources.k8s import retry
 from src.log_pipeline.types import EvidenceGap, GapType
 from src.utils.logging_config import get_logger
 
@@ -218,7 +219,10 @@ def _verify_namespace(namespace: str, request_timeout: float) -> tuple:
         return False, k8s_client_module.unavailable_reason()
 
     try:
-        api.read_namespace(name=namespace, _request_timeout=request_timeout)
+        # Retries 429/5xx with jitter, never retries a 403 (F8).
+        retry.call_with_retry(
+            api.read_namespace, name=namespace, _request_timeout=request_timeout
+        )
         return True, None
     except Exception as e:
         status = getattr(e, "status", None)
@@ -256,7 +260,7 @@ def _list_pods(namespace: str, match_spec: PodMatchSpec, request_timeout: float)
     if match_spec.mode == MATCH_MODE_LABEL:
         list_kwargs["label_selector"] = match_spec.value
 
-    response = api.list_namespaced_pod(**list_kwargs)
+    response = retry.call_with_retry(api.list_namespaced_pod, **list_kwargs)
     pods = list(response.items or [])
 
     if match_spec.mode == MATCH_MODE_NAME_CONTAINS:

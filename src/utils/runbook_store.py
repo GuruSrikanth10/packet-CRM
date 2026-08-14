@@ -2,6 +2,7 @@ import os
 import json
 import re
 import hashlib
+import threading
 from typing import Optional
 from cachetools import TTLCache
 from pathlib import Path
@@ -23,6 +24,9 @@ REASON_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 # Module-level TTL cache for runbook loads
 CACHE_TTL = int(os.environ.get("RUNBOOK_CACHE_TTL_SECONDS", "600"))
 _runbook_cache = TTLCache(maxsize=1024, ttl=CACHE_TTL)
+# TTLCache is not thread-safe and this is read from every concurrent agent
+# thread; expiry mutates internal state during lookup (F15).
+_runbook_cache_lock = threading.Lock()
 
 def normalize_enrolment_type(enrolment_type) -> str:
     """Normalise an enrolment type for use in a filename or cache key.
@@ -98,8 +102,10 @@ def get_runbook(reason_code: str, enrolment_type: str) -> Optional[dict]:
 
     for r_code, e_type in candidates:
         cache_key = runbook_cache_key(r_code, e_type)
-        if cache_key in _runbook_cache:
-            return _runbook_cache[cache_key]
+        with _runbook_cache_lock:
+            cached = _runbook_cache.get(cache_key)
+        if cached is not None:
+            return cached
             
         try:
             target_path = _resolve_runbook_path(r_code, e_type, RUNBOOK_FINAL_DIR)
@@ -127,7 +133,8 @@ def get_runbook(reason_code: str, enrolment_type: str) -> Optional[dict]:
             if not required_keys.issubset(resolution.keys()):
                 raise ValueError(f"Missing resolution keys: {required_keys - set(resolution.keys())}")
                 
-            _runbook_cache[cache_key] = data
+            with _runbook_cache_lock:
+                _runbook_cache[cache_key] = data
             return data
             
         except Exception as e:
@@ -172,7 +179,8 @@ def promote_draft_to_final(draft_path: Path, data: dict):
     
     # Invalidate cache. Built through the same normalizer get_runbook() reads
     # from, so a draft carrying "e" invalidates the "E" key lookups use (F13).
-    _runbook_cache.pop(runbook_cache_key(reason_code, enrolment_type), None)
+    with _runbook_cache_lock:
+        _runbook_cache.pop(runbook_cache_key(reason_code, enrolment_type), None)
     
     # Remove draft
     os.remove(draft_path)

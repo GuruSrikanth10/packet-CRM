@@ -8,7 +8,10 @@ so Stages 2-4 cannot tell the two apart.
 import time
 from typing import Optional
 
+import pybreaker
+
 from src.log_pipeline import snapshot
+from src.utils.resilience import k8s_breaker
 from src.log_pipeline.sources.k8s import discovery, gaps, retrieval
 from src.log_pipeline.sources.k8s.filtering import build_selector, resolve_search_values
 from src.log_pipeline.types import (
@@ -29,6 +32,24 @@ class KubernetesLogSource:
 
     def fetch(self, identifier: str, window: TimeWindow,
               ctx: FetchContext) -> FetchResult:
+        """Fetch pod logs, guarded by the Kubernetes circuit breaker.
+
+        The breaker stops a cluster that is down entirely from costing every
+        packet a full discovery + fan-out timeout. It is opened by repeated
+        failures and, once open, fails fast -- which the fallback chain then
+        treats as "this source produced nothing" and falls through to
+        Elasticsearch (F8).
+        """
+        try:
+            return k8s_breaker.call(self._fetch, identifier, window, ctx)
+        except pybreaker.CircuitBreakerError:
+            logger.bind(event_id=ctx.event_id).warning(
+                "Kubernetes circuit breaker is OPEN; failing fast."
+            )
+            return FetchResult.failure(self.name, "kubernetes circuit breaker open")
+
+    def _fetch(self, identifier: str, window: TimeWindow,
+               ctx: FetchContext) -> FetchResult:
         log = logger.bind(event_id=ctx.event_id)
         started = time.monotonic()
 

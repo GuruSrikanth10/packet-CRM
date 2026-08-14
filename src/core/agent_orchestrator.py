@@ -10,7 +10,13 @@ from langgraph.prebuilt import create_react_agent
 
 from src.utils.llm_utils import get_llm
 from src.utils.env import get_bool_env
-from src.tools.tool_registry import get_tool_by_name, lookup_rule_for, lookup_rule_text
+from src.tools.tool_registry import (
+    fetch_logs_for,
+    get_tool_by_name,
+    lookup_rule_for,
+    lookup_rule_text,
+)
+from src.log_pipeline.sources.k8s.filtering import identifiers_from_payload
 from src.utils.resilience import retry_transient, llm_breaker
 from src.utils.logging_config import get_logger
 from src.utils.paths import CHECKPOINT_DB_PATH
@@ -84,7 +90,8 @@ def get_agent():
     log_filter_prompt = load_prompt("LogFilterAgent.md")
     
     def fetch_logs_node(state: GraphState):
-        event_id = state.get("payload", {}).get("eventId", "")
+        payload = state.get("payload", {})
+        event_id = payload.get("eventId", "")
         log = logger.bind(event_id=event_id)
         log.info("Log fetcher node started", state="LOG_FETCHER")
         enable_log_fetching = get_bool_env("ENABLE_LOG_FETCHING", False)
@@ -92,9 +99,18 @@ def get_agent():
             log.info("Log fetching disabled via .env; skipping.")
             return {"logs": "Log fetching disabled."}
 
-        log.info("Fetching Elasticsearch traces")
-        tool = get_tool_by_name("fetch_elastic_logs")
-        logs = tool.invoke(event_id)
+        # Pull every K8S_SEARCH_FIELDS value out of the payload (refId, srn,
+        # ...) so the Kubernetes source can match lines that never mention
+        # eventId, and so redaction allowlists them. Only eventId was ever
+        # searched before, which made the Kubernetes source silently
+        # unproductive if the services log a different id (F11).
+        extra_identifiers = tuple(
+            value for value in identifiers_from_payload(payload)
+            if value != event_id
+        )
+
+        log.info("Fetching log traces", extra_identifiers=list(extra_identifiers))
+        logs = fetch_logs_for(event_id, extra_identifiers=extra_identifiers)
         log.info("Logs retrieved")
         return {"logs": logs}
 

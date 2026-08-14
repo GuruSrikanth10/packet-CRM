@@ -1,10 +1,11 @@
 import json
 import os
+import threading
 from typing import Optional
 import pandas as pd
 from cachetools import TTLCache
 from langchain_core.tools import tool
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import pymysql
 from src.utils.env import get_bool_env, get_required_env
 from src.utils.resilience import retry_transient, db_breaker, es_breaker
@@ -27,6 +28,12 @@ _RULE_INDEX_CACHE = None
 # effect (1.1). TTLCache bounds both problems: entries expire on their own.
 _RULE_CACHE_TTL_SECONDS = int(os.environ.get("RULE_CACHE_TTL_SECONDS", "600"))
 _rule_cache: TTLCache = TTLCache(maxsize=256, ttl=_RULE_CACHE_TTL_SECONDS)
+# cachetools.TTLCache is explicitly NOT thread-safe -- its docs require
+# external locking. This is read and written from up to
+# MAX_CONCURRENT_INVESTIGATIONS agent threads, and TTL expiry mutates the
+# internal linked list during __getitem__, so concurrent access can corrupt it
+# or raise KeyError from inside the cache (F15).
+_rule_cache_lock = threading.Lock()
 
 # Results that reflect a broken lookup (DB unreachable, misconfigured mock
 # file) rather than a legitimate answer for this reason_code. These must
@@ -52,8 +59,13 @@ def get_live_db_engine():
         db_name = get_required_env("DB_NAME", "uidmasterv1_1")
         _LIVE_DB_ENGINE = create_engine(
             f"mysql+pymysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}",
-            pool_size=10, 
-            max_overflow=20
+            pool_size=10,
+            max_overflow=20,
+            # Without pre-ping, a pooled connection that MySQL closed on its
+            # wait_timeout is handed out anyway and the first query after an
+            # idle period fails (F14). Recycle below that timeout as well.
+            pool_pre_ping=True,
+            pool_recycle=3600,
         )
     return _LIVE_DB_ENGINE
 
@@ -182,15 +194,21 @@ def _lookup_rule_json(reason_code: str) -> str:
     the typed `lookup_rule_for` / `lookup_rule_text` helpers, so callers can't
     accidentally bypass the cache, the retry, or the circuit breaker.
     """
-    cached_result = _rule_cache.get(reason_code)
+    with _rule_cache_lock:
+        cached_result = _rule_cache.get(reason_code)
     if cached_result is not None:
         logger.info(f"[TOOL] Cache hit for rule lookup: {reason_code}")
         return cached_result
 
+    # The lookup itself runs OUTSIDE the lock: it can take seconds against a
+    # live DB, and holding the lock across it would serialise every concurrent
+    # packet behind one query. A duplicate concurrent lookup is cheap; a
+    # serialised pipeline is not.
     result = _lookup_rule_by_reason_code_impl(reason_code)
 
     if not _is_uncacheable_result(result):
-        _rule_cache[reason_code] = result
+        with _rule_cache_lock:
+            _rule_cache[reason_code] = result
 
     return result
 
@@ -304,9 +322,13 @@ def _lookup_rule_by_reason_code_impl(reason_code: str) -> str:
         try:
             engine = get_live_db_engine()
 
-            # Using pandas to query and format identically to the mock DB approach
-            query = "SELECT * FROM rules WHERE reject_reason_code = %s"
-            matches = pd.read_sql(query, engine, params=(reason_code,))
+            # Using pandas to query and format identically to the mock DB
+            # approach. Must be text() with a :named bind: pandas wraps a raw
+            # string in text() anyway, which uses SQLAlchemy's :name paramstyle
+            # and expects a dict -- the old "%s" + tuple form is DBAPI
+            # paramstyle and fails against a SQLAlchemy 2.x Engine (F14).
+            query = text("SELECT * FROM rules WHERE reject_reason_code = :reason_code")
+            matches = pd.read_sql(query, engine, params={"reason_code": reason_code})
 
             if not matches.empty:
                 logger.info(f"[TOOL] Found {len(matches)} matching rule(s) in Live DB for {reason_code}")
@@ -320,10 +342,9 @@ def _lookup_rule_by_reason_code_impl(reason_code: str) -> str:
             return f"Failed to query live DB: {e}"
 
 
-@tool
 @es_breaker
 @retry_transient
-def fetch_elastic_logs(event_id: str) -> Optional[str]:
+def fetch_logs_for(event_id: str, extra_identifiers: tuple = ()) -> Optional[str]:
     """Fetch and reduce logs from Elastic using the 6-stage log reduction pipeline.
 
     Stages:
@@ -341,17 +362,28 @@ def fetch_elastic_logs(event_id: str) -> Optional[str]:
     content (1.6).
     """
     log = logger.bind(event_id=event_id)
-    log.info("[TOOL] fetch_elastic_logs triggered")
+    log.info("[TOOL] log fetch triggered", extra_identifiers=list(extra_identifiers or ()))
 
     try:
         from src.log_pipeline.pipeline import reduce_logs
-        return reduce_logs(event_id)
+        return reduce_logs(event_id, extra_identifiers=extra_identifiers)
     except pybreaker.CircuitBreakerError:
         log.error("[TOOL] ES Circuit breaker is OPEN. Failing fast.")
         return None
     except Exception as e:
         log.error(f"[TOOL] Log reduction pipeline failed: {e}")
         return None
+
+
+@tool
+def fetch_elastic_logs(event_id: str) -> Optional[str]:
+    """Fetch and reduce logs for an event_id using the log reduction pipeline.
+
+    LLM-facing wrapper. Python callers should use `fetch_logs_for`, which also
+    accepts the extra correlation identifiers (refId, srn) that the Kubernetes
+    source matches on (F11) -- a tool signature can't carry those cleanly.
+    """
+    return fetch_logs_for(event_id)
 
 @tool
 def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, category: str, fromSedaStart: bool, notificationEmail: str, notificationMobile: str) -> str:
