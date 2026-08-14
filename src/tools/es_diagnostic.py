@@ -29,9 +29,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from src.utils.env import get_bool_env  # noqa: E402
+from src.log_pipeline.fetcher import _app_names  # noqa: E402
 
-# The service name hardcoded in fetcher.py's filter_clauses.
-PRODUCTION_APP_FILTER = "enu-biometric"
+# The app names fetcher.py filters on. Read through the same helper the
+# fetcher uses so this diagnostic can't drift from production when
+# ES_APP_NAMES is set (F19) -- variant A being byte-identical to the real
+# query is the entire point of this tool.
+PRODUCTION_APP_FILTERS = _app_names()
+
+# The primary app name, as a plain string, for report headings and for
+# aggregating which service actually logged an id.
+PRODUCTION_APP_FILTER = PRODUCTION_APP_FILTERS[0] if PRODUCTION_APP_FILTERS else ""
 
 
 # ======================================================================
@@ -55,7 +63,7 @@ def build_variants(event_id: str, boilerplate_phrases: list[str]) -> dict:
     variant_a = _with_must_not({
         "bool": {
             "must": [{"query_string": {"query": f'"{event_id}"'}}],
-            "filter": [{"term": {"application_name.keyword": PRODUCTION_APP_FILTER}}],
+            "filter": [{"terms": {"application_name.keyword": PRODUCTION_APP_FILTERS}}],
         }
     })
 
@@ -68,7 +76,7 @@ def build_variants(event_id: str, boilerplate_phrases: list[str]) -> dict:
     variant_c = {
         "bool": {
             "must": [{"multi_match": {"query": event_id, "fields": ["*"]}}],
-            "filter": [{"term": {"application_name.keyword": PRODUCTION_APP_FILTER}}],
+            "filter": [{"terms": {"application_name.keyword": PRODUCTION_APP_FILTERS}}],
         }
     }
 

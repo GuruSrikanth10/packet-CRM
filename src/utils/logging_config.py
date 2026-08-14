@@ -1,16 +1,28 @@
 import logging
+import os
 import structlog
 import sys
+
+
+def _resolve_level() -> int:
+    """Log level from LOG_LEVEL, defaulting to INFO.
+
+    This was hardcoded to INFO with no override, so raising verbosity to debug
+    a production issue meant editing code (F21).
+    """
+    raw = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+    return getattr(logging, raw, logging.INFO)
+
 
 def setup_logging():
     # Only configure once
     if structlog.is_configured():
         return
-        
+
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
-        level=logging.INFO,
+        level=_resolve_level(),
     )
     
     structlog.configure(

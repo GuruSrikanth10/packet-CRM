@@ -18,7 +18,9 @@ from src.log_pipeline.reducer import branch_on_error, cluster_logs, apply_eviden
 from src.log_pipeline.sources import chain as source_chain
 from src.log_pipeline.sources.k8s import gaps as k8s_gaps
 from src.log_pipeline.types import FetchContext, TimeWindow
+from src.utils import metrics
 from src.utils.logging_config import get_logger
+from src.utils.paths import casebook_dir
 
 logger = get_logger(__name__)
 
@@ -73,6 +75,11 @@ def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
     )
     raw_logs = fetch_result.records
 
+    # FetchDiagnostics was built on every fetch and then discarded (4.5).
+    metrics.record_fetch_diagnostics(
+        fetch_result.diagnostics, ok=fetch_result.ok, gaps=fetch_result.gaps
+    )
+
     gap_banner = k8s_gaps.render_banner(fetch_result.gaps)
 
     if not raw_logs:
@@ -109,6 +116,8 @@ def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
             f"redacted_{label.lower()}": count
             for label, count in redaction_counts.items()
         })
+        for label, count in redaction_counts.items():
+            metrics.REDACTIONS.labels(pattern=label).inc(count)
 
     # Persist raw logs to disk for audit
     log_file_path = _save_raw_logs(event_id, raw_logs)
@@ -253,33 +262,36 @@ def _format_normal_path(event_id: str, assembled: dict,
 # Disk persistence
 # ======================================================================
 
+def _write_artifact(event_id: str, filename: str, render) -> str:
+    """Write one log artifact beside the casebook and return its path.
+
+    The directory comes from utils.paths rather than a local
+    `parent.parent.parent` walk -- this module used to re-derive it twice, and
+    storage/local.py and snapshot.py once each, so a change to the casesheets
+    root silently split them apart (F22).
+    """
+    try:
+        log_dir = casebook_dir(event_id)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file_path = log_dir / filename
+        with open(log_file_path, "w", encoding="utf-8") as f:
+            render(f)
+        logger.bind(event_id=event_id).info(f"[PIPELINE] Saved {filename} to {log_file_path}")
+        return str(log_file_path)
+    except Exception as e:
+        logger.bind(event_id=event_id).error(f"[PIPELINE] Failed to save {filename}: {e}")
+        return "Failed to save"
+
+
 def _save_raw_logs(event_id: str, logs: list[dict]) -> str:
     """Write raw logs to disk and return the file path."""
-    try:
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        log_dir = os.path.join(base_dir, "local_casesheets", f"casebook_{event_id}")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file_path = os.path.join(log_dir, "raw_logs.txt")
-        with open(log_file_path, "w", encoding="utf-8") as f:
-            for log in logs:
-                f.write(f"[{log['timestamp']}] [{_origin(log)}] [{log['level']}] {log['message']}\n")
-        logger.bind(event_id=event_id).info(f"[PIPELINE] Saved raw logs to {log_file_path}")
-        return log_file_path
-    except Exception as e:
-        logger.bind(event_id=event_id).error(f"[PIPELINE] Failed to save raw logs: {e}")
-        return "Failed to save"
+    def render(f):
+        for log in logs:
+            f.write(f"[{log['timestamp']}] [{_origin(log)}] [{log['level']}] {log['message']}\n")
+
+    return _write_artifact(event_id, "raw_logs.txt", render)
+
 
 def _save_reduced_logs(event_id: str, reduced_text: str) -> str:
     """Write reduced logs to disk and return the file path."""
-    try:
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        log_dir = os.path.join(base_dir, "local_casesheets", f"casebook_{event_id}")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file_path = os.path.join(log_dir, "reduced_logs.txt")
-        with open(log_file_path, "w", encoding="utf-8") as f:
-            f.write(reduced_text)
-        logger.bind(event_id=event_id).info(f"[PIPELINE] Saved reduced logs to {log_file_path}")
-        return log_file_path
-    except Exception as e:
-        logger.bind(event_id=event_id).error(f"[PIPELINE] Failed to save reduced logs: {e}")
-        return "Failed to save"
+    return _write_artifact(event_id, "reduced_logs.txt", lambda f: f.write(reduced_text))

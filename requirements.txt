@@ -27,3 +27,5 @@ cachetools
 httpx
 pytest
 kubernetes
+# Optional: /metrics degrades to 501 and all counters no-op without it.
+prometheus-client

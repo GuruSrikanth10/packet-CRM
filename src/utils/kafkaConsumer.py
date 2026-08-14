@@ -1,6 +1,5 @@
 import os
 import json
-import logging
 import requests
 import signal
 import threading
@@ -12,8 +11,9 @@ from kafka.structs import OffsetAndMetadata
 from pathlib import Path
 from .env import get_required_env
 from src.storage.factory import get_casebook_storage
+from src.utils.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 kafkaConsumerBrokers = [
     b.strip() for b in get_required_env("KAFKA_CONSUMER_BROKERS", "localhost:9092").split(",") if b.strip()
@@ -143,12 +143,12 @@ def _process_and_commit(signal_payload: dict, message_offsets: dict = None):
     event_id = signal_payload.get("eventId")
     success = False
     try:
-        logger.info("Forwarding event %s to internal endpoint", event_id)
+        logger.info("Forwarding event to internal endpoint", event_id=event_id)
         response = forward_signal_to_internal_endpoint(signal_payload)
-        logger.info("Forwarded event %s status=%s", event_id, response.status_code)
+        logger.info("Forwarded event", event_id=event_id, status_code=response.status_code)
         success = True
     except requests.exceptions.Timeout:
-        logger.error(f"Timeout forwarding Kafka message Event ID: {event_id}")
+        logger.error("Timeout forwarding Kafka message", event_id=event_id)
         storage = get_casebook_storage()
         # Both casebook.json and status.json move to FAILED_TIMEOUT together.
         # Writing only casebook.json left the API's late-result guard -- which
@@ -164,11 +164,11 @@ def _process_and_commit(signal_payload: dict, message_offsets: dict = None):
         publish_to_dlq(signal_payload, "Pipeline timed out (PACKET_TIMEOUT_SECONDS exceeded)")
         success = True  # Successfully handled via DLQ, so we should commit
     except Exception:
-        logger.exception(f"Error forwarding Kafka message Event ID: {event_id}. Will not commit offset.")
+        logger.exception("Error forwarding Kafka message; will not commit offset", event_id=event_id)
     finally:
         if success:
             _record_completion(message_offsets)
-            logger.info("Event %s completed; offset eligible for commit.", event_id)
+            logger.info("Event completed; offset eligible for commit", event_id=event_id)
         _queue_semaphore.release()
 
 
@@ -200,7 +200,7 @@ def _handle_one_message(tp, msg):
             # Validate payload structure (Poison-pill check)
             MessagePayload(**signal_payload)
         except Exception as validation_err:
-            logger.error(f"Poison-pill payload detected: {validation_err}")
+            logger.error("Poison-pill payload detected", error=str(validation_err))
             from src.utils.dlq_publisher import publish_to_dlq
             publish_to_dlq(payload, f"Structural validation failed: {validation_err}")
             _record_completion(message_offsets)
@@ -209,7 +209,7 @@ def _handle_one_message(tp, msg):
         # Check packetStatus if it's REJECTED
         summary = signal_payload.get("packetExecutionSummary", {})
         if summary.get("packetStatus") != "REJECTED":
-            logger.info("Skipping non-rejected packet %s", signal_payload.get("eventId"))
+            logger.info("Skipping non-rejected packet", event_id=signal_payload.get("eventId"))
             _record_completion(message_offsets)
             return
 
@@ -217,17 +217,17 @@ def _handle_one_message(tp, msg):
         event_id = signal_payload.get("eventId")
         storage = get_casebook_storage()
         if storage.exists(event_id, terminal_only=True):
-            logger.info("Skipping Event ID %s; terminal casebook already exists.", event_id)
+            logger.info("Skipping event; terminal casebook already exists", event_id=event_id)
             _record_completion(message_offsets)
             return
 
-        logger.info("Received REJECTED packet with Event ID: %s; enqueueing for analysis.", event_id)
+        logger.info("Received REJECTED packet; enqueueing for analysis", event_id=event_id)
 
         _worker_pool.submit(_process_and_commit, signal_payload, message_offsets)
         submitted = True
     except Exception:
         payload_sample = payload[:500] if 'payload' in locals() else 'Decode failed'
-        logger.exception(f"Error processing Kafka message. Raw payload: {payload_sample}")
+        logger.exception("Error processing Kafka message", payload_sample=payload_sample)
     finally:
         if not submitted:
             _queue_semaphore.release()
@@ -240,9 +240,9 @@ def _commit_ready_offsets():
         return
     try:
         consumer.commit(commits)
-        logger.debug("Committed offsets: %s", commits)
+        logger.debug("Committed offsets", commits=str(commits))
     except Exception as e:
-        logger.error(f"Error committing offset: {e}")
+        logger.error("Error committing offset", error=str(e))
 
 
 def _write_heartbeat(heartbeat_file: Path):
@@ -256,7 +256,7 @@ def _write_heartbeat(heartbeat_file: Path):
         tmp_path.write_text(str(time.time()), encoding="utf-8")
         os.replace(tmp_path, heartbeat_file)
     except Exception as e:
-        logger.warning(f"Failed to write heartbeat: {e}")
+        logger.warning("Failed to write heartbeat", error=str(e))
 
 
 def _start_heartbeat_thread(heartbeat_file: Path) -> threading.Thread:
@@ -281,7 +281,7 @@ def _start_heartbeat_thread(heartbeat_file: Path) -> threading.Thread:
 
 def request_shutdown(signum=None, frame=None):
     """Signal handler: stop polling and let the drain run (F12)."""
-    logger.info("Shutdown requested (signal=%s); draining in-flight work.", signum)
+    logger.info("Shutdown requested; draining in-flight work", signal=signum)
     _shutdown.set()
 
 
@@ -291,7 +291,7 @@ def _install_signal_handlers():
             signal.signal(sig, request_shutdown)
         except (ValueError, OSError):
             # Not the main thread (e.g. under a test runner) -- non-fatal.
-            logger.debug("Could not install handler for signal %s", sig)
+            logger.debug("Could not install signal handler", signal=str(sig))
 
 
 def _drain_and_commit():
@@ -306,7 +306,7 @@ def _drain_and_commit():
         remaining = _offset_tracker.in_flight()
         if remaining == 0:
             break
-        logger.info("Draining: %d investigation(s) still in flight.", remaining)
+        logger.info("Draining in-flight investigations", remaining=remaining)
         time.sleep(0.5)
 
     _worker_pool.shutdown(wait=False, cancel_futures=True)
@@ -316,9 +316,9 @@ def _drain_and_commit():
         try:
             consumer.close()
         except Exception as e:
-            logger.warning(f"Error closing consumer: {e}")
+            logger.warning("Error closing consumer", error=str(e))
 
-    logger.info("Consumer shutdown complete.")
+    logger.info("Consumer shutdown complete")
 
 
 def consume_forever():
@@ -336,7 +336,7 @@ def consume_forever():
 
     _install_signal_handlers()
 
-    logger.info("Listening on topic=%s brokers=%s", kafkaConsumerTopicName, kafkaConsumerBrokers)
+    logger.info("Kafka consumer started", topic=kafkaConsumerTopicName, brokers=kafkaConsumerBrokers)
 
     heartbeat_file = Path(__file__).resolve().parent.parent.parent / "local_checkpoints" / "consumer_heartbeat.txt"
     os.makedirs(heartbeat_file.parent, exist_ok=True)

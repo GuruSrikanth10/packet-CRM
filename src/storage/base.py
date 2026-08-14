@@ -1,5 +1,14 @@
 from typing import Protocol, Optional
 
+#: Casebook schema version written by the storage layer.
+#: 1.1 -> 1.2 adds the optional `resolution_outcome` block (section 4.1), which
+#: records whether a resolution was actually correct. It is additive: a 1.1
+#: casebook is a valid 1.2 casebook with no outcome recorded yet.
+CASEBOOK_SCHEMA_VERSION = "1.2"
+
+#: Verdicts an operator can attach to a resolution.
+OUTCOME_VERDICTS = ("CORRECT", "INCORRECT", "PARTIAL")
+
 #: Statuses that end a packet's lifecycle. Defined here rather than duplicated
 #: across routes.py, kafkaConsumer.py and local.py, which each carried their
 #: own copy and had already drifted (F4).

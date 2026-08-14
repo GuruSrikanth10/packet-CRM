@@ -3,15 +3,21 @@ import json
 from pathlib import Path
 from typing import Optional
 from filelock import FileLock
-from src.storage.base import CasebookStorage, TERMINAL_STATUSES
+from src.storage.base import (
+    CASEBOOK_SCHEMA_VERSION,
+    CasebookStorage,
+    TERMINAL_STATUSES,
+)
+from src.utils.paths import LOCAL_CASESHEETS_DIR
 
 class LocalFilesystemCasebookStorage(CasebookStorage):
     def __init__(self, base_dir: str = None):
         if base_dir:
             self.base_dir = Path(base_dir)
         else:
-            self.base_dir = Path(__file__).resolve().parent.parent.parent / "local_casesheets"
-            
+            self.base_dir = LOCAL_CASESHEETS_DIR
+
+
         os.makedirs(self.base_dir, exist_ok=True)
         
     def _resolve_dir(self, event_id: str) -> Path:
@@ -47,7 +53,7 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
 
         # Enforce schema version for backwards compatibility
         if "schema_version" not in casebook:
-            casebook["schema_version"] = "1.1"
+            casebook["schema_version"] = CASEBOOK_SCHEMA_VERSION
 
         with FileLock(str(lock_path), timeout=10):
             with open(tmp_path, "w", encoding="utf-8") as f:

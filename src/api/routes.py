@@ -8,9 +8,17 @@ import functools
 import ipaddress
 import threading
 import concurrent.futures
-from fastapi import APIRouter, Depends, HTTPException, Security, Request
+from typing import Literal, Optional
+from fastapi import APIRouter, Depends, HTTPException, Security, Request, Response
 from fastapi.security import APIKeyHeader
-from src.models.schemas import MessagePayload
+from pydantic import BaseModel, Field
+from src.models.schemas import EVENT_ID_PATTERN, MessagePayload
+from src.utils import metrics
+from src.utils.outcomes import (
+    InvalidVerdictError,
+    UnknownEventError,
+    record_outcome,
+)
 from src.core.agent_orchestrator import get_agent
 from src.utils.s3_uploader import upload_logs_to_s3
 from src.storage.factory import get_casebook_storage
@@ -240,6 +248,62 @@ def readiness_check():
     else:
         raise HTTPException(status_code=503, detail="Service Unavailable")
 
+@router.get("/metrics")
+def metrics_endpoint():
+    """Prometheus exposition (4.5).
+
+    Unauthenticated by design -- a scrape target that needs a secret is one
+    operators route around. It exposes counters and latencies only, never
+    packet content or resident data.
+    """
+    payload = metrics.render_latest()
+    if payload is None:
+        raise HTTPException(
+            status_code=501,
+            detail="prometheus_client is not installed; metrics are unavailable.",
+        )
+    return Response(content=payload, media_type=metrics.CONTENT_TYPE_LATEST)
+
+
+class OutcomeRequest(BaseModel):
+    """Operator verdict on a completed investigation (4.1)."""
+
+    verdict: Literal["CORRECT", "INCORRECT", "PARTIAL"]
+    verified_by: str = Field(min_length=1, max_length=128)
+    notes: str = Field(default="", max_length=4000)
+    corrected_action: Optional[str] = Field(default=None, max_length=64)
+
+
+@router.post("/outcome/{event_id}", dependencies=[Depends(get_api_key), Depends(rate_limiter)])
+def record_resolution_outcome(event_id: str, body: OutcomeRequest):
+    """Attach ground truth to a resolution, so accuracy becomes measurable.
+
+    Nothing in the system recorded whether a resolution was actually right,
+    which blocks runbook promotion, regression detection, and any statement
+    about how well the pipeline works (4.1).
+    """
+    if not re.fullmatch(EVENT_ID_PATTERN, event_id):
+        raise HTTPException(status_code=422, detail="Invalid event_id format")
+
+    try:
+        outcome = record_outcome(
+            event_id=event_id,
+            verdict=body.verdict,
+            verified_by=body.verified_by,
+            notes=body.notes,
+            corrected_action=body.corrected_action,
+        )
+    except UnknownEventError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No casebook found for event {event_id}; nothing to judge.",
+        )
+    except InvalidVerdictError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return {"status": "recorded", "event_id": event_id, "verdict": outcome["verdict"]}
+
+
 @router.post("/process-rejection", dependencies=[Depends(get_api_key), Depends(rate_limiter)])
 async def process_rejection(signal: MessagePayload):
     """
@@ -300,6 +364,7 @@ async def process_rejection(signal: MessagePayload):
 
     log = logger.bind(event_id=event_id)
     log.info("Processing Rejection", state="IN_PROGRESS")
+    packet_started_at = time.monotonic()
     
     # Run the agent with exception handling for DLQ. Offloaded onto the
     # module-level bounded executor (not a per-request one) so agent.invoke
@@ -473,6 +538,19 @@ async def process_rejection(signal: MessagePayload):
     # crash between them can't leave status.json stuck at IN_PROGRESS.
     storage.save_terminal(event_id, casebook_data)
 
-    log.info("Successfully saved finalized Casebook", final_status=casebook_data["packet_status"]["status"], state="COMPLETED")
+    final_status = casebook_data["packet_status"]["status"]
+    resolution_source = casebook_data["resolution"]["source"] or "agent"
+    # Collapse runbook:<id>@v<n> so the label set stays bounded -- a per-runbook
+    # label would make cardinality grow with the runbook catalog.
+    source_kind = "runbook" if str(resolution_source).startswith("runbook:") else "agent"
+    metrics.PACKETS_TOTAL.labels(
+        status=str(final_status), resolution_source=source_kind
+    ).inc()
+    metrics.PACKET_DURATION.labels(resolution_source=source_kind).observe(
+        time.monotonic() - packet_started_at
+    )
+
+    log.info("Successfully saved finalized Casebook", final_status=final_status,
+             resolution_source=resolution_source, state="COMPLETED")
 
     return {"status": "processed", "event_id": event_id}

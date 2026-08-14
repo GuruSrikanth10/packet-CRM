@@ -8,6 +8,7 @@ import sqlite3
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 
+from src.utils import metrics
 from src.utils.llm_utils import get_llm
 from src.utils.env import get_bool_env
 from src.tools.tool_registry import (
@@ -322,6 +323,8 @@ def get_agent():
             ]})
 
         res = invoke_investigator()
+        metrics.record_llm_usage("investigator", res)
+        metrics.LLM_CALLS.labels(node="investigator", outcome="ok").inc()
         log.info("Investigator finished analysis")
         return {"investigation": res["messages"][-1].content, "db_rule": db_rule}
 
@@ -348,6 +351,8 @@ def get_agent():
             ]})
 
         res = invoke_reviewer()
+        metrics.record_llm_usage("reviewer", res)
+        metrics.LLM_CALLS.labels(node="reviewer", outcome="ok").inc()
         feedback = res["messages"][-1].content
         log.info("Reviewer finished assessment")
         return {"reviewer_feedback": feedback, "retry_count": state.get("retry_count", 0) + 1}
@@ -403,8 +408,13 @@ def get_agent():
             ]})
 
         res = invoke_synthesis()
+        metrics.record_llm_usage("synthesis", res)
+        metrics.LLM_CALLS.labels(node="synthesis", outcome="ok").inc()
         synthesis_content = res["messages"][-1].content
         log.info("Synthesis finished")
+        # How many Reviewer rejections this packet needed. A rising
+        # distribution is the earliest signal of prompt or model regression.
+        metrics.INVESTIGATOR_RETRIES.observe(max(0, state.get("retry_count", 1) - 1))
         
         shadow_res = state.get("shadow_runbook_resolution")
         if shadow_res:
