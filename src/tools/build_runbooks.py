@@ -9,7 +9,7 @@ from src.utils.llm_utils import get_llm
 from src.utils.runbook_validator import validate_generic_text
 from src.utils.runbook_store import write_draft_runbook, generate_rule_fingerprint
 from src.utils.logging_config import get_logger
-from src.tools.tool_registry import lookup_rule_by_reason_code
+from src.tools.tool_registry import lookup_rule_for
 
 logger = get_logger(__name__)
 
@@ -85,15 +85,17 @@ def main():
             pm = cb.get("packet_metadata", {})
             specific_values.extend([pm.get("eid", ""), pm.get("srn", ""), pm.get("ref_id", "")])
             
-        # We need the rule fingerprint
-        # The orchestrator maps U -> UPDATE, E -> ENROLMENT when fetching the rule
-        db_etype = "UPDATE" if etype == "U" else ("ENROLMENT" if etype == "E" else "UPDATE")
-        rule = lookup_rule_by_reason_code(reason_code, db_etype)
-        if not rule:
+        # The rule fingerprint pins this runbook to the DB rule it was derived
+        # from. `lookup_rule_for` normalises the enrolment type internally and
+        # returns parsed rows, so the fingerprint no longer folds DataFrame
+        # column order into the hash (F2). "ANY" normalises to None, meaning
+        # "do not filter" -- correct for a cross-type runbook.
+        rules = lookup_rule_for(reason_code, etype)
+        if not rules:
             logger.warning("No rule found in DB for group", reason_code=reason_code)
             continue
-            
-        fingerprint = generate_rule_fingerprint(rule)
+
+        fingerprint = generate_rule_fingerprint(rules)
         
         # Prompt LLM
         examples = []

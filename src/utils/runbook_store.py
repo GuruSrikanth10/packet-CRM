@@ -24,9 +24,39 @@ REASON_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 CACHE_TTL = int(os.environ.get("RUNBOOK_CACHE_TTL_SECONDS", "600"))
 _runbook_cache = TTLCache(maxsize=1024, ttl=CACHE_TTL)
 
-def generate_rule_fingerprint(rule_dict: dict) -> str:
-    """Generate a stable SHA256 fingerprint from a rule dict."""
-    canonical_json = json.dumps(rule_dict, sort_keys=True, separators=(",", ":"))
+def normalize_enrolment_type(enrolment_type) -> str:
+    """Normalise an enrolment type for use in a filename or cache key.
+
+    A missing type means the runbook applies to any type.
+    """
+    return str(enrolment_type).strip().upper() if enrolment_type else "ANY"
+
+
+def runbook_cache_key(reason_code: str, enrolment_type) -> str:
+    """The one place a runbook cache key is constructed.
+
+    `promote_draft_to_final` used to build this from the *raw* enrolment type
+    while `get_runbook` built it from the normalised one, so a draft carrying
+    "e" or " E " invalidated a key lookups never read -- and the stale runbook
+    kept being served for up to RUNBOOK_CACHE_TTL_SECONDS (F13).
+    """
+    return f"{reason_code}__{normalize_enrolment_type(enrolment_type)}"
+
+
+def generate_rule_fingerprint(rule) -> str:
+    """Generate a stable SHA256 fingerprint from parsed rule row(s).
+
+    Accepts the dict or list-of-dicts that `lookup_rule_for` returns. It must
+    NOT be handed the raw `DataFrame.to_json()` string: hashing that folds
+    column order and float formatting into the fingerprint, so a harmless
+    re-export of the rules table invalidated every runbook (F2).
+    """
+    if isinstance(rule, str):
+        raise TypeError(
+            "generate_rule_fingerprint expects parsed rule rows (dict or list), "
+            "not a raw JSON string -- use tool_registry.lookup_rule_for()."
+        )
+    canonical_json = json.dumps(rule, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 def _resolve_runbook_path(reason_code: str, enrolment_type: str, directory: Path) -> Path:
@@ -35,8 +65,8 @@ def _resolve_runbook_path(reason_code: str, enrolment_type: str, directory: Path
         raise ValueError(f"Invalid reason_code format: {reason_code}")
     
     # Enrolment type defaults to ANY if missing
-    etype = str(enrolment_type).strip().upper() if enrolment_type else "ANY"
-    
+    etype = normalize_enrolment_type(enrolment_type)
+
     filename = f"{reason_code}__{etype}.json"
     target_path = (directory / filename).resolve()
     
@@ -61,13 +91,13 @@ def get_runbook(reason_code: str, enrolment_type: str) -> Optional[dict]:
         return None
 
     # Determine types to try (exact match, then ANY fallback)
-    etype = str(enrolment_type).strip().upper() if enrolment_type else "ANY"
+    etype = normalize_enrolment_type(enrolment_type)
     candidates = [(reason_code, etype)]
     if etype != "ANY":
         candidates.append((reason_code, "ANY"))
-        
+
     for r_code, e_type in candidates:
-        cache_key = f"{r_code}__{e_type}"
+        cache_key = runbook_cache_key(r_code, e_type)
         if cache_key in _runbook_cache:
             return _runbook_cache[cache_key]
             
@@ -140,9 +170,9 @@ def promote_draft_to_final(draft_path: Path, data: dict):
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp_path, final_path)
     
-    # Invalidate cache
-    cache_key = f"{reason_code}__{enrolment_type}"
-    _runbook_cache.pop(cache_key, None)
+    # Invalidate cache. Built through the same normalizer get_runbook() reads
+    # from, so a draft carrying "e" invalidates the "E" key lookups use (F13).
+    _runbook_cache.pop(runbook_cache_key(reason_code, enrolment_type), None)
     
     # Remove draft
     os.remove(draft_path)

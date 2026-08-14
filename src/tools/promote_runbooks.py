@@ -17,7 +17,7 @@ from src.utils.runbook_store import (
 )
 from src.utils.runbook_validator import validate_generic_text
 from src.utils.logging_config import get_logger
-from src.tools.tool_registry import lookup_rule_by_reason_code
+from src.tools.tool_registry import lookup_rule_for
 
 logger = get_logger(__name__)
 
@@ -134,11 +134,10 @@ def main():
                         rc = final_data["reason_code"]
                         et = final_data["enrolment_type"]
                         
-                        db_etype = "UPDATE" if et == "U" else ("ENROLMENT" if et == "E" else "UPDATE")
-                        rule = lookup_rule_by_reason_code(rc, db_etype)
-                        
-                        if rule:
-                            current_fp = generate_rule_fingerprint(rule)
+                        rules = lookup_rule_for(rc, et)
+
+                        if rules:
+                            current_fp = generate_rule_fingerprint(rules)
                             if current_fp != final_data["rule_fingerprint"]:
                                 print(f"STALE: {rc} ({et}) - Fingerprint mismatch! Rule has changed.")
                         else:

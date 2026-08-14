@@ -10,7 +10,7 @@ from langgraph.prebuilt import create_react_agent
 
 from src.utils.llm_utils import get_llm
 from src.utils.env import get_bool_env
-from src.tools.tool_registry import get_tool_by_name, lookup_rule_by_reason_code
+from src.tools.tool_registry import get_tool_by_name, lookup_rule_for, lookup_rule_text
 from src.utils.resilience import retry_transient, llm_breaker
 from src.utils.logging_config import get_logger
 from src.utils.paths import CHECKPOINT_DB_PATH
@@ -102,49 +102,61 @@ def get_agent():
         mode = os.environ.get("RUNBOOK_MODE", "off").lower()
         if mode == "off":
             return {"resolution_source": "agent"}
-            
+
         payload = state.get("payload", {})
         event_id = payload.get("eventId", "unknown")
         log = logger.bind(event_id=event_id)
-        
-        exec_summary = payload.get("packetExecutionSummary") or {}
-        error_data = exec_summary.get("errorData") or []
-        reason_code = None
-        for err in error_data:
-            if err and err.get("errorReasonCode"):
-                reason_code = err.get("errorReasonCode")
-                break
-                
-        if not reason_code:
-            return {"resolution_source": "agent"}
-            
-        packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
-        runbook = get_runbook(reason_code, packet_type)
-        if not runbook:
-            return {"resolution_source": "agent"}
-            
-        runbook_id = runbook["runbook_id"]
-        version = runbook["version"]
-        
-        # Check fingerprint
-        db_etype = "UPDATE" if packet_type == "U" else ("ENROLMENT" if packet_type == "E" else "UPDATE")
-        rule = lookup_rule_by_reason_code(reason_code, db_etype)
-        
-        if rule:
-            current_fp = generate_rule_fingerprint(rule)
-            if current_fp != runbook["rule_fingerprint"]:
-                log.warning("Fingerprint mismatch", runbook_id=runbook_id, expected=runbook["rule_fingerprint"], actual=current_fp)
+
+        # The runbook path is an optimisation, never a correctness
+        # requirement: falling back to the agents always produces a valid
+        # result. Any failure here must therefore degrade to "agent", not
+        # propagate -- an uncaught TypeError from the fingerprint check used
+        # to fail agent.invoke() outright and DLQ every runbook-matching
+        # packet (F2).
+        try:
+            exec_summary = payload.get("packetExecutionSummary") or {}
+            error_data = exec_summary.get("errorData") or []
+            reason_code = None
+            for err in error_data:
+                if err and err.get("errorReasonCode"):
+                    reason_code = err.get("errorReasonCode")
+                    break
+
+            if not reason_code:
                 return {"resolution_source": "agent"}
-        
-        res_source = f"runbook:{runbook_id}@v{version}"
-        synthesis_json = json.dumps(runbook["resolution"])
-        
-        log.info("Runbook hit", runbook_id=runbook_id, version=version, mode=mode)
-        
-        if mode == "shadow":
-            return {"resolution_source": "agent", "shadow_runbook_resolution": synthesis_json}
-            
-        return {"resolution_source": res_source, "synthesis": synthesis_json, "runbook_id": runbook_id}
+
+            packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
+            runbook = get_runbook(reason_code, packet_type)
+            if not runbook:
+                return {"resolution_source": "agent"}
+
+            runbook_id = runbook["runbook_id"]
+            version = runbook["version"]
+
+            # Staleness check: serve the runbook only while the DB rule it was
+            # derived from is unchanged. Fingerprint the *parsed* rows, not the
+            # raw to_json string (F2).
+            rules = lookup_rule_for(reason_code, packet_type)
+            if rules:
+                current_fp = generate_rule_fingerprint(rules)
+                if current_fp != runbook["rule_fingerprint"]:
+                    log.warning("Fingerprint mismatch", runbook_id=runbook_id,
+                                expected=runbook["rule_fingerprint"], actual=current_fp)
+                    return {"resolution_source": "agent"}
+
+            res_source = f"runbook:{runbook_id}@v{version}"
+            synthesis_json = json.dumps(runbook["resolution"])
+
+            log.info("Runbook hit", runbook_id=runbook_id, version=version, mode=mode)
+
+            if mode == "shadow":
+                return {"resolution_source": "agent", "shadow_runbook_resolution": synthesis_json}
+
+            return {"resolution_source": res_source, "synthesis": synthesis_json, "runbook_id": runbook_id}
+        except Exception as e:
+            log.error("Runbook lookup failed; falling through to the agents",
+                      error=f"{type(e).__name__}: {e}", exc_info=True)
+            return {"resolution_source": "agent"}
 
     def check_runbook_hit(state: GraphState):
         if state.get("resolution_source", "").startswith("runbook:"):
@@ -243,32 +255,16 @@ def get_agent():
                     break
             
             if reason_code:
-                rule_tool = get_tool_by_name("lookup_rule_by_reason_code")
-                db_rule = rule_tool.invoke(reason_code)
-                
-                # Filter DB rule by enrolmentType if multiple rules are returned
+                # Lookup + enrolment-type filtering now live together in
+                # tool_registry.lookup_rule_text; this node previously carried
+                # its own copy of the filter, which drifted from the three
+                # runbook call sites' copy (F2).
+                packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
                 try:
-                    packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
-                    target_type = "UPDATE" if packet_type == "U" else ("ENROLMENT" if packet_type == "E" else None)
-                    
-                    if target_type and db_rule and db_rule.startswith("["):
-                        rules_list = json.loads(db_rule)
-                        filtered_rules = []
-                        for r in rules_list:
-                            try:
-                                rule_data = json.loads(r.get("rule_data", "{}"))
-                                cond = rule_data.get("statement", {}).get("Condition", {})
-                                str_eq = cond.get("StringEquals", {})
-                                rule_enrol_type = str_eq.get("enrolmentType")
-                                if rule_enrol_type == target_type or not rule_enrol_type:
-                                    filtered_rules.append(r)
-                            except Exception:
-                                filtered_rules.append(r)
-                        
-                        if filtered_rules:
-                            db_rule = json.dumps(filtered_rules)
+                    db_rule = lookup_rule_text(reason_code, packet_type)
                 except Exception as e:
-                    log.warning("Error filtering rules by enrolmentType", error=str(e))
+                    log.warning("Rule lookup failed", error=f"{type(e).__name__}: {e}")
+                    db_rule = f"Rule lookup failed for reason code {reason_code}: {e}"
             else:
                 db_rule = "No errorReasonCode found in payload."
 

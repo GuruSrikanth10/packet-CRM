@@ -1,3 +1,4 @@
+import json
 import os
 from typing import Optional
 import pandas as pd
@@ -145,12 +146,42 @@ def lookup_error_code(error_code: str) -> str:
     }
     return mock_errors.get(error_code, "Unknown error code.")
 
-# Registry mimicking agentic-fms
-@tool
+# Maps the payload's terse enrolmentType onto the vocabulary the DB rule's
+# `rule_data.statement.Condition.StringEquals.enrolmentType` actually uses.
+# This mapping was previously inlined -- and inconsistently -- at four call
+# sites: investigator_node defaulted an unknown type to None (no filtering)
+# while all three runbook sites defaulted it to "UPDATE", silently filtering
+# ENROLMENT rules out of an unrecognised packet type (F2).
+_ENROLMENT_TYPE_ALIASES = {
+    "U": "UPDATE",
+    "UPDATE": "UPDATE",
+    "E": "ENROLMENT",
+    "ENROLMENT": "ENROLMENT",
+    "ENROLLMENT": "ENROLMENT",
+}
+
+
+def normalize_enrolment_type(value: Optional[str]) -> Optional[str]:
+    """Return the DB-side enrolment type, or None when it can't be determined.
+
+    None means "do not filter" -- never "filter to the default". Guessing a
+    type we don't have would drop the very rule the Investigator needs.
+    """
+    if not value:
+        return None
+    return _ENROLMENT_TYPE_ALIASES.get(str(value).strip().upper())
+
+
 @db_breaker
 @retry_transient
-def lookup_rule_by_reason_code(reason_code: str) -> str:
-    """Lookup the exact corresponding rule (including ruleId, payload, etc.) for a given reason code."""
+def _lookup_rule_json(reason_code: str) -> str:
+    """Cached, breaker-protected raw lookup. Returns the impl's JSON string
+    (or its human-readable failure message).
+
+    This is the single protected path shared by the LLM-facing `@tool` and by
+    the typed `lookup_rule_for` / `lookup_rule_text` helpers, so callers can't
+    accidentally bypass the cache, the retry, or the circuit breaker.
+    """
     cached_result = _rule_cache.get(reason_code)
     if cached_result is not None:
         logger.info(f"[TOOL] Cache hit for rule lookup: {reason_code}")
@@ -162,6 +193,88 @@ def lookup_rule_by_reason_code(reason_code: str) -> str:
         _rule_cache[reason_code] = result
 
     return result
+
+
+# Registry mimicking agentic-fms
+@tool
+def lookup_rule_by_reason_code(reason_code: str) -> str:
+    """Lookup the exact corresponding rule (including ruleId, payload, etc.) for a given reason code."""
+    return _lookup_rule_json(reason_code)
+
+
+def lookup_rule_for(reason_code: str,
+                    enrolment_type: Optional[str] = None) -> Optional[list]:
+    """Return the parsed rule rows for a reason code, filtered by enrolment type.
+
+    Returns None when the lookup failed or matched nothing -- callers that
+    need to distinguish "no rule" from "the DB is down" should check the
+    breaker, not this return value.
+
+    Exists because `lookup_rule_by_reason_code` is a `StructuredTool` under
+    langchain-core 1.x: it is not callable, and it takes one argument. Three
+    call sites invoked it directly with two, raising `TypeError` -- which in
+    `runbook_lookup_node` was uncaught and sent every runbook-matching packet
+    to the DLQ (F2). Fingerprinting also needs the *parsed* rows: hashing the
+    raw `to_json` string folds DataFrame column order into the fingerprint, so
+    a harmless re-export invalidated every runbook.
+    """
+    raw = _lookup_rule_json(reason_code)
+    return _parse_and_filter_rules(raw, enrolment_type)
+
+
+def lookup_rule_text(reason_code: str,
+                     enrolment_type: Optional[str] = None) -> str:
+    """Return the LLM-facing rule text for a reason code.
+
+    Falls back to the raw lookup string when it isn't parseable JSON, because
+    that string carries a meaningful message ("Rule not found for reason
+    code: X") that the Investigator should see rather than an empty prompt.
+    """
+    raw = _lookup_rule_json(reason_code)
+    filtered = _parse_and_filter_rules(raw, enrolment_type)
+    if filtered is None:
+        return raw
+    return json.dumps(filtered)
+
+
+def _parse_and_filter_rules(raw: str,
+                            enrolment_type: Optional[str] = None) -> Optional[list]:
+    """Parse the lookup's JSON-array string and filter it by enrolment type.
+
+    A rule carrying no `enrolmentType` condition applies to every type and is
+    always kept. If filtering would leave nothing, the unfiltered rows are
+    returned instead -- a rule that matched the reason code is better evidence
+    than no rule at all.
+    """
+    if not raw or not raw.lstrip().startswith("["):
+        return None
+
+    try:
+        rules = json.loads(raw)
+    except (ValueError, TypeError) as e:
+        logger.warning("[TOOL] Rule lookup result was not parseable JSON", error=str(e))
+        return None
+
+    if not isinstance(rules, list) or not rules:
+        return None
+
+    target_type = normalize_enrolment_type(enrolment_type)
+    if not target_type:
+        return rules
+
+    filtered = []
+    for rule in rules:
+        try:
+            rule_data = json.loads(rule.get("rule_data", "{}"))
+            condition = rule_data.get("statement", {}).get("Condition", {})
+            rule_enrol_type = condition.get("StringEquals", {}).get("enrolmentType")
+            if rule_enrol_type == target_type or not rule_enrol_type:
+                filtered.append(rule)
+        except Exception:
+            # An unparseable rule_data is not grounds for hiding the rule.
+            filtered.append(rule)
+
+    return filtered or rules
 
 
 def _lookup_rule_by_reason_code_impl(reason_code: str) -> str:

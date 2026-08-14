@@ -15,3 +15,6 @@ local_checkpoints/
 *.db-shm
 *.db-wal
 
+
+# filelock artifacts
+*.lock
