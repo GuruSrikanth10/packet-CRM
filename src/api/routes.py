@@ -364,11 +364,11 @@ async def process_rejection(signal: MessagePayload):
             "eid": event_id,
             "ref_id": packet_meta.get("refId"),
             "source": signal_dict.get("sourceTopic"),
-            "packet_type": packet_meta.get("enrolmentType"),
+            "packet_type": packet_meta.get("pktSource"),
             "is_mbu": None,  # MBU mapping not immediately available in payload
-            "update_type": None,  # B/D mapping not immediately available
+            "update_type": packet_meta.get("enrolmentType"),  # B/D mapping not immediately available
             "is_child": None,  # Age determination not immediately available
-            "created_at": signal_dict.get("eventTimestamp"),
+            "created_at": signal_dict.get("sidDate"),
             "uploaded_at": signal_dict.get("eventTimestamp")
         },
         "packet_status": {

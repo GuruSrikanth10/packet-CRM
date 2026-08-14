@@ -63,7 +63,7 @@ def get_agent():
     logger.info("Building Deterministic LangGraph from scratch...")
     base_dir = os.path.dirname(os.path.dirname(__file__))
     llm = get_llm("complex")
-    simple_llm = get_llm("simple")
+    simple_llm = get_llm("complex")
     
     def load_prompt(filename):
         with open(os.path.join(base_dir, "prompts", filename), "r", encoding="utf-8") as f:
