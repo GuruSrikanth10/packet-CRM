@@ -121,7 +121,9 @@ def forward_signal_to_internal_endpoint(signal_payload: dict):
     try:
         response.raise_for_status()
     except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP Error forwarding signal: {e.response.text}")
+        logger.error("HTTP error forwarding signal to the internal endpoint",
+                     event_id=signal_payload.get("eventId"),
+                     status_code=getattr(e.response, "status_code", None))
         raise
     return response
 

@@ -72,10 +72,10 @@ _agent = None
 def get_agent():
     global _agent
     if _agent is not None:
-        logger.info("Returning cached Deterministic Graph.")
+        logger.info("Returning the cached agent graph")
         return _agent
 
-    logger.info("Building Deterministic LangGraph from scratch...")
+    logger.info("Building the agent graph")
     base_dir = os.path.dirname(os.path.dirname(__file__))
     llm = get_llm("complex")
     simple_llm = get_llm("complex")
@@ -105,7 +105,7 @@ def get_agent():
         log.info("Log fetcher node started", state="LOG_FETCHER")
         enable_log_fetching = get_bool_env("ENABLE_LOG_FETCHING", False)
         if not enable_log_fetching:
-            log.info("Log fetching disabled via .env; skipping.")
+            log.info("Log fetching is disabled; skipping the fetch", reason="ENABLE_LOG_FETCHING=false")
             return {"logs": "Log fetching disabled."}
 
         # Pull every K8S_SEARCH_FIELDS value out of the payload (refId, srn,
@@ -504,7 +504,7 @@ def get_agent():
                         agent_synthesis=agent_res.get("synthesis")
                     )
             except Exception as e:
-                log.error("Failed to compare shadow divergence", error=str(e))
+                log.error("Failed to compare the shadow runbook resolution", error=f"{type(e).__name__}: {e}")
                 
         return {"synthesis": synthesis_content, "messages": res["messages"], "resolution_source": "agent"}
 
@@ -530,5 +530,5 @@ def get_agent():
     # Backend is selectable so two API replicas can share checkpoints (4.7).
     _agent = workflow.compile(checkpointer=get_checkpointer())
     
-    logger.info("Deterministic Graph successfully constructed!")
+    logger.info("Agent graph constructed")
     return _agent

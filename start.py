@@ -27,7 +27,7 @@ def _terminate_all():
 
     for name, process in _children:
         if process.poll() is None:
-            print(f"Stopping {name}...")
+            print(f"Stopping {name}.")
             process.terminate()
 
     deadline = time.monotonic() + TERMINATE_GRACE_SECONDS
@@ -42,28 +42,28 @@ def _terminate_all():
 
 
 def _handle_signal(signum, _frame):
-    print(f"\nReceived signal {signum}; stopping services...")
+    print(f"\nReceived signal {signum}; stopping services.")
     _terminate_all()
     sys.exit(0)
 
 
 def main():
-    print("Starting Packet-CRM Ecosystem...\n")
+    print("Starting the Packet-CRM ecosystem.\n")
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, _handle_signal)
 
-    print("Starting API Server (main_api.py)...")
+    print("Starting the API server (main_api.py).")
     _children.append(("API", subprocess.Popen([sys.executable, "src/main_api.py"])))
 
     # Give the API a moment to bind its port before the consumer starts
     # forwarding to it.
     time.sleep(2)
 
-    print("Starting Kafka Consumer (main_consumer.py)...")
+    print("Starting the Kafka consumer (main_consumer.py).")
     _children.append(("Consumer", subprocess.Popen([sys.executable, "src/main_consumer.py"])))
 
-    print("\nBoth services are running! Press Ctrl+C to stop them.")
+    print("\nBoth services are running. Press Ctrl+C to stop them.")
 
     try:
         # Wait on BOTH concurrently. The previous version waited on the API

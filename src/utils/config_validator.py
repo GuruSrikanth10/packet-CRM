@@ -1,11 +1,14 @@
 import os
 import sys
 from pathlib import Path
-import logging
 
 from src.utils.env import get_bool_env
+from src.utils.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+# Every other module logs through structlog; this one used the stdlib logger,
+# so its startup errors arrived as unparseable plain text interleaved with the
+# JSON stream an aggregator expects (F21).
+logger = get_logger(__name__)
 
 def _collect_llm_key_errors() -> list:
     """Return validation errors for whichever LLM provider get_llm() will
@@ -112,8 +115,10 @@ def validate_config():
 
     if errors:
         for err in errors:
-            logger.error(f"Startup Validation Error: {err}")
-            print(f"Startup Validation Error: {err}", file=sys.stderr)
+            logger.error("Startup validation error", detail=err)
+            # Also to stderr: a boot failure must be visible even when the log
+            # stream is being shipped elsewhere or the level is raised.
+            print(f"Startup validation error: {err}", file=sys.stderr)
         sys.exit(1)
 
-    logger.info("Configuration validation passed.")
+    logger.info("Configuration validation passed")

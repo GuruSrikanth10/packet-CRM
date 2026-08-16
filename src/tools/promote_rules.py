@@ -51,7 +51,7 @@ def promote_rules():
         for i, line in enumerate(lines):
             try:
                 entry = json.loads(line.strip())
-                print(f"\n--- Rule {i+1} ---")
+                print(f"\nRule {i+1}")
                 print(f"Event ID: {entry.get('eventId')}")
                 print(f"Reasoning: {entry.get('reviewer_reasoning')}")
                 print(f"Proposed Rule: {entry.get('proposed_rule')}")
@@ -66,7 +66,7 @@ def promote_rules():
                     commit_msg = f"Add learning rule from event {entry.get('eventId')}"
                     subprocess.run(["git", "add", target_file], check=True)
                     subprocess.run(["git", "commit", "-m", commit_msg], check=True)
-                    print("Rule promoted and committed!")
+                    print("Rule promoted and committed.")
                     promoted_count += 1
                     promoted_raw_lines.add(line.strip())
                 else:

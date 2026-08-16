@@ -160,7 +160,7 @@ def get_runbook(reason_code: str, enrolment_type: str) -> Optional[dict]:
             return data
             
         except Exception as e:
-            logger.error(f"Malformed runbook", path=str(target_path), error=str(e))
+            logger.error("Malformed runbook", path=str(target_path), error=f"{type(e).__name__}: {e}")
             logger.info("Runbook miss", reason_code=r_code, enrolment_type=e_type, miss_reason="malformed")
             
     logger.info("Runbook miss", reason_code=reason_code, enrolment_type=enrolment_type, miss_reason="not_found")

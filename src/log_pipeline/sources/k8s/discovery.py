@@ -385,7 +385,7 @@ def discover_targets(namespace: Optional[str] = None,
 
     if not targets:
         logger.warning(
-            "No pods matched -- check namespace and match spec",
+            "No pods matched; check the namespace and the match spec",
             namespace=resolved_namespace,
             match_mode=match_spec.mode,
             match_value=match_spec.value,

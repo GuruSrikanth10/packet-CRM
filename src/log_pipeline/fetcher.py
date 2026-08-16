@@ -93,12 +93,12 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None,
     kubelet-sized window must not be applied to the system of record.
     """
     log = logger.bind(event_id=event_id)
-    log.info("[FETCHER] Fetching logs")
+    log.info("Elasticsearch fetch started")
 
     # --- Testing/Mock Mode: Load logs from a local CSV file ---
     mock_file = os.environ.get("ES_MOCK_FILE")
     if mock_file:
-        log.info(f"[FETCHER] ES_MOCK_FILE set. Loading logs from {mock_file}.")
+        log.info("ES_MOCK_FILE is set; loading logs from file", mock_file=mock_file)
         logs = []
         try:
             with open(mock_file, 'r', encoding='utf-8', errors='replace') as f:
@@ -128,15 +128,15 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None,
                                 "app_name": source.get("application_name", "unknown-service"),
                             })
                         except json.JSONDecodeError as e:
-                            log.warning(f"[FETCHER] Skipped line due to JSON decode error: {e}")
-                            log.warning(f"[FETCHER] Problematic JSON: {log_json_str[:150]}...")
+                            log.warning("Skipped a mock log line that was not valid JSON",
+                                        error=str(e), sample=log_json_str[:150])
                             continue
             # Sort by timestamp to mimic Elasticsearch's ascending order
             logs.sort(key=lambda x: x["timestamp"])
-            log.info(f"[FETCHER] Loaded {len(logs)} logs from file.")
+            log.info("Mock logs loaded", record_count=len(logs), mock_file=mock_file)
             return logs
         except Exception as e:
-            log.error(f"[FETCHER] Error loading mock file: {e}")
+            log.error("Failed to load the mock log file", mock_file=mock_file, error=f"{type(e).__name__}: {e}")
             return []
 
     es_host = os.environ.get("ES_HOST")
@@ -145,7 +145,7 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None,
     index_pattern = os.environ.get("ES_INDEX_PATTERN", "logs-*")
 
     if not es_host:
-        log.info("[FETCHER] ES_HOST not set. Returning mock logs.")
+        log.info("ES_HOST is not set; returning mock logs")
         return [
             {"timestamp": "MOCK", "level": "ERROR", "message": f"[MOCK] connection timeout for {event_id}", "app_name": "mock-service"}
         ]
@@ -192,7 +192,7 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None,
                 {"range": {"@timestamp": {"gte": f"now-{int(float(search_days))}d"}}}
             )
         except ValueError:
-            log.warning(f"[FETCHER] Ignoring invalid ES_SEARCH_WINDOW_DAYS: {search_days}")
+            log.warning("Ignoring invalid ES_SEARCH_WINDOW_DAYS", value=search_days)
 
     # Stage 1 enhancement: must_not from catalog boilerplate
     must_not_clauses = []
@@ -251,7 +251,7 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None,
             search_after_values = hit["sort"]
 
         if len(logs) >= max_documents:
-            log.warning(f"[FETCHER] Hit LOG_MAX_DOCUMENTS cap ({max_documents}); truncating results.")
+            log.warning("Hit the LOG_MAX_DOCUMENTS cap; truncating results", max_documents=max_documents)
             logs = logs[:max_documents]
             break
 
@@ -260,5 +260,5 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None,
         if len(hits) < page_size:
             break
 
-    log.info(f"[FETCHER] Fetched {len(logs)} logs from Elasticsearch.")
+    log.info("Elasticsearch fetch completed", record_count=len(logs), index_pattern=index_pattern)
     return logs

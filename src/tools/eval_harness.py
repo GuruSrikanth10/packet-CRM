@@ -38,8 +38,7 @@ def main():
     with open(args.test_cases, "r", encoding="utf-8") as f:
         test_cases = json.load(f)
 
-    print(f"[EVAL] Loaded {len(test_cases)} test cases.")
-    print("=" * 60)
+    print(f"Loaded {len(test_cases)} test cases.")
 
     results = []
 
@@ -48,7 +47,7 @@ def main():
         expected_outcome = tc.get("expected_outcome", "").lower()
         expected_keywords = tc.get("expected_evidence_keywords", [])
 
-        print(f"\n--- Test Case {i+1}/{len(test_cases)}: refid={refid} ---")
+        print(f"\nTest case {i+1}/{len(test_cases)}: refid={refid}")
         print(f"    Expected outcome: {expected_outcome}")
 
         try:
@@ -92,9 +91,7 @@ def main():
             })
 
     # Summary
-    print("\n" + "=" * 60)
-    print("EVALUATION SUMMARY")
-    print("=" * 60)
+    print("\nEvaluation summary")
     total = len(results)
     passed = sum(1 for r in results if r.get("status") == "PASS")
     failed = sum(1 for r in results if r.get("status") == "FAIL")

@@ -67,7 +67,7 @@ def _check_kafka_producer_ready() -> bool:
         producer = get_producer()
         ready = producer is not None
     except Exception as e:
-        logger.error(f"Readiness check failed on Kafka Producer: {e}")
+        logger.error("Readiness check failed on the Kafka producer", error=f"{type(e).__name__}: {e}")
 
     with _producer_health_lock:
         _producer_health_cache["ready"] = ready
@@ -251,7 +251,7 @@ def readiness_check():
             conn.close()
             db_ready = True
     except Exception as e:
-        logger.error(f"Readiness check failed on checkpoint store ({backend}): {e}")
+        logger.error("Readiness check failed on the checkpoint store", backend=backend, error=f"{type(e).__name__}: {e}")
 
     kafka_ready = _check_kafka_producer_ready()
 
@@ -339,7 +339,7 @@ async def process_rejection(signal: MessagePayload):
     if existing_casebook:
         status = existing_casebook.get("packet_status", {}).get("status")
         if status in TERMINAL_STATUSES:
-            logger.bind(event_id=event_id).info("Skipping event; terminal casebook already exists.")
+            logger.bind(event_id=event_id).info("Skipping event; a terminal casebook already exists", recorded_status=status)
             return {"status": "already_processed", "event_id": event_id}
 
     agent = get_agent()
@@ -357,15 +357,15 @@ async def process_rejection(signal: MessagePayload):
             is_stale = (time.time() - started_at) > max_age
 
             if is_stale and not has_active_checkpoint:
-                pre_invoke_log.info("IN_PROGRESS but stale with no active checkpoint. Reprocessing fresh.")
+                pre_invoke_log.info("Stale IN_PROGRESS with no active checkpoint; reprocessing from scratch", max_age_seconds=max_age)
             elif has_active_checkpoint:
-                pre_invoke_log.info("Has active checkpoint. Resuming.")
+                pre_invoke_log.info("Active checkpoint found; resuming the existing run")
                 return {"status": "already_processing_resumed", "event_id": event_id}
             else:
                 # Not stale, and no active checkpoint: a run is in flight but
                 # between checkpoint writes. Treat as already processing
                 # instead of falling through to a full duplicate reprocess.
-                pre_invoke_log.info("IN_PROGRESS and not stale. Skipping duplicate invocation.")
+                pre_invoke_log.info("IN_PROGRESS and not stale; skipping duplicate invocation")
                 return {"status": "already_processing", "event_id": event_id}
 
     # Write IN_PROGRESS stub before invoking graph to status.json
@@ -481,7 +481,7 @@ async def process_rejection(signal: MessagePayload):
     if not raw_logs or raw_logs == "Log fetching disabled.":
         processed_logs = None
     elif len(raw_logs) > 5000:
-        log.info("Logs are too large for JSON, uploading to S3...")
+        log.info("Logs exceed the inline size limit; uploading to S3", log_chars=len(raw_logs))
         uploaded_url = upload_logs_to_s3(event_id, raw_logs)
         if uploaded_url:
             processed_logs = uploaded_url

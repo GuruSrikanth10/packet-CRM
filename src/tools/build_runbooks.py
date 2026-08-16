@@ -64,7 +64,7 @@ def main():
                 groups[(reason_code, etype)].append(cb)
                 
             except Exception as e:
-                logger.error(f"Failed to read casebook {cb_file}", error=str(e))
+                logger.error("Failed to read casebook", path=str(cb_file), error=f"{type(e).__name__}: {e}")
                 continue
                 
     with open(PROMPT_PATH, "r", encoding="utf-8") as f:
@@ -159,7 +159,7 @@ def main():
                 logger.info("Dry run: would write draft", runbook_id=runbook_id)
                 
         except Exception as e:
-            logger.error("Failed to generate draft", reason_code=reason_code, error=str(e))
+            logger.error("Failed to generate draft", reason_code=reason_code, error=f"{type(e).__name__}: {e}")
             continue
 
 if __name__ == "__main__":

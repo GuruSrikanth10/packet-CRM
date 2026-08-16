@@ -88,7 +88,7 @@ def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
 
     total_fetched = len(raw_logs)
     log = logger.bind(event_id=event_id)
-    log.info(f"[PIPELINE] Fetched {total_fetched} logs.")
+    log.info("Log pipeline fetch completed", record_count=total_fetched)
 
     # ------------------------------------------------------------------
     # Redaction -- after fetch, before ANY persistence.
@@ -112,7 +112,7 @@ def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
         raw_logs, allowlist=[event_id, *(extra_identifiers or ())]
     )
     if redaction_counts:
-        log.info("[PIPELINE] Redacted PII before persistence", **{
+        log.info("Redacted PII before persistence", **{
             f"redacted_{label.lower()}": count
             for label, count in redaction_counts.items()
         })
@@ -276,10 +276,10 @@ def _write_artifact(event_id: str, filename: str, render) -> str:
         log_file_path = log_dir / filename
         with open(log_file_path, "w", encoding="utf-8") as f:
             render(f)
-        logger.bind(event_id=event_id).info(f"[PIPELINE] Saved {filename} to {log_file_path}")
+        logger.bind(event_id=event_id).info("Log artifact saved", filename=filename, path=str(log_file_path))
         return str(log_file_path)
     except Exception as e:
-        logger.bind(event_id=event_id).error(f"[PIPELINE] Failed to save {filename}: {e}")
+        logger.bind(event_id=event_id).error("Failed to save log artifact", filename=filename, error=f"{type(e).__name__}: {e}")
         return "Failed to save"
 
 
