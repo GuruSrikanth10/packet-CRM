@@ -13,7 +13,6 @@ The script fetches logs for each refid, clusters them with Drain3, computes
 cross-flow statistics, and outputs the catalog JSON.
 """
 import argparse
-import json
 import os
 import sys
 

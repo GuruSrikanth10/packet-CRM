@@ -8,8 +8,6 @@ F9  -- the heartbeat ticks independently of the poll loop.
 F10 -- redaction covers every log source, not just Kubernetes.
 F12 -- SIGTERM stops the poll loop and drains.
 """
-import json
-import os
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch

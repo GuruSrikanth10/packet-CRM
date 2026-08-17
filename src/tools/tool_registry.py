@@ -6,9 +6,12 @@ import pandas as pd
 from cachetools import TTLCache
 from langchain_core.tools import tool
 from sqlalchemy import create_engine, text
-import pymysql
+# Imported for its side effect, not its name: SQLAlchemy resolves the
+# "mysql+pymysql://" driver lazily, so without this a missing PyMySQL surfaces
+# as a failed query on the first live lookup rather than at boot.
+import pymysql  # noqa: F401
 from src.utils.env import get_bool_env, get_required_env
-from src.utils.resilience import retry_transient, db_breaker, es_breaker
+from src.utils.resilience import retry_transient, db_breaker
 from src.utils.logging_config import get_logger
 import pybreaker
 
@@ -409,10 +412,22 @@ def fetch_elastic_logs(event_id: str) -> Optional[str]:
     return fetch_logs_for(event_id)
 
 @tool
-def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, category: str, fromSedaStart: bool, notificationEmail: str, notificationMobile: str) -> str:
+def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, category: str, fromSedaStart: bool) -> str:
     """Queue a packet for replay through the OIS pipeline."""
     logger.info("Replay queue requested", packet_id=id, id_type=idType)
 
+    # notificationEmail / notificationMobile are deliberately NOT parameters.
+    #
+    # They were, which meant the LLM chose them -- and they are POSTed to the
+    # OIS endpoint when ENABLE_AUTO_REPLAY=true. Nothing checked that the
+    # address belonged to the packet in question, so a hallucinated or
+    # log-scraped value would send a real notification about someone else's
+    # enrolment (G20). Remediation 1.8 had already moved these out of query
+    # params to keep them out of access logs, so the sensitivity was
+    # understood; the provenance was not addressed.
+    #
+    # Omitted entirely rather than guessed: OIS can resolve the resident's
+    # contact details from `id`, which is the authoritative source.
     payload = {
         "id": id,
         "idType": idType,
@@ -420,10 +435,8 @@ def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, cat
         "operatorName": operatorName,
         "category": category,
         "fromSedaStart": fromSedaStart,
-        "notificationEmail": notificationEmail,
-        "notificationMobile": notificationMobile
     }
-    
+
     enable_auto_replay = get_bool_env("ENABLE_AUTO_REPLAY", False)
     
     if enable_auto_replay:

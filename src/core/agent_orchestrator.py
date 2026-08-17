@@ -23,6 +23,7 @@ from src.models.synthesis import (
     parse_synthesis,
 )
 from src.utils.resilience import retry_transient, llm_breaker
+from src.utils.runbook_validator import validate_learning_rule
 from src.utils.logging_config import get_logger
 from src.core.checkpointer import get_checkpointer
 from src.utils.runbook_store import (
@@ -159,23 +160,34 @@ def get_agent():
     # fix turns that test green again and the xfail marker must then come off.
     simple_llm = get_llm("complex")
     
-    def load_prompt(filename):
+    def load_prompt(filename, with_policy: bool = True):
+        """Read an agent prompt, optionally appending the business policy.
+
+        `with_policy` exists because the policy document was appended to every
+        prompt including the LogFilter's. That agent strips log lines not
+        belonging to a target event id -- a mechanical text operation with no
+        use for business policy -- so the whole document rode along in the
+        context window of every filter call for nothing (G24).
+        """
         with open(os.path.join(base_dir, "prompts", filename), "r", encoding="utf-8") as f:
             prompt = f.read()
-            
+
+        if not with_policy:
+            return prompt
+
         policy_path = os.path.join(os.path.dirname(base_dir), "agent_policy_context.md")
         if os.path.exists(policy_path):
             with open(policy_path, "r", encoding="utf-8") as f:
                 policy = f.read()
-            # Inject policy context directly into the prompt so the LLM actually sees it!
+            # Inject policy context directly into the prompt so the LLM sees it.
             prompt += "\n\n### GLOBAL BUSINESS POLICY CONTEXT\n" + policy
-            
+
         return prompt
-            
+
     investigator_prompt = load_prompt("InvestigatorAgent.md")
     reviewer_prompt = load_prompt("ReviewerAgent.md")
     synthesis_prompt = load_prompt("SynthesisAgent.md")
-    log_filter_prompt = load_prompt("LogFilterAgent.md")
+    log_filter_prompt = load_prompt("LogFilterAgent.md", with_policy=False)
     
     def fetch_logs_node(state: GraphState):
         payload = state.get("payload", {})
@@ -304,6 +316,27 @@ def get_agent():
         """Propose a new permanent rule to fix Investigator mistakes."""
         target_file = os.path.join(base_dir, "prompts", "pending_rules.jsonl")
         lock_file = target_file + ".lock"
+
+        # Validate at the point of proposal, not only at promotion.
+        #
+        # This argument is LLM-generated text derived from log content, and
+        # log content is influenced by upstream request data. Whatever lands
+        # here can be appended verbatim to InvestigatorAgent.md by
+        # promote_rules.py -- labelled "CRITICAL RULE" -- and becomes part of
+        # the system prompt for every future packet. Rejecting here keeps
+        # instruction-shaped text out of the operator's queue entirely,
+        # rather than relying on one interactive y/N to catch it (G19).
+        violations = validate_learning_rule(rule_text)
+        if violations:
+            logger.warning(
+                "Rejected a proposed learning rule",
+                event_id=_current_event_id.get(),
+                violations=violations,
+            )
+            return (
+                "Rule rejected and NOT queued. Fix these and try again: "
+                + "; ".join(violations)
+            )
 
         entry = {
             "eventId": _current_event_id.get(),

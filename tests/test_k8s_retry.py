@@ -7,7 +7,7 @@ entire time budget on a call that can never succeed, while failing to retry a
 row of the plan's 6.1 table.
 """
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from kubernetes.client.exceptions import ApiException

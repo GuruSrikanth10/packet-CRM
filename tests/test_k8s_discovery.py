@@ -180,7 +180,6 @@ def test_namespace_read_success_proceeds_to_list_pods(monkeypatch):
 
 
 def test_fixtures_namespace_exists():
-    import os
     assert fixtures.namespace_exists("anything") is False  # K8S_FIXTURE_DIR unset
 
 

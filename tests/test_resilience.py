@@ -1,15 +1,12 @@
 import os
 import json
-import time
 import asyncio
 import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call
-import threading
+from unittest.mock import patch, MagicMock
 import concurrent.futures
 
 from src.storage.factory import get_casebook_storage
-from src.core.agent_orchestrator import get_agent
 from src.api.routes import process_rejection
 from src.models.schemas import MessagePayload
 from src.utils.paths import CHECKPOINT_DB_PATH
@@ -86,7 +83,6 @@ def test_idempotency_short_circuit():
         mock_get_agent.assert_not_called()
 
 def test_poison_pill_validation():
-    from src.utils.kafkaConsumer import _process_and_commit
     
     bad_signal = {"eventId": "bad-1234", "packetExecutionSummary": "not-a-dict"}
     with patch("src.utils.kafkaConsumer.forward_signal_to_internal_endpoint") as mock_forward:

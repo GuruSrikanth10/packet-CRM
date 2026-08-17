@@ -9,6 +9,5 @@ from src.utils.config_validator import validate_config
 if __name__ == "__main__":
     validate_config()
     
-    import threading
     # Can run in main thread since it's just the consumer
     consume_forever()

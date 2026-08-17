@@ -1,9 +1,28 @@
-import os
+"""Promote Reviewer-proposed learning rules into the Investigator prompt.
+
+Every rule approved here is appended to InvestigatorAgent.md and becomes part
+of the system prompt for every future investigation. That text originates from
+an LLM reading log content, and log content is influenced by upstream request
+data -- so this is the last gate on a path that runs from a log line to a
+permanent, privileged instruction (G19).
+
+The gate is therefore deliberately awkward:
+  - each rule is re-validated here, not only when it was proposed;
+  - the exact diff is shown before anything is written;
+  - approval requires typing the word `promote`, not `y`;
+  - the git commit is a separate, opt-in step.
+"""
+import argparse
 import json
+import os
 import subprocess
+
 from filelock import FileLock
 
-def promote_rules():
+from src.utils.runbook_validator import validate_learning_rule
+
+
+def promote_rules(auto_commit: bool = False):
     base_dir = os.path.dirname(os.path.dirname(__file__))
     prompts_dir = os.path.join(base_dir, "prompts")
     pending_file = os.path.join(prompts_dir, "pending_rules.jsonl")
@@ -51,24 +70,44 @@ def promote_rules():
         for i, line in enumerate(lines):
             try:
                 entry = json.loads(line.strip())
+                proposed = entry.get("proposed_rule") or ""
+
                 print(f"\nRule {i+1}")
                 print(f"Event ID: {entry.get('eventId')}")
                 print(f"Reasoning: {entry.get('reviewer_reasoning')}")
-                print(f"Proposed Rule: {entry.get('proposed_rule')}")
 
-                choice = input("\nPromote this rule? (y/N): ").strip().lower()
-                if choice == 'y':
-                    # Append to InvestigatorAgent.md
+                # Re-validate at promotion. A rule may have been queued before
+                # the validator existed, or by a different code path.
+                violations = validate_learning_rule(proposed)
+                if violations:
+                    print("REJECTED by validation, cannot be promoted:")
+                    for violation in violations:
+                        print(f"  - {violation}")
+                    continue
+
+                # The exact diff, so approval is informed rather than nominal.
+                addition = f"\n- CRITICAL RULE: {proposed}\n"
+                print(f"\nThis will append to {os.path.basename(target_file)}:")
+                print("-" * 70)
+                for diff_line in addition.strip("\n").splitlines():
+                    print(f"+ {diff_line}")
+                print("-" * 70)
+                print("It becomes part of the system prompt for EVERY future packet.")
+
+                choice = input("Type 'promote' to apply, anything else to skip: ").strip()
+                if choice == "promote":
                     with open(target_file, "a", encoding="utf-8") as f_target:
-                        f_target.write(f"\n- CRITICAL RULE: {entry.get('proposed_rule')}\n")
+                        f_target.write(addition)
 
-                    # Commit via git
-                    commit_msg = f"Add learning rule from event {entry.get('eventId')}"
-                    subprocess.run(["git", "add", target_file], check=True)
-                    subprocess.run(["git", "commit", "-m", commit_msg], check=True)
-                    print("Rule promoted and committed.")
+                    print("Rule promoted.")
                     promoted_count += 1
                     promoted_raw_lines.add(line.strip())
+
+                    if auto_commit:
+                        commit_msg = f"Add learning rule from event {entry.get('eventId')}"
+                        subprocess.run(["git", "add", target_file], check=True)
+                        subprocess.run(["git", "commit", "-m", commit_msg], check=True)
+                        print("Committed.")
                 else:
                     print("Rule skipped.")
             except Exception as e:
@@ -90,4 +129,13 @@ def promote_rules():
         promo_lock.release()
 
 if __name__ == "__main__":
-    promote_rules()
+    parser = argparse.ArgumentParser(
+        description="Review and promote Reviewer-proposed learning rules."
+    )
+    parser.add_argument(
+        "--commit", action="store_true",
+        help="Also git-commit each promotion. Off by default so promoting and "
+             "committing stay separate decisions -- an auto-commit makes an "
+             "unreviewed prompt change look reviewed.",
+    )
+    promote_rules(auto_commit=parser.parse_args().commit)

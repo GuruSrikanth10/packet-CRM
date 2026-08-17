@@ -253,7 +253,6 @@ def test_fetch_logs_node_passes_identifiers_through(monkeypatch):
 def test_live_db_query_uses_named_binds(monkeypatch):
     """The old "%s" + tuple form is DBAPI paramstyle and fails against a
     SQLAlchemy 2.x Engine. Exercised here with SQLite in memory."""
-    import pandas as pd
     from sqlalchemy import create_engine
 
     engine = create_engine("sqlite:///:memory:")

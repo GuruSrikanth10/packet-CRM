@@ -8,7 +8,6 @@ Phase E regression tests (ENHANCEMENT_PLAN.md section 5).
 """
 import json
 
-import pytest
 
 from src.models.synthesis import (
     SynthesisResult,
@@ -228,7 +227,6 @@ def test_only_listed_codes_may_serve(monkeypatch):
 def test_a_non_allowlisted_code_shadows_instead_of_serving(monkeypatch):
     """It keeps running the agents and is compared against them -- which is
     how it earns its way onto the allowlist."""
-    import src.core.agent_orchestrator as orch
     from src.utils import runbook_store
 
     monkeypatch.setenv("RUNBOOK_MODE", "serve")

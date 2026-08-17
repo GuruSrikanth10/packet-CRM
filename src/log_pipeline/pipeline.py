@@ -9,7 +9,6 @@ Flow:
     -> ERROR path:   trim to error + context, format, return
     -> Normal path:  Stage 3 (cluster) -> Stage 4 (guardrails) -> format, return
 """
-import json
 import os
 
 from src.log_pipeline import redaction

@@ -8,8 +8,7 @@ Scope note: these prove the seams are correct and the contracts match. They
 do NOT prove two live replicas coordinate -- that needs a real S3 bucket,
 Postgres, and Kafka broker. See the Phase F notes in ENHANCEMENT_PLAN.md.
 """
-import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

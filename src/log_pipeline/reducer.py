@@ -5,9 +5,7 @@ Stage 2: Branch on ERROR presence.
 Stage 3: Drain3 clustering with persisted state.
 Stage 4: Evidence assembly guardrails.
 """
-import json
 import os
-import re
 import threading
 from typing import Optional
 

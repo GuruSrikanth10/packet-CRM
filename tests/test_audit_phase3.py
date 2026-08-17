@@ -11,7 +11,6 @@ G13 -- one definition per path.
 G14 -- LOG_MAX_DOCUMENTS is read at call time.
 N1  -- the shadow report is the promotion gate.
 """
-import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -351,7 +350,7 @@ def test_retry_prompt_includes_the_logs():
 
 def test_paths_have_a_single_definition():
     from src.log_pipeline import config
-    from src.tools import build_runbooks, prune_checkpoints
+    from src.tools import build_runbooks
     from src.utils import paths
 
     assert config.DRAIN3_STATE_DIR == paths.DRAIN3_STATE_DIR

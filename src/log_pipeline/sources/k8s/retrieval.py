@@ -25,7 +25,7 @@ from concurrent.futures import (
     as_completed,
 )
 from dataclasses import dataclass, field
-from typing import Callable, Iterator, Optional
+from typing import Iterator, Optional
 
 from src.log_pipeline.sources.k8s import client as k8s_client_module
 from src.log_pipeline.sources.k8s import fixtures

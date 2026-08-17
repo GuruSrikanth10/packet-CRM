@@ -6,7 +6,6 @@ snapshot reuse behind the same protocol the Elasticsearch source implements,
 so Stages 2-4 cannot tell the two apart.
 """
 import time
-from typing import Optional
 
 import pybreaker
 

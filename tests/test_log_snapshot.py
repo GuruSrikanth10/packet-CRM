@@ -7,8 +7,6 @@ lag, DLQ replays, staleness resumption, and the retry loop.
 """
 import json
 import time
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 

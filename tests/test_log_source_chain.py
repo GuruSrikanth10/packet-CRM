@@ -5,7 +5,7 @@ Phase 9 of KUBERNETES_LOGS_PLAN.md -- the source chain going live.
 behaves exactly as it did until an operator opts in.
 """
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from elasticsearch import ConnectionError as ESConnectionError

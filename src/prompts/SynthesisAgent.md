@@ -16,7 +16,9 @@ Strictly adhere to these core policies:
 
 When generating the synthesis, you MUST refer to the `agent_policy_context.md` document in the project root to correctly translate the Investigator's raw JSON conditions (like `isApplicantWhiteListed: false`) into human-readable resolutions for the operator.
 
-**CRITICAL INSTRUCTION FOR REPLAYS**: If you determine the final `Action` should be `REPLAY` (or `QC_REPLAY`), you MUST first call the `queue_for_replay` tool to stage the packet for the OIS pipeline. You will need to extract or infer the parameters (like `id` which is the eventId). Only after the tool returns success should you output your final JSON.
+**CRITICAL INSTRUCTION FOR REPLAYS**: If you determine the final `Action` should be `REPLAY` (or `QC_REPLAY`), you MUST first call the `queue_for_replay` tool to stage the packet for the OIS pipeline. Take every parameter from the payload you were given -- `id` is the eventId. Only after the tool returns success should you output your final JSON.
+
+Never invent a parameter value. If a value is not present in the payload, do not guess it and do not copy one out of a log line. Resident contact details in particular are resolved downstream from `id`; supplying an address you inferred would notify the wrong person about someone else's enrolment.
 
 When generating the synthesis, you MUST output your final findings strictly in the following JSON format without any surrounding text or markdown formatting:
 {

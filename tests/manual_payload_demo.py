@@ -1,7 +1,17 @@
-import json
-import sys
+"""Manual demo: parse a real rejection payload and print what was extracted.
+
+    python3 tests/manual_payload_demo.py
+
+Renamed off the `test_*.py` pattern. As `test_payload.py` at the repo root it
+matched pytest discovery and ran its module-level code on collection, while
+never asserting anything -- so it looked like a test and tested nothing
+(G22b).
+"""
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from src.models.schemas import MessagePayload
 
 reject_json = """{

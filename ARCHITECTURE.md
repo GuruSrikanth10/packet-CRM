@@ -288,7 +288,7 @@ because the mapping is not derivable from the payload alone.
 For repeated rejections, the system implements a Runbook pattern to short-circuit the multi-minute LLM loop.
 - **Drafting (Offline)**: `build_runbooks.py` mines `local_casesheets/` for completed resolutions sharing the same `errorReasonCode` and `enrolmentType`. It uses a strictly prompted LLM (the `simple` tier) to synthesize a generic resolution template that contains zero packet-specific values (enforced by a regex validator checking for UUIDs, dates, SRNs, etc.). The result is saved to `src/runbooks/draft/`.
 - **Promotion (Offline)**: `promote_runbooks.py` acts as a human review gate. Operators inspect the generic template and approve it. The tool checks for rule fingerprint staleness, bumps the version, and git-commits the final template to `src/runbooks/final/`.
-- **Serving (Online)**: A `runbook_lookup` node runs immediately after `fetch_logs`. If `RUNBOOK_MODE=serve` and a final runbook matches the current packet's reason code (with the `rule_fingerprint` matching the live DB rule), the graph short-circuits the agents and directly emits the runbook's generic resolution. To preserve auditability, `resolution.source` in the casebook is marked with `runbook:<id>@v<version>`. If `RUNBOOK_MODE=shadow`, the agents still run and any divergence is logged. `RUNBOOK_SERVE_ALLOWLIST` narrows `serve` to specific reason codes: a code not on the list keeps running the agents and is shadow-compared, which is how it earns its place. (Until 2026-08-15 the fingerprint check raised `TypeError` and DLQ'd every runbook-matching packet -- see ENHANCEMENT_PLAN.md F2.)
+- **Serving (Online)**: A `runbook_lookup` node runs immediately after `fetch_logs`. If `RUNBOOK_MODE=serve` and a final runbook matches the current packet's reason code (with the `rule_fingerprint` matching the live DB rule), the graph short-circuits the agents and directly emits the runbook's generic resolution. To preserve auditability, `resolution.source` in the casebook is marked with `runbook:<id>@v<version>`. If `RUNBOOK_MODE=shadow`, the agents still run and any divergence is logged. `RUNBOOK_SERVE_ALLOWLIST` narrows `serve` to specific reason codes: a code not on the list keeps running the agents and is shadow-compared, which is how it earns its place. (Until 2026-08-15 the fingerprint check raised `TypeError` and DLQ'd every runbook-matching packet.)
 
 ### 3.10 Kubernetes Log Source (`src/log_pipeline/sources/k8s/`)
 Elasticsearch is the primary log source and system of record, but it can drop lines under heavy load or indexing delays. The Kubernetes log source reads pod logs directly from the kubelet API to cover those gaps. **It is supplementary, not a replacement.** The full design is documented in `KUBERNETES_LOGS_PLAN.md`.
@@ -419,14 +419,11 @@ python3 -m src.tools.eval_harness --test-cases test_cases.json # Stage 6 evaluat
 This section records where the running code diverges from the design intent above.
 It is maintained deliberately so the document stays a truthful source of truth.
 
-**Update 2026-08-15:** a second full audit produced `ENHANCEMENT_PLAN.md`
-(findings F1-F22) and Phases A-F of it are now implemented. The table below
-predates that work; `ENHANCEMENT_PLAN.md` section 7 is the current,
-authoritative list of what remains undone and why.
+**Update 2026-08-15:** Second full audit completed and Phases A-F are now implemented. 
 
 The Phase 0 (correctness-breaking, P0), Phase 1 (reliability/operability, P1),
-and Phase 2 (optimization, P2) items from the remediation plan
-(`REMEDIATION_PLAN.md`) have all been implemented, covered by
+and Phase 2 (optimization, P2) items from the past remediation plans
+have all been implemented, covered by
 `tests/test_phase0_fixes.py`, `tests/test_phase1_fixes.py`, and
 `tests/test_phase2_fixes.py` respectively -- with one deliberate exception (2.9,
 below). What remains:
@@ -437,4 +434,4 @@ below). What remains:
 | 2 | Template catalog not yet rebuilt | `build_catalog.py` no longer inherits the Drain3 cross-flow leak (fixed at the source in `reducer.cluster_logs`), and now warns if the boilerplate share of a build is implausibly high, but this requires live ES access to real event IDs to actually run -- no catalog has been (re)built under the fixed pipeline yet. |
 | 3 | Rate limiter eviction strategy (Phase 2, 2.9) | `routes.py`'s in-memory rate limiter still scans all tracked IPs with a `max()` per entry once past 1000 entries. Left as-is deliberately -- the remediation plan itself notes this is cheap at current request volume, and recommends revisiting with a per-IP `deque` only if that volume grows; not a currently-observable problem. |
 
-See `AUDIT_2026_08.md` for the current active audit and enhancement plan this architecture tracks against.
+
