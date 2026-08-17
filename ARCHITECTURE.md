@@ -9,11 +9,44 @@ When a packet fails enrollment or deduplication (e.g., due to a `RESIDENT_MAN_DE
 
 ## 1. High-Level Workflow
 
+Ingestion is split into two independently-scalable stages -- fetching
+Kubernetes/Elasticsearch logs (bounded, fast I/O) and running the LLM
+investigation (unbounded, slow) -- so a backlog in the LLM stage can never
+stall log collection and let short-retention Kubernetes logs rotate away
+before a packet is even fetched. See section 3.11 for the full design.
+
+### 1.1 Two-Stage Ingestion
+
 ```mermaid
 sequenceDiagram
-    participant K as Kafka Queue
-    participant C as Background Consumer
-    participant API as FastAPI (/process-rejection)
+    participant K1 as Kafka: rejections
+    participant FC as fast_consumer.py
+    participant API as FastAPI (/fetch-logs)
+    participant FS as CasebookStorage
+    participant K2 as Kafka: analysis-queue
+    participant SC as slow_consumer.py
+    participant API2 as FastAPI (/analyze-rejection)
+
+    K1->>FC: Push Rejected Packet JSON
+    FC->>FC: Filter packetStatus == "REJECTED"
+    FC->>API: HTTP POST /fetch-logs
+    API->>API: Fetch Kubernetes + Elasticsearch logs
+    API->>FS: Persist fetched_logs.txt + status.json (LOGS_FETCHED)
+    API->>K2: Republish the payload
+    API-->>FC: 200 OK
+
+    K2->>SC: Push the same payload
+    SC->>API2: HTTP POST /analyze-rejection
+    Note over API2,FS: See section 1.2 -- runs the LangGraph orchestration,<br/>reading logs already persisted by /fetch-logs
+    API2->>FS: Save terminal casebook.json + status.json
+```
+
+### 1.2 Analysis Workflow (inside POST /analyze-rejection)
+
+```mermaid
+sequenceDiagram
+    participant SC as Slow Consumer
+    participant API as FastAPI (/analyze-rejection)
     participant M as RejectionManagerAgent
     participant RB as Runbook Store
     participant LF as LogFilterAgent
@@ -21,14 +54,15 @@ sequenceDiagram
     participant R as ReviewerAgent
     participant S as SynthesisAgent
     participant T as Tool Registry
-    participant FS as Local Filesystem
+    participant FS as CasebookStorage
 
-    K->>C: Push Rejected Packet JSON
-    C->>C: Filter packetStatus == "REJECTED"
-    C->>API: HTTP POST /process-rejection
+    SC->>API: HTTP POST /analyze-rejection
     
     API->>API: Validate via Pydantic (MessagePayload)
     API->>M: Invoke Orchestrator
+
+    M->>FS: fetch_logs_node reads fetched_logs.txt
+    Note over M,FS: Cache hit (the normal path): no live fetch.<br/>Cache miss falls back to a live fetch inline --<br/>e.g. direct /process-rejection or local_run.py use.
     
     M->>RB: Lookup runbook by (reason_code, enrolment_type)
     alt Runbook Hit (RUNBOOK_MODE=serve)
@@ -78,7 +112,7 @@ packet-CRM/
 ├── .agents/
 │   └── AGENTS.md                   # Agentic configurations and behavioral rules
 ├── agent_policy_context.md         # Foundational business logic & rules mapping for AI agents
-├── start.py                        # Process supervisor: spawns main_api.py + main_consumer.py
+├── start.py                        # Process supervisor: spawns main_api.py + fast_consumer.py + slow_consumer.py
 ├── local_run.py                    # CLI: POST a local packet JSON to the running API
 ├── test_payload.py                 # Static Pydantic validation smoke test
 ├── rules.csv                       # Rules export used by check_drift.py
@@ -102,9 +136,10 @@ packet-CRM/
 │   └── test_k8s_retry.py           # Kubernetes HTTP retry logic tests
 ├── src/
 │   ├── main_api.py                 # FastAPI entry point (uvicorn, port 8000)
-│   ├── main_consumer.py            # Kafka consumer entry point (separate process)
+│   ├── fast_consumer.py            # Fast consumer entry point: rejections -> /fetch-logs
+│   ├── slow_consumer.py            # Slow consumer entry point: analysis queue -> /analyze-rejection
 │   ├── api/
-│   │   └── routes.py               # REST endpoints (/process-rejection, /health, /ready)
+│   │   └── routes.py               # REST endpoints (/fetch-logs, /analyze-rejection, /process-rejection, /health, /ready)
 │   ├── core/
 │   │   └── agent_orchestrator.py   # LangGraph StateGraph build + LLM provisioning
 │   ├── models/
@@ -164,10 +199,11 @@ packet-CRM/
 │       ├── paths.py                # Centralized path constants (CHECKPOINT_DB_PATH, etc.)
 │       ├── config_validator.py     # Fail-fast boot-time configuration validation
 │       ├── logging_config.py       # structlog JSON logging setup
-│       ├── kafkaConsumer.py        # Background topic polling + bounded worker pool
+│       ├── kafkaConsumer.py        # Background topic polling + bounded worker pool (CONSUMER_ROLE=fast|slow)
 │       ├── llm_utils.py            # LLM factory (local OpenAI-compatible / Mistral / HF)
 │       ├── resilience.py           # tenacity retries + pybreaker circuit breakers
 │       ├── dlq_publisher.py        # Dead Letter Queue producer
+│       ├── analysis_queue_publisher.py # Publishes fetched payloads onto the analysis queue
 │       ├── s3_uploader.py          # Uploads large Elastic logs to S3
 │       ├── runbook_store.py        # Runbook load/save, TTL cache, fingerprinting, path guard
 │       └── runbook_validator.py    # Generic-text regex validator (no UUIDs/dates/SRNs)
@@ -204,7 +240,7 @@ default OpenAI-compatible) actually reads, not a hardcoded `OPENAI_API_KEY`.
 ### 3.3 Core Pipeline (Deterministic StateGraph)
 Instead of relying on an unpredictable LLM to orchestrate the subagents, the system uses a highly robust, strictly deterministic Python `StateGraph` (via `langgraph`) in `src/core/agent_orchestrator.py`. This ensures the exact sequential execution of every step.
 
-1. **Log Fetcher Node**: (If `ENABLE_LOG_FETCHING=true`) Automatically triggers the `fetch_elastic_logs` tool to pull relevant Kibana traces using the `eventId`.
+1. **Log Fetcher Node**: Cache-first (section 3.11). Reads `fetched_logs.txt` from `CasebookStorage` -- persisted by `POST /fetch-logs` before `/analyze-rejection` ever invokes the graph -- and uses it directly if present, with no live fetch. Only when that artifact is absent (a direct `/process-rejection` call, `local_run.py`, or any caller that invokes the graph without going through `/fetch-logs` first) does it fall back to fetching live: if `ENABLE_LOG_FETCHING=true`, `fetch_and_persist_logs` triggers the same log-reduction pipeline (`fetch_logs_for`) to pull relevant Kibana/Kubernetes traces using the `eventId` and persists the result for next time.
 2. **Runbook Lookup Node**: Checks `RUNBOOK_MODE` (off/serve/shadow). If `serve`, it looks up a final runbook by `(reason_code, enrolment_type)` in `src/runbooks/final/`, verifies the DB rule fingerprint hasn't changed, and short-circuits the graph directly to `END` with the pre-built resolution (no LLM calls). In `shadow` mode, it records the runbook match but lets the agents run normally; `synthesis_node` later compares the two results and logs any divergence. If `off` (the default) or no runbook matches, it falls through to the Investigator.
 3. **Investigator Node**: A React agent constructed with an **empty tool list**. All external lookups are performed deterministically in Python before the call: `lookup_rule_by_reason_code` is invoked by the node itself, the result is filtered by `enrolmentType`, and the rule text is injected into the prompt. This removes a whole class of tool-call hallucination and redundant DB round-trips. The prompt is projected down to only the fields the Investigator needs (`eventId`, `packetMetaData`, `packetExecutionSummary`, `flowMetaData.stage`) rather than the full raw Kafka message, and on a retry it sends only the delta -- the prior investigation plus the Reviewer's feedback -- instead of resending the full payload/logs/rule context again.
 4. **Reviewer Node**: A distinct React agent, built once at graph-construction time (not per review) and bound to the `simple` LLM tier, that acts as a strict QC validator holding one tool (`add_learning_rule`). The tool no longer closes over the current `event_id`/investigation text per call -- it reads them from a pair of `contextvars.ContextVar`s that `reviewer_node` sets before each invocation, since each packet already runs on its own dedicated thread.
@@ -214,19 +250,19 @@ Instead of relying on an unpredictable LLM to orchestrate the subagents, the sys
 
 ### 3.4 Resilience & Hardening (Phase 1 & 2)
 The architecture incorporates several resilience mechanisms to prevent runaway costs, silent failures, file corruption, and pipeline deadlocks:
-- **Idempotency & Staleness Guards**: The API intercepts requests and validates against the `CasebookStorage` interface. `IN_PROGRESS` stubs are written immediately to a separate `status.json` file to prevent duplicate runs without polluting the final `casebook.json`. Upon successful completion, `status.json` is overwritten with the terminal status. If an `IN_PROGRESS` stub goes stale (exceeding `MAX_IN_PROGRESS_AGE_SECONDS`), the pipeline safely resumes from a LangGraph checkpoint or fresh start. Terminal statuses include `COMPLETED`, `REJECTED`, `NEEDS_MANUAL_REVIEW`, `FAILED_PERMANENT`, `DLQ`, and `FAILED_TIMEOUT`.
+- **Idempotency & Staleness Guards**: The API intercepts requests and validates against the `CasebookStorage` interface. `IN_PROGRESS` stubs are written immediately to a separate `status.json` file to prevent duplicate runs without polluting the final `casebook.json`. Upon successful completion, `status.json` is overwritten with the terminal status. If an `IN_PROGRESS` stub goes stale (exceeding `MAX_IN_PROGRESS_AGE_SECONDS`), the pipeline safely resumes from a LangGraph checkpoint or fresh start. Terminal statuses include `COMPLETED`, `REJECTED`, `NEEDS_MANUAL_REVIEW`, `FAILED_PERMANENT`, `DLQ`, and `FAILED_TIMEOUT`. `POST /fetch-logs` writes a non-terminal `LOGS_FETCHED` status ahead of `IN_PROGRESS` (section 3.11); it only ever advances `status.json` from absent/`LOGS_FETCHED`, never overwriting an `IN_PROGRESS` or terminal status a concurrent `/analyze-rejection` call may already have written, so a redelivered fetch can't hide the marker that `_investigate_packet`'s own dedupe guard depends on.
 - **6-Stage Log Reduction Pipeline (`src/log_pipeline/`)**: Elasticsearch logs are no longer dumped raw into the LLM context. Instead, they pass through a production-grade pipeline: Stage 1 (source-filtered fetch with `search_after` and an `_id` tiebreaker for broad ES version compatibility, a hard `LOG_MAX_DOCUMENTS` cap, TLS verification on by default (`ES_VERIFY_CERTS`), and local Kibana CSV mock support via `ES_MOCK_FILE` for offline testing), Stage 2 (branch on ERROR -- stuck packets skip clustering, with both a leading *and* trailing context window so a cascading failure can't pull in the entire trace), Stage 3 (Drain3 clustering with file-persisted state for stable template IDs, held as a process-wide `TemplateMiner` singleton so the state file is only read/deserialized once per process rather than per packet, serialized by a thread lock + cross-process `FileLock` so concurrent packets can't corrupt the shared parse tree, and scoped to emit only the clusters this call's own logs actually matched -- never another packet's templates), and Stage 4 (evidence assembly guardrails enforcing decision-vocabulary regex matches, rare-template retention, and flow-boundary context). An offline Stage 0 catalog (`build_catalog.py`) classifies templates as boilerplate/informative/decision-marker and flags an implausibly high boilerplate share, and a Stage 6 eval harness (`eval_harness.py`) validates pipeline accuracy before production use.
 - **Pluggable Log Sources (`src/log_pipeline/sources/`)**: Stage 1 sits behind a `LogSource` Protocol (mirroring `CasebookStorage`), so Stages 2-4 are source-agnostic -- any source emitting the canonical `LogRecord` (`timestamp`/`level`/`message`/`app_name`, defined in `src/log_pipeline/types.py`) works with Drain3 clustering, the guardrails, the S3 offload, and the casebook wiring unchanged. `ElasticLogSource` wraps the existing fetcher without modifying it, so the `ES_MOCK_FILE` CSV workflow is unchanged. See section 3.10 for the Kubernetes log source and the fallback chain architecture.
-- **Decoupled Consumer, Bounded Concurrency, & At-Least-Once Delivery**: `main_consumer.py` isolates the Kafka polling loop and submits tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`). To guarantee At-Least-Once delivery and prevent consumer rebalances during slow AI processing, the consumer is configured with `KAFKA_MAX_POLL_RECORDS` and a high `KAFKA_MAX_POLL_INTERVAL_MS`. Offsets are never committed immediately upon enqueuing; instead, background threads pass successfully completed offsets back to the main thread via a thread-safe `queue.Queue`, which the main polling loop safely commits. If a crash or 429 error occurs, the offset is not queued, and Kafka safely redelivers the packet.
+- **Decoupled Fetch/Analyze Consumers, Bounded Concurrency, & At-Least-Once Delivery**: `fast_consumer.py` and `slow_consumer.py` (both thin entry points over `src/utils/kafkaConsumer.py`, selected by `CONSUMER_ROLE`; section 3.11) each isolate their own Kafka polling loop and submit tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`, sized independently per process). To guarantee At-Least-Once delivery and prevent consumer rebalances during slow AI processing, each consumer is configured with `KAFKA_MAX_POLL_RECORDS` and a high `KAFKA_MAX_POLL_INTERVAL_MS`. Offsets are never committed immediately upon dispatch; instead, an `OffsetTracker` records completions and each poll cycle commits only the safe low-water mark -- the highest offset below which every dispatched message on that partition has completed -- so a batch that finishes out of order can never commit past one still in flight. If a crash or 429 error occurs, the offset is not marked complete, and Kafka safely redelivers the packet.
 - **DLQ, Poison-pill, & Checkpointing**: LangGraph uses `SqliteSaver` (with WAL mode enabled) for scalable crash recovery. Structurally invalid Kafka messages (poison-pills) and unrecoverable pipeline crashes are immediately published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
-- **Pipeline Timeouts**: `PACKET_TIMEOUT_SECONDS` bounds the **consumer-side HTTP client** in `kafkaConsumer.py`. The API side is independently bounded too: `routes.py` runs `agent.invoke()` on a dedicated executor thread with its own budget (`AGENT_INVOKE_TIMEOUT_SECONDS`, defaulting to `PACKET_TIMEOUT_SECONDS - 30s`) so the server is authoritative about its own failure and returns `FAILED_TIMEOUT` before the consumer's deadline fires. Both the LLM clients (`LLM_TIMEOUT_SECONDS`, `max_retries=0`) and `agent.invoke` are bounded. If a terminal `FAILED_TIMEOUT`/`DLQ` status is already recorded by the time a slow invocation finally returns, that late result is discarded rather than overwriting it.
+- **Pipeline Timeouts**: `PACKET_TIMEOUT_SECONDS` bounds the **slow consumer's HTTP client** waiting on `/analyze-rejection` -- the LLM investigation budget, same variable and meaning this had before the fetch/analyze split. The fast consumer gets its own, much shorter `FAST_CONSUMER_TIMEOUT_SECONDS` for the bounded `/fetch-logs` call. The API side is independently bounded too: `routes.py` runs `agent.invoke()` (from `/analyze-rejection` or `/process-rejection`) on a dedicated executor thread with its own budget (`AGENT_INVOKE_TIMEOUT_SECONDS`, defaulting to `PACKET_TIMEOUT_SECONDS - 30s`) so the server is authoritative about its own failure and returns `FAILED_TIMEOUT` before the consumer's deadline fires. `/fetch-logs` has no equivalent dedicated executor -- it's bounded I/O (`K8S_TOTAL_FETCH_TIMEOUT_SECONDS`, `ES_REQUEST_TIMEOUT_SECONDS`), not a multi-minute LLM call, so it runs on Starlette's own sync-dispatch threadpool like `/health`/`/ready`. Both the LLM clients (`LLM_TIMEOUT_SECONDS`, `max_retries=0`) and `agent.invoke` are bounded. If a terminal `FAILED_TIMEOUT`/`DLQ` status is already recorded by the time a slow invocation finally returns, that late result is discarded rather than overwriting it.
 - **Human-in-the-Loop Replays**: Agents cannot fire destructive API requests directly. Unless `ENABLE_AUTO_REPLAY=true`, replay actions invoked by the LLM are queued to `src/db/pending_replays.jsonl` under a `filelock` and require an operator to approve via `approve_replays.py`. Both the auto-replay call and `approve_replays.py` send the replay payload as an authenticated (`OIS_API_KEY`) JSON body rather than query params, so PII like `notificationEmail`/`notificationMobile` doesn't land in server access logs. `approve_replays.py` re-reads the queue file fresh before its final rewrite so replays queued mid-review by a live investigation aren't erased.
 - **Safe Self-Learning & Drift Checks**: The Reviewer's `add_learning_rule` tool stages suggestions to `src/prompts/pending_rules.jsonl` using `filelock`. A human runs `src/tools/promote_rules.py` (which includes top-level locking and git-status safety checks) to approve and Git-commit the rules; only promoted entries are removed from the pending file, so skipped/errored/concurrently-appended entries survive. Additionally, `src/tools/check_drift.py` detects database schema/policy drift, and distinguishes a genuinely changed schema from a malformed single-column CSV export.
 - **External Call Resilience**: `tenacity` handles exponential backoff retries, and `pybreaker` provides circuit breakers for database, Elasticsearch, and LLM calls.
 - **Storage Abstraction & Schema Versioning**: The `CasebookStorage` interface implements atomic `.tmp` writes and enforces a `"schema_version"` field on every saved casebook for backwards compatibility.
-- **Structured Logging & Health Checks**: `agent_orchestrator.py`, `tool_registry.py`, `kafkaConsumer.py`, `dlq_publisher.py`, `s3_uploader.py` and the entire `log_pipeline/` package log through the same `structlog` logger as `routes.py` (bound to `event_id` where available) rather than bare `print()`. Verbosity is set by `LOG_LEVEL`. The operator CLIs still print to stdout deliberately -- they are interactive tools, not services. The FastAPI server provides `/health` (monitoring consumer heartbeats) and `/ready` (verifying SQLite and Kafka producer connectivity) endpoints; the Kafka producer check is cached for `PRODUCER_HEALTH_TTL_SECONDS` (default 30s) so a burst of readiness probes can't each force a fresh broker connection attempt. `validate_config()` provides fail-fast configuration validation at boot.
+- **Structured Logging & Health Checks**: `agent_orchestrator.py`, `tool_registry.py`, `kafkaConsumer.py`, `dlq_publisher.py`, `analysis_queue_publisher.py`, `s3_uploader.py` and the entire `log_pipeline/` package log through the same `structlog` logger as `routes.py` (bound to `event_id` where available) rather than bare `print()`. Verbosity is set by `LOG_LEVEL`. The operator CLIs still print to stdout deliberately -- they are interactive tools, not services. The FastAPI server provides `/health` (reporting both the fast and slow consumers' heartbeats, under `fast_consumer`/`slow_consumer`, plus a top-level `last_heartbeat`/`consumer_alive` alias for the fast consumer that predates the split) and `/ready` (verifying SQLite and Kafka producer connectivity) endpoints; the Kafka producer check is cached for `PRODUCER_HEALTH_TTL_SECONDS` (default 30s) so a burst of readiness probes can't each force a fresh broker connection attempt. `validate_config()` provides fail-fast configuration validation at boot.
 - **Agent Caching**: Investigator, Synthesis, and Reviewer React agents are all created once at graph construction time and reused across invocations, avoiding per-packet (and, for the Reviewer, per-retry) LLM handshake overhead.
-- **Non-Blocking Request Handling**: `/process-rejection` is `async def`; `agent.invoke()` runs on a dedicated `ThreadPoolExecutor` sized to `MAX_CONCURRENT_INVESTIGATIONS`, separate from Starlette's own sync-dispatch threadpool. A multi-minute investigation therefore can't starve `/health`, `/ready`, or the sync auth/rate-limit dependencies of a worker slot.
+- **Non-Blocking Request Handling**: `/process-rejection` and `/analyze-rejection` are both `async def`; `agent.invoke()` runs on a dedicated `ThreadPoolExecutor` sized to `MAX_CONCURRENT_INVESTIGATIONS`, separate from Starlette's own sync-dispatch threadpool. A multi-minute investigation therefore can't starve `/health`, `/ready`, `/fetch-logs`, or the sync auth/rate-limit dependencies of a worker slot. `/fetch-logs` is deliberately plain `def`, not `async def` -- its bounded I/O runs on Starlette's own threadpool, the same one `/health`/`/ready` use, since it never needs the dedicated executor a multi-minute LLM call does.
 - **Indexed Mock Rule Lookups**: `lookup_rule_by_reason_code` builds a `reason_code -> row positions` index over the mock rules table once (cached for the process lifetime) instead of rescanning and re-casting every row on every lookup; a missing/unreadable mock DB file is also cached so the filesystem isn't re-probed on every call.
 - **Rate Limiter Eviction**: The in-memory IP rate limiter evicts stale entries when it exceeds 1000 tracked IPs to prevent unbounded memory growth.
 
@@ -333,6 +369,81 @@ Kubelet retention is short (roughly 10MB x 5 files per container), but investiga
 - `client.py`: Thin wrapper over `urllib3` / `kubernetes.client` for the Kubernetes API.
 - `retry.py`: Status-aware backoff: retries on 429/5xx with full jitter, never retries a 403 (RBAC misconfiguration should fail fast, not loop). Wrapped around all three Kubernetes API calls (`read_namespace`, `list_namespaced_pod`, `read_namespaced_pod_log`); `k8s_breaker` guards `KubernetesLogSource.fetch` so a cluster that is down entirely fails fast rather than costing every packet a full fan-out timeout.
 
+### 3.11 Fetch/Analyze Consumer Split
+
+Log fetching (bounded Kubernetes/Elasticsearch I/O) and LLM analysis
+(unbounded, minutes-long) used to run back-to-back inside one
+`agent.invoke()` call reached via one Kafka consumer. That coupled their
+scaling: the consumer's effective throughput was capped by LLM latency, and
+under any backlog a packet's Kubernetes pod logs -- short retention, roughly
+10MB x 5 files per container -- could rotate away before the packet was even
+fetched. The two stages are now fully decoupled, each independently
+scalable, connected by a second Kafka topic.
+
+**Topics, consumers, routes:**
+
+| | Topic (default) | Consumer | Route |
+|---|---|---|---|
+| Fetch | `rejections` (`KAFKA_CONSUMER_TOPIC_NAME`) | `src/fast_consumer.py` | `POST /fetch-logs` |
+| Analyze | `packet-analysis-queue` (`PACKET_ANALYSIS_TOPIC_NAME` / `SLOW_CONSUMER_TOPIC_NAME`) | `src/slow_consumer.py` | `POST /analyze-rejection` |
+
+Both consumers are thin entry points over the same, otherwise-unmodified
+`src/utils/kafkaConsumer.py` engine -- the offset tracker, rebalance
+listener, heartbeat, health server, bounded worker pool, DLQ routing, and
+graceful shutdown drain are all identical code, reused rather than
+duplicated. Each entry point sets `CONSUMER_ROLE` (`fast`/`slow`) before
+importing the module, which is what selects that process's topic, group id,
+internal endpoint, per-message timeout, heartbeat file, and health port --
+see the `CONSUMER_ROLE` block at the top of `kafkaConsumer.py`. No
+role-specific branching exists anywhere else in that file: the analysis
+queue carries the exact same payload the original topic did (still
+`packetStatus == "REJECTED"`, still validated by the same `MessagePayload`
+schema), so the existing poison-pill check and terminal-casebook dedupe are
+exactly the right guards for both roles, unchanged.
+
+**`POST /fetch-logs`** (fast consumer's target): fetches Kubernetes and
+Elasticsearch logs for the payload (`fetch_and_persist_logs` in
+`tool_registry.py` -- the same `ENABLE_LOG_FETCHING` check and
+`fetch_logs_for` call `fetch_logs_node` used to run itself), persists the
+result to `CasebookStorage` as `fetched_logs.txt`, writes a non-terminal
+`LOGS_FETCHED` status, and republishes the payload onto the analysis queue.
+It touches neither the LangGraph agent nor its checkpointer. It is
+idempotent on redelivery: an already-terminal event is skipped entirely, an
+already-fetched event reuses the persisted artifact instead of re-fetching,
+and it never overwrites a `status.json` that has already advanced to
+`IN_PROGRESS` or a terminal status (see 3.4's Idempotency bullet) -- so a
+duplicate delivery on the *original* topic can't reopen a dedupe race on the
+*analysis* side. Runs as a plain `def` route (Starlette's own sync
+threadpool), not `async def`, since the work is bounded I/O, not a
+multi-minute LLM call.
+
+**`POST /analyze-rejection`** (slow consumer's target): byte-for-byte the
+same body as `/process-rejection` -- both call the same `_investigate_packet`
+under the same metrics/in-flight-tracking wrappers, because that function has
+no idea, and no need to know, where `state["logs"]` came from. The only
+thing that differs in practice is *how* `fetch_logs_node` gets its logs.
+
+**Checkpoint and state safety.** The graph itself (node set, edges,
+`thread_id = event_id` checkpointer keying in `agent_orchestrator.py`) is
+completely unchanged by this split. `fetch_logs_node` is cache-first: it
+checks `CasebookStorage.load_artifact(event_id, "fetched_logs.txt")` first
+and returns that if present (the normal path once `/fetch-logs` has run);
+only when it's absent does it fall back to a live fetch, via the same
+`fetch_and_persist_logs` function `/fetch-logs` uses (which persists the
+artifact so a later retry doesn't re-fetch). That fallback is what keeps
+`/process-rejection`, `local_run.py`, and every pre-split test working
+unmodified -- none of them ever populate `fetched_logs.txt`, so they always
+take the live-fetch path, exactly as before the split -- and it's also what
+lets `/analyze-rejection` degrade gracefully if it's ever reached before
+`/fetch-logs` (a manual publish to the analysis queue, or a race). Because
+the artifact's presence (not its content) is what fetch_logs_node checks,
+even the "disabled"/"no logs found" sentinel strings are cached and treated
+as a completed fetch, never re-attempted.
+
+**Local development:** `start.py` spawns all three processes (API,
+`fast_consumer.py`, `slow_consumer.py`); no special per-child environment is
+needed since each consumer sets its own `CONSUMER_ROLE`. See section 4.
+
 ---
 
 ## 4. How to Run Locally
@@ -364,17 +475,20 @@ Kubelet retention is short (roughly 10MB x 5 files per container), but investiga
    `LLM_BASE_URL_COMPLEX` / `LLM_MODEL_COMPLEX`, and `PACKET_CRM_API_KEY`.
    For fully offline runs, set `ES_MOCK_FILE` to a Kibana CSV export.
 
-3. **Start both services:**
+3. **Start all three services:**
    ```bash
    python3 start.py
    ```
-   *This supervisor spawns `src/main_api.py` (FastAPI on port 8000) and
-   `src/main_consumer.py` (Kafka consumer) as two separate processes.*
+   *This supervisor spawns `src/main_api.py` (FastAPI on port 8000),
+   `src/fast_consumer.py` (rejections -> `/fetch-logs`), and
+   `src/slow_consumer.py` (analysis queue -> `/analyze-rejection`) as three
+   separate processes. See section 3.11 for the fetch/analyze split.*
 
    To run them individually:
    ```bash
    python3 src/main_api.py        # API only
-   python3 src/main_consumer.py   # Consumer only
+   python3 src/fast_consumer.py   # Fast consumer only
+   python3 src/slow_consumer.py   # Slow consumer only
    ```
 
 ### 4.2 API Documentation (Swagger UI)
@@ -418,6 +532,12 @@ python3 -m src.tools.eval_harness --test-cases test_cases.json # Stage 6 evaluat
 
 This section records where the running code diverges from the design intent above.
 It is maintained deliberately so the document stays a truthful source of truth.
+
+**Update 2026-08-17:** Log fetching and LLM analysis are decoupled into two
+Kafka topics, two consumer processes, and two API routes (section 3.11), so
+LLM backlog can no longer stall log collection. No catalog of remaining gaps
+from this change -- the split reuses the existing checkpointer, storage
+layer, and idempotency guards unmodified rather than introducing new ones.
 
 **Update 2026-08-15:** Second full audit completed and Phases A-F are now implemented. 
 

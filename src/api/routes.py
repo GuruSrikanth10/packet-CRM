@@ -24,8 +24,10 @@ from src.core.agent_orchestrator import get_agent, prompt_fingerprint
 from src.utils.s3_uploader import upload_logs_to_s3
 from src.storage.factory import get_casebook_storage
 from src.utils.dlq_publisher import publish_to_dlq
+from src.utils.analysis_queue_publisher import publish_to_analysis_queue
+from src.tools.tool_registry import fetch_and_persist_logs
 from src.utils.logging_config import get_logger
-from src.storage.base import PROTECTED_TERMINAL_STATUSES, TERMINAL_STATUSES
+from src.storage.base import LOGS_FETCHED_STATUS, PROTECTED_TERMINAL_STATUSES, TERMINAL_STATUSES
 
 logger = get_logger(__name__)
 
@@ -333,24 +335,40 @@ def health_check():
 
     The heartbeat fields are still emitted when the file is readable, so a
     single-host start.py deployment keeps the signal it had.
+
+    Since the fetch/analyze split (two consumers, each with its own
+    heartbeat file), this reports both under `fast_consumer`/`slow_consumer`
+    and keeps the original top-level `last_heartbeat`/`consumer_alive` keys
+    as an alias for the fast consumer -- the one `CONSUMER_HEARTBEAT_PATH`
+    already meant before the split -- so nothing that previously read those
+    top-level keys breaks.
     """
-    from src.utils.paths import CONSUMER_HEARTBEAT_PATH
+    from src.utils.paths import CONSUMER_HEARTBEAT_PATH, SLOW_CONSUMER_HEARTBEAT_PATH
+
+    def _heartbeat(path) -> dict:
+        # Co-located deployment only. Absent is absent, not dead: a
+        # split-pod deployment has no local heartbeat file for either
+        # consumer at all, and each consumer answers its own /health via
+        # CONSUMER_HEALTH_PORT / SLOW_CONSUMER_HEALTH_PORT instead.
+        try:
+            stamp = float(path.read_text(encoding="utf-8").strip())
+            return {"last_heartbeat": stamp, "alive": (time.time() - stamp) < 30}
+        except Exception:
+            return {"last_heartbeat": None, "alive": None}  # unknown, not false
+
+    fast = _heartbeat(CONSUMER_HEARTBEAT_PATH)
+    slow = _heartbeat(SLOW_CONSUMER_HEARTBEAT_PATH)
 
     payload = {
         "status": "draining" if _draining.is_set() else "up",
         "draining": _draining.is_set(),
         "in_flight": _in_flight_investigations(),
         "capacity": _MAX_CONCURRENT_INVESTIGATIONS,
+        "last_heartbeat": fast["last_heartbeat"],
+        "consumer_alive": fast["alive"],
+        "fast_consumer": fast,
+        "slow_consumer": slow,
     }
-
-    # Co-located deployment only. Absent is absent, not dead.
-    try:
-        stamp = float(CONSUMER_HEARTBEAT_PATH.read_text(encoding="utf-8").strip())
-        payload["last_heartbeat"] = stamp
-        payload["consumer_alive"] = (time.time() - stamp) < 30
-    except Exception:
-        payload["last_heartbeat"] = None
-        payload["consumer_alive"] = None  # unknown, not false
 
     return payload
 
@@ -449,6 +467,63 @@ def record_resolution_outcome(event_id: str, body: OutcomeRequest):
     return {"status": "recorded", "event_id": event_id, "verdict": outcome["verdict"]}
 
 
+@router.post("/fetch-logs", dependencies=[Depends(get_api_key), Depends(rate_limiter)])
+def fetch_logs(signal: MessagePayload):
+    """
+    Endpoint the FAST consumer forwards rejected packets to.
+
+    Fetches Kubernetes/Elasticsearch logs, persists them to CasebookStorage as
+    `fetched_logs.txt`, and republishes the payload onto the analysis queue
+    for the SLOW consumer to pick up. Does not touch the LangGraph agent or
+    its checkpointer at all -- that only happens in /analyze-rejection.
+
+    Deliberately NOT async: this work is bounded I/O
+    (K8S_TOTAL_FETCH_TIMEOUT_SECONDS, ES_REQUEST_TIMEOUT_SECONDS), not a
+    multi-minute LLM call, so it runs on Starlette's own sync-dispatch
+    threadpool -- the same one /health and /ready already use -- rather than
+    needing a dedicated bounded executor the way agent.invoke() does (2.6).
+    """
+    event_id = str(signal.eventId).strip()
+    signal_dict = signal.model_dump()
+    log = logger.bind(event_id=event_id)
+    storage = get_casebook_storage()
+
+    # Cheap no-op on a redelivered original-topic message once the packet is
+    # done -- mirrors the consumer's own terminal-only dedupe check.
+    current_status = storage.terminal_status(event_id)
+    if current_status in TERMINAL_STATUSES:
+        log.info("Skipping fetch; a terminal casebook already exists", recorded_status=current_status)
+        return {"status": "already_processed", "event_id": event_id}
+
+    if storage.artifact_exists(event_id, "fetched_logs.txt"):
+        log.info("Logs already fetched; reusing the persisted artifact")
+    else:
+        log.info("Fetching logs for the analysis queue")
+        fetch_and_persist_logs(event_id, signal_dict)
+
+    # Only advance status.json to LOGS_FETCHED from nothing/LOGS_FETCHED.
+    # /analyze-rejection may already have moved it to IN_PROGRESS (or a
+    # terminal status) by the time a redelivered original-topic message gets
+    # here -- overwriting that back to LOGS_FETCHED would hide the
+    # IN_PROGRESS marker from _investigate_packet's own dedupe/active-
+    # checkpoint guard and could let a second concurrent invocation of the
+    # same thread_id slip through. Republishing below is still safe and
+    # correct either way: the slow side's own dedupe is what actually
+    # prevents a duplicate LLM run, not this status write.
+    existing_status = storage.load(event_id, filename="status.json")
+    existing_status_value = (existing_status or {}).get("packet_status", {}).get("status")
+    if existing_status_value in (None, LOGS_FETCHED_STATUS):
+        storage.save(event_id, {
+            "packet_metadata": {"eid": event_id, "started_at": time.time()},
+            "packet_status": {"status": LOGS_FETCHED_STATUS},
+        }, filename="status.json")
+
+    publish_to_analysis_queue(signal_dict)
+
+    log.info("Queued for analysis", state=LOGS_FETCHED_STATUS)
+    return {"status": "queued_for_analysis", "event_id": event_id}
+
+
 @router.post("/process-rejection", dependencies=[Depends(get_api_key), Depends(rate_limiter)])
 async def process_rejection(signal: MessagePayload):
     """
@@ -458,12 +533,41 @@ async def process_rejection(signal: MessagePayload):
     async so that awaiting the (potentially multi-minute) agent.invoke() call
     below yields the event loop instead of occupying a slot in Starlette's
     sync-dispatch threadpool for the whole duration (2.6).
+
+    Kept as a synchronous, single-call legacy path alongside the
+    /fetch-logs + /analyze-rejection split: local_run.py and a number of
+    tests call this directly, and it remains correct unmodified because
+    fetch_logs_node (agent_orchestrator.py) falls back to a live fetch
+    whenever no /fetch-logs run has cached one first.
     """
     event_id = str(signal.eventId).strip()
     with _packet_metrics() as outcome, _tracked_in_flight(event_id):
         response = await _investigate_packet(signal, outcome)
         # Paths that did not classify themselves fall back to the response
         # status, so no exit path goes uncounted (G15).
+        if not outcome["status"]:
+            outcome["status"] = response.get("status", "unknown")
+        return response
+
+
+@router.post("/analyze-rejection", dependencies=[Depends(get_api_key), Depends(rate_limiter)])
+async def analyze_rejection(signal: MessagePayload):
+    """
+    Endpoint the SLOW consumer forwards packets to, once /fetch-logs has
+    persisted their logs.
+
+    Identical to /process-rejection -- same _investigate_packet, same
+    metrics wrapper, same in-flight tracking and shutdown drain -- because
+    _investigate_packet has no idea (and no need to know) where state["logs"]
+    came from; that is entirely fetch_logs_node's concern. The graph still
+    runs runbook_lookup first (bypassing the LLMs on a hit) exactly as
+    before; the only practical difference from /process-rejection is that
+    fetch_logs_node finds its logs already cached instead of fetching them
+    live.
+    """
+    event_id = str(signal.eventId).strip()
+    with _packet_metrics() as outcome, _tracked_in_flight(event_id):
+        response = await _investigate_packet(signal, outcome)
         if not outcome["status"]:
             outcome["status"] = response.get("status", "unknown")
         return response

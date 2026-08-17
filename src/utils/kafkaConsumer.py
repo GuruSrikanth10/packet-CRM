@@ -12,17 +12,56 @@ from pathlib import Path
 from .env import get_required_env
 from src.storage.factory import get_casebook_storage
 from src.utils.logging_config import get_logger
-from src.utils.paths import CONSUMER_HEARTBEAT_PATH
+from src.utils.paths import CONSUMER_HEARTBEAT_PATH, SLOW_CONSUMER_HEARTBEAT_PATH
 
 logger = get_logger(__name__)
 
 kafkaConsumerBrokers = [
     b.strip() for b in get_required_env("KAFKA_CONSUMER_BROKERS", "localhost:9092").split(",") if b.strip()
 ]
-kafkaConsumerTopicName = get_required_env("KAFKA_CONSUMER_TOPIC_NAME", "rejections")
-kafkaConsumerGroupId = get_required_env("KAFKA_CONSUMER_GROUP_ID", "rejection-agents-group")
-kafkaConsumerInternalEndpoint = get_required_env("KAFKA_CONSUMER_INTERNAL_ENDPOINT", "http://localhost:8000/process-rejection")
-kafkaConsumerInternalTimeoutSec = float(os.environ.get("PACKET_TIMEOUT_SECONDS", "300"))
+
+# Which role this process plays -- set by the entrypoint script
+# (src/fast_consumer.py or src/slow_consumer.py) before this module is
+# imported, since each role runs as its own OS process/pod. Defaults to
+# "fast", so every existing caller/test that never sets this env var (which
+# is all of them -- CONSUMER_ROLE is new) gets today's exact behaviour,
+# unchanged. Everything below this block -- OffsetTracker, the rebalance
+# listener, heartbeat/health-server plumbing, _handle_one_message,
+# _process_and_commit, consume_forever, the shutdown drain -- is identical
+# for both roles and reused as-is: the analysis queue carries the exact same
+# payload shape as the original topic (still packetStatus == "REJECTED",
+# still validated by the same MessagePayload schema), so the poison-pill
+# check and the terminal-casebook dedupe are exactly the right guards for
+# both, unmodified.
+CONSUMER_ROLE = os.environ.get("CONSUMER_ROLE", "fast").strip().lower()
+
+if CONSUMER_ROLE == "slow":
+    # Reads the analysis queue that POST /fetch-logs publishes to, and
+    # forwards each message to /analyze-rejection for the LLM-driven
+    # investigation. This is the process meant to scale out to many pods to
+    # absorb LLM latency, independently of the fast consumer.
+    kafkaConsumerTopicName = get_required_env("SLOW_CONSUMER_TOPIC_NAME", "packet-analysis-queue")
+    kafkaConsumerGroupId = get_required_env("SLOW_CONSUMER_GROUP_ID", "packet-analysis-group")
+    kafkaConsumerInternalEndpoint = get_required_env("SLOW_CONSUMER_ENDPOINT", "http://localhost:8000/analyze-rejection")
+    # Same env var and meaning as before the split: PACKET_TIMEOUT_SECONDS
+    # has always been "how long the consumer's HTTP client waits for the
+    # internal call to finish", and it's the slow (LLM-bound) consumer whose
+    # call now actually needs that budget.
+    kafkaConsumerInternalTimeoutSec = float(os.environ.get("PACKET_TIMEOUT_SECONDS", "300"))
+    _HEARTBEAT_PATH = SLOW_CONSUMER_HEARTBEAT_PATH
+    _HEALTH_PORT_ENV = "SLOW_CONSUMER_HEALTH_PORT"
+else:
+    # Reads the original rejections topic and forwards to /fetch-logs.
+    # Bounded I/O only (no LLM call), so it gets its own, much shorter,
+    # per-message timeout instead of the LLM-scaled PACKET_TIMEOUT_SECONDS.
+    kafkaConsumerTopicName = get_required_env("KAFKA_CONSUMER_TOPIC_NAME", "rejections")
+    kafkaConsumerGroupId = get_required_env("KAFKA_CONSUMER_GROUP_ID", "rejection-agents-group")
+    # Same env var as before the split; only the default changed, from
+    # /process-rejection to /fetch-logs.
+    kafkaConsumerInternalEndpoint = get_required_env("KAFKA_CONSUMER_INTERNAL_ENDPOINT", "http://localhost:8000/fetch-logs")
+    kafkaConsumerInternalTimeoutSec = float(os.environ.get("FAST_CONSUMER_TIMEOUT_SECONDS", "90"))
+    _HEARTBEAT_PATH = CONSUMER_HEARTBEAT_PATH
+    _HEALTH_PORT_ENV = "CONSUMER_HEALTH_PORT"
 
 # Consumer will be instantiated lazily in consume_forever
 consumer = None
@@ -50,7 +89,7 @@ HEARTBEAT_STALE_SECONDS = float(
 
 
 def _heartbeat_path() -> Path:
-    return CONSUMER_HEARTBEAT_PATH
+    return _HEARTBEAT_PATH
 
 
 class OffsetTracker:
@@ -486,8 +525,12 @@ def _start_health_server():
     Deliberately stdlib-only and tiny: the consumer is not an HTTP service and
     should not grow a web framework to answer one boolean. Disabled by default
     so single-host runs via start.py are unaffected.
+
+    Reads CONSUMER_HEALTH_PORT (fast role) or SLOW_CONSUMER_HEALTH_PORT
+    (slow role) via `_HEALTH_PORT_ENV`, so the two roles never collide on
+    the same port when co-located under start.py.
     """
-    port = os.environ.get("CONSUMER_HEALTH_PORT", "").strip()
+    port = os.environ.get(_HEALTH_PORT_ENV, "").strip()
     if not port:
         return None
 

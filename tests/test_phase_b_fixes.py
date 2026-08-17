@@ -394,3 +394,72 @@ def test_changing_extra_patterns_is_picked_up(monkeypatch):
 
     monkeypatch.setenv("K8S_REDACT_EXTRA_PATTERNS", r"BBB")
     assert "[REDACTED:CUSTOM]" in redaction.redact_text("BBB").text
+
+
+# ======================================================================
+# CONSUMER_ROLE -- the fetch/analyze split's constant resolution
+# (ARCHITECTURE.md 3.11)
+# ======================================================================
+
+def test_consumer_role_slow_resolves_the_slow_defaults():
+    """kafkaConsumer.py's CONSUMER_ROLE branch is read once, at import time.
+
+    This spawns a fresh interpreter with CONSUMER_ROLE=slow rather than
+    reloading the already-imported `kc` module in-process: every other test
+    in this file (and ~40 call sites across test_audit_phase1.py,
+    test_audit_phase3.py, test_phase0_fixes.py, test_resilience.py) imports
+    the SAME cached module object via `import src.utils.kafkaConsumer as kc`
+    and relies on its default (fast) constants -- an in-process reload would
+    mutate that shared object out from under all of them for the rest of the
+    test session.
+
+    The default (fast) role is already exhaustively exercised by every one
+    of those ~40 call sites, none of which ever set CONSUMER_ROLE, so this
+    only needs to prove the slow branch resolves independently and
+    differently -- not re-prove the fast defaults.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = (
+        "import json, src.utils.kafkaConsumer as kc\n"
+        "print(json.dumps({\n"
+        "    'topic': kc.kafkaConsumerTopicName,\n"
+        "    'group': kc.kafkaConsumerGroupId,\n"
+        "    'endpoint': kc.kafkaConsumerInternalEndpoint,\n"
+        "    'timeout': kc.kafkaConsumerInternalTimeoutSec,\n"
+        "    'heartbeat_path': str(kc._heartbeat_path()),\n"
+        "    'health_port_env': kc._HEALTH_PORT_ENV,\n"
+        "}))\n"
+    )
+
+    env = dict(os.environ)
+    env["CONSUMER_ROLE"] = "slow"
+    env["PYTHONPATH"] = repo_root
+    # Pinned explicitly so the assertions below don't depend on whatever the
+    # developer's local .env happens to contain -- load_dotenv() never
+    # overrides an already-set variable, so this wins regardless.
+    env["PACKET_TIMEOUT_SECONDS"] = "300"
+    for var in ("SLOW_CONSUMER_TOPIC_NAME", "SLOW_CONSUMER_GROUP_ID",
+                "SLOW_CONSUMER_ENDPOINT", "SLOW_CONSUMER_HEALTH_PORT"):
+        env.pop(var, None)
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    resolved = json.loads(result.stdout.strip().splitlines()[-1])
+
+    assert resolved["topic"] == "packet-analysis-queue"
+    assert resolved["group"] == "packet-analysis-group"
+    assert resolved["endpoint"] == "http://localhost:8000/analyze-rejection"
+    assert resolved["timeout"] == 300.0
+    assert resolved["health_port_env"] == "SLOW_CONSUMER_HEALTH_PORT"
+
+    from src.utils import paths
+    assert resolved["heartbeat_path"] == str(paths.SLOW_CONSUMER_HEARTBEAT_PATH)
+    assert resolved["heartbeat_path"] != str(paths.CONSUMER_HEARTBEAT_PATH)

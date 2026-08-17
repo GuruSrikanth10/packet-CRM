@@ -35,6 +35,16 @@ TERMINAL_STATUSES = (
 #: "successful" result.
 PROTECTED_TERMINAL_STATUSES = ("FAILED_TIMEOUT", "DLQ")
 
+#: Non-terminal status written by POST /fetch-logs once it has persisted the
+#: `fetched_logs.txt` artifact and published the payload onto the analysis
+#: queue. Deliberately absent from TERMINAL_STATUSES: it must never satisfy a
+#: terminal_only dedupe check, and it must fall through the `status ==
+#: "IN_PROGRESS"` branch in routes.py's investigation dedupe so
+#: /analyze-rejection still writes its own fresh IN_PROGRESS stub and invokes
+#: the agent normally. It exists purely for observability -- distinguishing
+#: "never seen" from "logs fetched, awaiting analysis" from "analysis running".
+LOGS_FETCHED_STATUS = "LOGS_FETCHED"
+
 
 class CasebookStorage(Protocol):
     def save(self, event_id: str, casebook: dict, filename: str = "casebook.json") -> None:

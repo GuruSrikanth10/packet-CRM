@@ -13,6 +13,8 @@ import pymysql  # noqa: F401
 from src.utils.env import get_bool_env, get_required_env
 from src.utils.resilience import retry_transient, db_breaker
 from src.utils.logging_config import get_logger
+from src.log_pipeline.sources.k8s.filtering import identifiers_from_payload
+from src.storage.factory import get_casebook_storage
 import pybreaker
 
 logger = get_logger(__name__)
@@ -399,6 +401,40 @@ def fetch_logs_for(event_id: str, extra_identifiers: tuple = ()) -> Optional[str
     except Exception as e:
         log.error("Log reduction pipeline failed", error=f"{type(e).__name__}: {e}")
         return None
+
+
+def fetch_and_persist_logs(event_id: str, payload: dict) -> Optional[str]:
+    """Fetch logs for a payload and persist the result as `fetched_logs.txt`.
+
+    The single implementation shared by `POST /fetch-logs` and
+    `fetch_logs_node`'s live-fetch fallback (src/core/agent_orchestrator.py),
+    so there is exactly one place that decides what `state["logs"]` becomes.
+    Persisting here -- not just returning the text -- is what lets
+    `fetch_logs_node` short-circuit on a later invocation instead of
+    re-fetching, and is what makes the artifact's mere presence (regardless of
+    content, including the "disabled"/"no logs found" sentinels) an
+    unambiguous "a fetch was attempted" signal for that cache check.
+
+    Returns None, and persists nothing, when the fetch itself failed
+    (`fetch_logs_for` returning None -- breaker open, pipeline exception).
+    That is a transient-failure signal, not a legitimate answer, so it must
+    not be cached: the same reasoning `_is_uncacheable_result` applies to rule
+    lookups above applies here -- caching a failure would suppress every
+    later retry's chance to succeed once the underlying issue clears.
+    """
+    if not get_bool_env("ENABLE_LOG_FETCHING", False):
+        logs = "Log fetching disabled."
+    else:
+        extra_identifiers = tuple(
+            value for value in identifiers_from_payload(payload)
+            if value != event_id
+        )
+        logs = fetch_logs_for(event_id, extra_identifiers=extra_identifiers)
+        if logs is None:
+            return None
+
+    get_casebook_storage().save_artifact(event_id, "fetched_logs.txt", logs)
+    return logs
 
 
 @tool

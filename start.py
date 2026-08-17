@@ -1,9 +1,13 @@
 """Process supervisor for the Packet-CRM ecosystem.
 
-Spawns the API and the Kafka consumer, then holds both open. If either exits,
-the other is terminated rather than left running half a system: a consumer
-with no API forwards every packet into a connection error, and an API with no
-consumer silently stops receiving work (F12).
+Spawns the API and both Kafka consumers -- fast_consumer.py (rejections ->
+POST /fetch-logs) and slow_consumer.py (the analysis queue -> POST
+/analyze-rejection) -- then holds all three open. If any exits, the rest are
+terminated rather than left running half a system: a consumer with no API
+forwards every packet into a connection error, and an API with no consumers
+silently stops receiving work (F12). Each consumer sets its own CONSUMER_ROLE
+before importing kafkaConsumer.py, so no special per-child environment is
+needed here to keep their topics, heartbeat files, and health ports apart.
 """
 import signal
 import subprocess
@@ -56,24 +60,27 @@ def main():
     print("Starting the API server (main_api.py).")
     _children.append(("API", subprocess.Popen([sys.executable, "src/main_api.py"])))
 
-    # Give the API a moment to bind its port before the consumer starts
+    # Give the API a moment to bind its port before either consumer starts
     # forwarding to it.
     time.sleep(2)
 
-    print("Starting the Kafka consumer (main_consumer.py).")
-    _children.append(("Consumer", subprocess.Popen([sys.executable, "src/main_consumer.py"])))
+    print("Starting the fast consumer (fast_consumer.py) -- rejections -> /fetch-logs.")
+    _children.append(("FastConsumer", subprocess.Popen([sys.executable, "src/fast_consumer.py"])))
 
-    print("\nBoth services are running. Press Ctrl+C to stop them.")
+    print("Starting the slow consumer (slow_consumer.py) -- analysis queue -> /analyze-rejection.")
+    _children.append(("SlowConsumer", subprocess.Popen([sys.executable, "src/slow_consumer.py"])))
+
+    print("\nAll three services are running. Press Ctrl+C to stop them.")
 
     try:
-        # Wait on BOTH concurrently. The previous version waited on the API
-        # and only then on the consumer, so an API crash left the consumer
-        # running unattended while the supervisor sat blocked.
+        # Wait on all three concurrently. Waiting on the API and only then on
+        # the consumer(s) would let an API crash leave the consumers running
+        # unattended while the supervisor sat blocked.
         while True:
             for name, process in _children:
                 code = process.poll()
                 if code is not None:
-                    print(f"\n{name} exited with code {code}; stopping the other service.")
+                    print(f"\n{name} exited with code {code}; stopping the other services.")
                     _terminate_all()
                     sys.exit(code or 0)
             time.sleep(0.5)

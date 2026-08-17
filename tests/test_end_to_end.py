@@ -45,10 +45,18 @@ def storage(tmp_path, monkeypatch):
     import src.api.routes as routes
     import src.core.checkpointer as checkpointer
     import src.log_pipeline.pipeline as pipeline
+    import src.tools.tool_registry as tool_registry
 
     store = LocalFilesystemCasebookStorage(base_dir=str(tmp_path))
     monkeypatch.setattr(routes, "get_casebook_storage", lambda: store)
     monkeypatch.setattr(pipeline, "get_casebook_storage", lambda: store)
+    # fetch_logs_node's cache check (orch) and fetch_and_persist_logs'
+    # artifact write (tool_registry) each hold their own module-level
+    # binding of get_casebook_storage -- both must be patched too, or the
+    # fetch/analyze split's cache check and artifact persistence silently
+    # fall through to the real default storage location instead of tmp_path.
+    monkeypatch.setattr(orch, "get_casebook_storage", lambda: store)
+    monkeypatch.setattr(tool_registry, "get_casebook_storage", lambda: store)
     monkeypatch.setenv("ENABLE_LOG_FETCHING", "false")
     monkeypatch.setenv("RUNBOOK_MODE", "off")
 

@@ -8,14 +8,13 @@ from langgraph.prebuilt import create_react_agent
 
 from src.utils import metrics
 from src.utils.llm_utils import get_llm
-from src.utils.env import get_bool_env
 from src.tools.tool_registry import (
-    fetch_logs_for,
+    fetch_and_persist_logs,
     get_tool_by_name,
     lookup_rule_for,
     lookup_rule_text,
 )
-from src.log_pipeline.sources.k8s.filtering import identifiers_from_payload
+from src.storage.factory import get_casebook_storage
 from src.models.synthesis import (
     ACTIONS,
     RESIDENT_ACTIONS,
@@ -194,23 +193,28 @@ def get_agent():
         event_id = payload.get("eventId", "")
         log = logger.bind(event_id=event_id)
         log.info("Log fetcher node started", state="LOG_FETCHER")
-        enable_log_fetching = get_bool_env("ENABLE_LOG_FETCHING", False)
-        if not enable_log_fetching:
-            log.info("Log fetching is disabled; skipping the fetch", reason="ENABLE_LOG_FETCHING=false")
-            return {"logs": "Log fetching disabled."}
 
-        # Pull every K8S_SEARCH_FIELDS value out of the payload (refId, srn,
-        # ...) so the Kubernetes source can match lines that never mention
-        # eventId, and so redaction allowlists them. Only eventId was ever
-        # searched before, which made the Kubernetes source silently
-        # unproductive if the services log a different id (F11).
-        extra_identifiers = tuple(
-            value for value in identifiers_from_payload(payload)
-            if value != event_id
-        )
+        # Cache-first: POST /fetch-logs (the fast consumer's route) already
+        # fetched and persisted this event's logs before /analyze-rejection
+        # ever invokes the graph, so the normal path here is a storage read,
+        # not a live Elasticsearch/Kubernetes round trip. Presence of the
+        # artifact -- regardless of its content, including the "disabled"/"no
+        # logs found" sentinels fetch_and_persist_logs persists verbatim -- is
+        # the unambiguous signal that a fetch was already attempted.
+        #
+        # Falling back to a live fetch when the artifact is absent keeps
+        # every caller that invokes the graph directly (POST
+        # /process-rejection, local_run.py, a checkpoint resume that predates
+        # this split, or /analyze-rejection racing ahead of /fetch-logs)
+        # working exactly as before -- the graph's node set, edges, and
+        # thread_id=event_id checkpoint keying are unchanged either way.
+        cached = get_casebook_storage().load_artifact(event_id, "fetched_logs.txt")
+        if cached is not None:
+            log.info("Using logs persisted by the fast consumer", state="LOG_FETCHER")
+            return {"logs": cached}
 
-        log.info("Fetching log traces", extra_identifiers=list(extra_identifiers))
-        logs = fetch_logs_for(event_id, extra_identifiers=extra_identifiers)
+        log.info("No persisted logs found; fetching live", state="LOG_FETCHER")
+        logs = fetch_and_persist_logs(event_id, payload)
         log.info("Logs retrieved")
         return {"logs": logs}
 

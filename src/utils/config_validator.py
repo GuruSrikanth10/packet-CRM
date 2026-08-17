@@ -48,6 +48,11 @@ def validate_config():
     if not brokers:
         errors.append("KAFKA_CONSUMER_BROKERS must contain at least one valid broker.")
 
+    # 2b. The analysis-queue topic POST /fetch-logs publishes to, and
+    # slow_consumer.py reads from by default, must not be blanked out.
+    if not os.environ.get("PACKET_ANALYSIS_TOPIC_NAME", "packet-analysis-queue").strip():
+        errors.append("PACKET_ANALYSIS_TOPIC_NAME must not be empty.")
+
     # 3. PACKET_CRM_API_KEY is explicitly set in prod
     api_key = os.environ.get("PACKET_CRM_API_KEY")
     env = os.environ.get("ENV", "dev").lower()

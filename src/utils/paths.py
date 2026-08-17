@@ -14,8 +14,15 @@ CHECKPOINT_DB_PATH = LOCAL_CHECKPOINTS_DIR / "checkpoints.db"
 
 # The consumer's liveness stamp. Independently re-derived in kafkaConsumer.py
 # and routes.py, which is how the two ended up agreeing only by coincidence
-# (G13).
+# (G13). Used by the fast consumer (CONSUMER_ROLE=fast, the default); kept
+# under its original name for backwards compatibility with existing
+# deployments and the tests that assert this exact path.
 CONSUMER_HEARTBEAT_PATH = LOCAL_CHECKPOINTS_DIR / "consumer_heartbeat.txt"
+
+# The slow (analysis) consumer's liveness stamp -- a distinct file so the two
+# consumers don't clobber each other's heartbeat when co-located under
+# start.py on one host.
+SLOW_CONSUMER_HEARTBEAT_PATH = LOCAL_CHECKPOINTS_DIR / "slow_consumer_heartbeat.txt"
 
 # Drain3's persisted parse tree and the template catalog. Both were derived
 # with their own `dirname(dirname(dirname(...)))` walks in log_pipeline/config.py.
