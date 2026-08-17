@@ -30,6 +30,7 @@ from filelock import FileLock
 from src.log_pipeline.types import EvidenceGap, GapType
 from src.utils.env import get_bool_env
 from src.utils.logging_config import get_logger
+from src.utils.paths import LOCAL_CASESHEETS_DIR
 
 logger = get_logger(__name__)
 
@@ -42,7 +43,12 @@ def reuse_enabled() -> bool:
 
 
 def _casesheets_root() -> Path:
-    return Path(__file__).resolve().parent.parent.parent / "local_casesheets"
+    """Root holding every casebook directory.
+
+    Delegates to utils.paths rather than re-deriving the path (F22), but stays
+    a function so tests can redirect it at a tmp_path.
+    """
+    return LOCAL_CASESHEETS_DIR
 
 
 def snapshot_dir(event_id: str) -> Path:

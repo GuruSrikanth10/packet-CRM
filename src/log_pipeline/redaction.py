@@ -20,6 +20,7 @@ can see that a value existed and reason about its presence.
 """
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -52,10 +53,27 @@ def is_enabled() -> bool:
     return get_bool_env("K8S_REDACT_ENABLED", True)
 
 
+#: Cache of (env value -> compiled pattern tuple). Keyed on the raw env string
+#: so a config change is picked up without a restart, while the steady state
+#: costs one dict lookup.
+#:
+#: This used to re-read os.environ, split, and re.compile on *every record*.
+#: That was tolerable when only the Kubernetes path redacted; now that every
+#: source does (F10), an Elasticsearch fetch at LOG_MAX_DOCUMENTS=50000 would
+#: pay it 50k times per packet (F18).
+_extra_patterns_cache: dict = {}
+_extra_patterns_lock = threading.Lock()
+
+
 def _extra_patterns():
     raw = os.environ.get("K8S_REDACT_EXTRA_PATTERNS", "").strip()
     if not raw:
-        return []
+        return ()
+
+    cached = _extra_patterns_cache.get(raw)
+    if cached is not None:
+        return cached
+
     compiled = []
     for pattern in raw.split("|||"):
         pattern = pattern.strip()
@@ -66,7 +84,22 @@ def _extra_patterns():
         except re.error as e:
             logger.warning("Ignoring invalid K8S_REDACT_EXTRA_PATTERNS entry",
                            pattern=pattern, error=str(e))
+
+    compiled = tuple(compiled)
+    with _extra_patterns_lock:
+        # Bound the cache: the key is an env value, so it changes rarely, but
+        # an unbounded dict keyed on external input is still a leak.
+        if len(_extra_patterns_cache) > 16:
+            _extra_patterns_cache.clear()
+        _extra_patterns_cache[raw] = compiled
     return compiled
+
+
+def _active_patterns():
+    """All patterns to apply, defaults first. Allocation-free in the common
+    case where no extra patterns are configured."""
+    extra = _extra_patterns()
+    return DEFAULT_PATTERNS if not extra else DEFAULT_PATTERNS + extra
 
 
 def redact_text(text: str, allowlist: Optional[list] = None) -> RedactionResult:
@@ -90,7 +123,7 @@ def redact_text(text: str, allowlist: Optional[list] = None) -> RedactionResult:
             stashed[token] = value
             text = text.replace(value, token)
 
-    for label, pattern in list(DEFAULT_PATTERNS) + _extra_patterns():
+    for label, pattern in _active_patterns():
         text, hits = pattern.subn(f"[REDACTED:{label}]", text)
         if hits:
             counts[label] = counts.get(label, 0) + hits

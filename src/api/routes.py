@@ -2,25 +2,31 @@ import os
 import json
 import re
 import time
+import hmac
 import asyncio
 import functools
+import ipaddress
 import threading
 import concurrent.futures
-from fastapi import APIRouter, Depends, HTTPException, Security, Request
+from typing import Literal, Optional
+from fastapi import APIRouter, Depends, HTTPException, Security, Request, Response
 from fastapi.security import APIKeyHeader
-from src.models.schemas import MessagePayload
+from pydantic import BaseModel, Field
+from src.models.schemas import EVENT_ID_PATTERN, MessagePayload
+from src.utils import metrics
+from src.utils.outcomes import (
+    InvalidVerdictError,
+    UnknownEventError,
+    record_outcome,
+)
 from src.core.agent_orchestrator import get_agent
 from src.utils.s3_uploader import upload_logs_to_s3
 from src.storage.factory import get_casebook_storage
 from src.utils.dlq_publisher import publish_to_dlq
 from src.utils.logging_config import get_logger
+from src.storage.base import PROTECTED_TERMINAL_STATUSES, TERMINAL_STATUSES
 
 logger = get_logger(__name__)
-
-# Statuses written by another actor (e.g. the consumer's own timeout handler,
-# or the DLQ path on a previous attempt) that a slow, late-finishing agent
-# run must never overwrite with a stale "successful" result.
-_PROTECTED_TERMINAL_STATUSES = ("FAILED_TIMEOUT", "DLQ")
 
 # A dedicated, bounded pool for agent.invoke() calls -- separate from
 # Starlette's own threadpool used to dispatch sync endpoints/dependencies.
@@ -61,7 +67,7 @@ def _check_kafka_producer_ready() -> bool:
         producer = get_producer()
         ready = producer is not None
     except Exception as e:
-        logger.error(f"Readiness check failed on Kafka Producer: {e}")
+        logger.error("Readiness check failed on the Kafka producer", error=f"{type(e).__name__}: {e}")
 
     with _producer_health_lock:
         _producer_health_cache["ready"] = ready
@@ -89,8 +95,16 @@ router = APIRouter()
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 API_KEYS = [os.environ.get("PACKET_CRM_API_KEY", "dev-secret-key")]
 
-# Simple in-memory rate limiting: 10 requests per minute per IP
-RATE_LIMIT = 10
+# The rate limiter exists to blunt external abuse, not to throttle this
+# system's own Kafka consumer. It was doing the latter: every packet arrives
+# from one IP, so the 11th packet in any 60s window got a 429, the consumer
+# didn't commit that offset, and throughput collapsed -- instantly under
+# RUNBOOK_MODE=serve (sub-second responses) or during any backlog drain (F5).
+#
+# Two changes: the ceiling now tracks the concurrency the API is actually
+# built to serve, and trusted internal callers are exempt entirely.
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MINUTE",
+                               str(max(60, _MAX_CONCURRENT_INVESTIGATIONS * 20))))
 RATE_WINDOW = 60
 _rate_limits = {}
 # FastAPI runs sync dependencies like this one in a threadpool, so concurrent
@@ -98,13 +112,71 @@ _rate_limits = {}
 # interleave a read-modify-write on _rate_limits without a lock (1.19).
 _rate_limits_lock = threading.Lock()
 
+
+def _parse_networks(raw: str) -> list:
+    networks = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            logger.warning("Ignoring invalid CIDR in rate-limit exemption list", entry=entry)
+    return networks
+
+
+# Callers exempt from rate limiting: this system's own consumer, and whatever
+# internal ranges an operator declares. Defaults to loopback so a single-host
+# deployment (start.py) works out of the box.
+_RATE_LIMIT_EXEMPT_CIDRS = _parse_networks(
+    os.environ.get("RATE_LIMIT_EXEMPT_CIDRS", "127.0.0.0/8,::1/128")
+)
+
+# Proxies whose X-Forwarded-For we trust. Behind an ingress, request.client.host
+# is the *proxy's* IP, so every caller shares one bucket. XFF is only honoured
+# when the immediate peer is one of these -- trusting it unconditionally would
+# let any caller forge an exempt source address.
+_TRUSTED_PROXY_CIDRS = _parse_networks(os.environ.get("TRUSTED_PROXY_CIDRS", ""))
+
+
+def _ip_in(networks: list, address: str) -> bool:
+    if not networks or not address:
+        return False
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return any(parsed in network for network in networks)
+
+
+def client_ip_for(request: Request) -> str:
+    """Resolve the caller's address, honouring X-Forwarded-For only from a
+    trusted proxy peer."""
+    peer = request.client.host if request.client else ""
+    if _ip_in(_TRUSTED_PROXY_CIDRS, peer):
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            # Left-most entry is the original client.
+            return forwarded.split(",")[0].strip()
+    return peer
+
+
 def get_api_key(api_key_header: str = Security(API_KEY_HEADER)):
-    if api_key_header in API_KEYS:
-        return api_key_header
+    # Constant-time comparison: `in` on a list short-circuits on the first
+    # differing byte, which leaks key material through response timing (F5).
+    if api_key_header:
+        for candidate in API_KEYS:
+            if candidate and hmac.compare_digest(str(api_key_header), str(candidate)):
+                return api_key_header
     raise HTTPException(status_code=403, detail="Could not validate API KEY")
 
 def rate_limiter(request: Request):
-    client_ip = request.client.host
+    client_ip = client_ip_for(request)
+
+    if _ip_in(_RATE_LIMIT_EXEMPT_CIDRS, client_ip):
+        return
+
     current_time = time.time()
 
     with _rate_limits_lock:
@@ -155,19 +227,31 @@ def health_check():
 def readiness_check():
     import sqlite3
     from src.utils.paths import CHECKPOINT_DB_PATH
+    from src.core.checkpointer import backend_name as checkpoint_backend_name
+    from src.core.checkpointer import get_checkpointer
 
-    # Check SQLite connectivity. A missing DB file should fail the probe,
-    # not be silently created by sqlite3.connect().
+    # Check checkpoint storage. Probing SQLite unconditionally would report a
+    # Postgres-backed deployment as unready forever, since it has no local
+    # checkpoint file at all (4.7).
     db_ready = False
+    backend = checkpoint_backend_name()
     try:
-        if not CHECKPOINT_DB_PATH.exists():
-            raise FileNotFoundError(f"Checkpoint DB not found at {CHECKPOINT_DB_PATH}")
-        conn = sqlite3.connect(str(CHECKPOINT_DB_PATH))
-        conn.execute("SELECT 1")
-        conn.close()
-        db_ready = True
+        if backend == "postgres":
+            # Building the saver connects and runs setup(); if that succeeds
+            # the store is reachable.
+            get_checkpointer()
+            db_ready = True
+        else:
+            # A missing DB file should fail the probe, not be silently created
+            # by sqlite3.connect().
+            if not CHECKPOINT_DB_PATH.exists():
+                raise FileNotFoundError(f"Checkpoint DB not found at {CHECKPOINT_DB_PATH}")
+            conn = sqlite3.connect(str(CHECKPOINT_DB_PATH))
+            conn.execute("SELECT 1")
+            conn.close()
+            db_ready = True
     except Exception as e:
-        logger.error(f"Readiness check failed on DB: {e}")
+        logger.error("Readiness check failed on the checkpoint store", backend=backend, error=f"{type(e).__name__}: {e}")
 
     kafka_ready = _check_kafka_producer_ready()
 
@@ -175,6 +259,62 @@ def readiness_check():
         return {"status": "ready"}
     else:
         raise HTTPException(status_code=503, detail="Service Unavailable")
+
+@router.get("/metrics")
+def metrics_endpoint():
+    """Prometheus exposition (4.5).
+
+    Unauthenticated by design -- a scrape target that needs a secret is one
+    operators route around. It exposes counters and latencies only, never
+    packet content or resident data.
+    """
+    payload = metrics.render_latest()
+    if payload is None:
+        raise HTTPException(
+            status_code=501,
+            detail="prometheus_client is not installed; metrics are unavailable.",
+        )
+    return Response(content=payload, media_type=metrics.CONTENT_TYPE_LATEST)
+
+
+class OutcomeRequest(BaseModel):
+    """Operator verdict on a completed investigation (4.1)."""
+
+    verdict: Literal["CORRECT", "INCORRECT", "PARTIAL"]
+    verified_by: str = Field(min_length=1, max_length=128)
+    notes: str = Field(default="", max_length=4000)
+    corrected_action: Optional[str] = Field(default=None, max_length=64)
+
+
+@router.post("/outcome/{event_id}", dependencies=[Depends(get_api_key), Depends(rate_limiter)])
+def record_resolution_outcome(event_id: str, body: OutcomeRequest):
+    """Attach ground truth to a resolution, so accuracy becomes measurable.
+
+    Nothing in the system recorded whether a resolution was actually right,
+    which blocks runbook promotion, regression detection, and any statement
+    about how well the pipeline works (4.1).
+    """
+    if not re.fullmatch(EVENT_ID_PATTERN, event_id):
+        raise HTTPException(status_code=422, detail="Invalid event_id format")
+
+    try:
+        outcome = record_outcome(
+            event_id=event_id,
+            verdict=body.verdict,
+            verified_by=body.verified_by,
+            notes=body.notes,
+            corrected_action=body.corrected_action,
+        )
+    except UnknownEventError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No casebook found for event {event_id}; nothing to judge.",
+        )
+    except InvalidVerdictError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return {"status": "recorded", "event_id": event_id, "verdict": outcome["verdict"]}
+
 
 @router.post("/process-rejection", dependencies=[Depends(get_api_key), Depends(rate_limiter)])
 async def process_rejection(signal: MessagePayload):
@@ -198,9 +338,8 @@ async def process_rejection(signal: MessagePayload):
     # for either.
     if existing_casebook:
         status = existing_casebook.get("packet_status", {}).get("status")
-        terminal_statuses = ("COMPLETED", "REJECTED", "NEEDS_MANUAL_REVIEW", "FAILED_PERMANENT", "DLQ", "FAILED_TIMEOUT")
-        if status in terminal_statuses:
-            logger.bind(event_id=event_id).info("Skipping event; terminal casebook already exists.")
+        if status in TERMINAL_STATUSES:
+            logger.bind(event_id=event_id).info("Skipping event; a terminal casebook already exists", recorded_status=status)
             return {"status": "already_processed", "event_id": event_id}
 
     agent = get_agent()
@@ -218,15 +357,15 @@ async def process_rejection(signal: MessagePayload):
             is_stale = (time.time() - started_at) > max_age
 
             if is_stale and not has_active_checkpoint:
-                pre_invoke_log.info("IN_PROGRESS but stale with no active checkpoint. Reprocessing fresh.")
+                pre_invoke_log.info("Stale IN_PROGRESS with no active checkpoint; reprocessing from scratch", max_age_seconds=max_age)
             elif has_active_checkpoint:
-                pre_invoke_log.info("Has active checkpoint. Resuming.")
+                pre_invoke_log.info("Active checkpoint found; resuming the existing run")
                 return {"status": "already_processing_resumed", "event_id": event_id}
             else:
                 # Not stale, and no active checkpoint: a run is in flight but
                 # between checkpoint writes. Treat as already processing
                 # instead of falling through to a full duplicate reprocess.
-                pre_invoke_log.info("IN_PROGRESS and not stale. Skipping duplicate invocation.")
+                pre_invoke_log.info("IN_PROGRESS and not stale; skipping duplicate invocation")
                 return {"status": "already_processing", "event_id": event_id}
 
     # Write IN_PROGRESS stub before invoking graph to status.json
@@ -237,6 +376,7 @@ async def process_rejection(signal: MessagePayload):
 
     log = logger.bind(event_id=event_id)
     log.info("Processing Rejection", state="IN_PROGRESS")
+    packet_started_at = time.monotonic()
     
     # Run the agent with exception handling for DLQ. Offloaded onto the
     # module-level bounded executor (not a per-request one) so agent.invoke
@@ -269,11 +409,13 @@ async def process_rejection(signal: MessagePayload):
                 state="FAILED_TIMEOUT",
                 timeout_seconds=agent_invoke_timeout_seconds,
             )
-            storage.save(event_id, {
+            # Both files move together, so the consumer (and any later
+            # redelivery) sees the same verdict whichever one it reads (F4).
+            storage.save_terminal(event_id, {
                 "packet_metadata": {"eid": event_id},
                 "packet_status": {"status": "FAILED_TIMEOUT"},
                 "resolution": {"synthesis": f"Investigation exceeded the server-side budget of {agent_invoke_timeout_seconds}s."}
-            }, filename="status.json")
+            })
             return {"status": "failed_timeout", "event_id": event_id}
     except Exception as e:
         import traceback
@@ -285,13 +427,11 @@ async def process_rejection(signal: MessagePayload):
         # files must move to a terminal status together -- leaving
         # status.json at IN_PROGRESS here previously left it stuck forever,
         # since only casebook.json was written (1.5).
-        dlq_status = {
+        storage.save_terminal(event_id, {
             "packet_metadata": {"eid": event_id},
             "packet_status": {"status": "DLQ"},
             "resolution": {"synthesis": f"Failed with {type(e).__name__}: {str(e)}"}
-        }
-        storage.save(event_id, dlq_status)
-        storage.save(event_id, dlq_status, filename="status.json")
+        })
         return {"status": "dlq", "event_id": event_id, "error": str(e)}
 
     log.info("Agent investigation complete", state="COMPLETED_GRAPH")
@@ -341,7 +481,7 @@ async def process_rejection(signal: MessagePayload):
     if not raw_logs or raw_logs == "Log fetching disabled.":
         processed_logs = None
     elif len(raw_logs) > 5000:
-        log.info("Logs are too large for JSON, uploading to S3...")
+        log.info("Logs exceed the inline size limit; uploading to S3", log_chars=len(raw_logs))
         uploaded_url = upload_logs_to_s3(event_id, raw_logs)
         if uploaded_url:
             processed_logs = uploaded_url
@@ -391,15 +531,14 @@ async def process_rejection(signal: MessagePayload):
         }
     }
     
-    storage = get_casebook_storage()
-
     # Guard against overwriting a terminal status another actor already
     # recorded while this invocation was still in flight -- e.g. the
     # consumer's own client-side timeout fired and wrote FAILED_TIMEOUT/DLQ
-    # before this slow LLM call finally returned (0.8).
-    current_status_doc = storage.load(event_id, filename="status.json")
-    current_status = (current_status_doc or {}).get("packet_status", {}).get("status")
-    if current_status in _PROTECTED_TERMINAL_STATUSES:
+    # before this slow LLM call finally returned (0.8). Checks BOTH files:
+    # the consumer's timeout handler used to write only casebook.json while
+    # this guard read only status.json, so it never fired (F4).
+    current_status = storage.terminal_status(event_id)
+    if current_status in PROTECTED_TERMINAL_STATUSES:
         log.warning(
             "Discarding late result; a terminal status was already recorded by another actor",
             recorded_status=current_status,
@@ -407,17 +546,23 @@ async def process_rejection(signal: MessagePayload):
         )
         return {"status": "already_processed", "event_id": event_id}
 
-    storage.save(event_id, casebook_data)
+    # casebook.json and status.json reach the terminal status together, so a
+    # crash between them can't leave status.json stuck at IN_PROGRESS.
+    storage.save_terminal(event_id, casebook_data)
 
-    # Clean up the IN_PROGRESS status.json now that we have a final casebook
-    try:
-        storage.save(event_id, {
-            "packet_metadata": {"eid": event_id},
-            "packet_status": {"status": casebook_data["packet_status"]["status"]}
-        }, filename="status.json")
-    except Exception as e:
-        log.error("Failed to update status.json after completion", error=str(e), exc_info=True)
-        
-    log.info("Successfully saved finalized Casebook", final_status=casebook_data["packet_status"]["status"], state="COMPLETED")
-    
+    final_status = casebook_data["packet_status"]["status"]
+    resolution_source = casebook_data["resolution"]["source"] or "agent"
+    # Collapse runbook:<id>@v<n> so the label set stays bounded -- a per-runbook
+    # label would make cardinality grow with the runbook catalog.
+    source_kind = "runbook" if str(resolution_source).startswith("runbook:") else "agent"
+    metrics.PACKETS_TOTAL.labels(
+        status=str(final_status), resolution_source=source_kind
+    ).inc()
+    metrics.PACKET_DURATION.labels(resolution_source=source_kind).observe(
+        time.monotonic() - packet_started_at
+    )
+
+    log.info("Successfully saved finalized Casebook", final_status=final_status,
+             resolution_source=resolution_source, state="COMPLETED")
+
     return {"status": "processed", "event_id": event_id}

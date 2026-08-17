@@ -162,7 +162,54 @@ def test_semaphore_released_once_when_submit_never_happens():
 # polled batch, so a crash mid-batch can't silently lose later messages.
 # ======================================================================
 
-def test_commit_targets_only_this_message_offset():
+def test_skip_path_records_only_this_message_offset():
+    """A message skipped without dispatch becomes committable immediately --
+    and contributes only its own offset, never the whole polled batch.
+
+    Skips go through the same OffsetTracker as completions rather than
+    committing inline. Committing a skip inline had the identical ordering
+    hazard as an out-of-order completion: skipping offset 100 while offset 99
+    was still in flight would commit 101 and strand 99 (F3).
+    """
+    import src.utils.kafkaConsumer as kc
+    from kafka.structs import OffsetAndMetadata
+
+    fake_consumer = MagicMock()
+
+    # packetStatus != REJECTED -> skipped without dispatch.
+    skipped_signal = dict(DUMMY_PAYLOAD)
+    skipped_signal["packetExecutionSummary"] = {
+        "packetStatus": "PROCESSED",
+        "errorData": [],
+    }
+    msg = SimpleNamespace(value=json.dumps(skipped_signal).encode("utf-8"), offset=99)
+    tp = MagicMock()
+
+    with patch.object(kc, "consumer", fake_consumer), \
+         patch.object(kc, "_worker_pool") as fake_pool, \
+         patch.object(kc, "_offset_tracker", kc.OffsetTracker()) as tracker, \
+         patch.object(kc, "get_casebook_storage"):
+        kc._handle_one_message(tp, msg)
+
+        fake_pool.submit.assert_not_called()
+        # Nothing is committed inline...
+        fake_consumer.commit.assert_not_called()
+        # ...but this offset alone is now safe to commit.
+        assert tracker.take_committable() == {tp: OffsetAndMetadata(100, None, -1)}
+
+
+def test_dispatched_message_defers_its_commit_to_completion():
+    """A message handed to the worker pool must NOT be committed on dispatch.
+
+    Committing at enqueue time is commit-before-work: a crash between dispatch
+    and completion advances the group past a packet that was never
+    investigated. `_handle_one_message` therefore passes the offset down to
+    `_process_and_commit`, which queues it on `_offsets_to_commit` only after
+    the work actually succeeded (commit 5cf2dbd).
+
+    The previous version of this test asserted the opposite and was never
+    updated when that behaviour changed, so it sat red in the suite (F6).
+    """
     import src.utils.kafkaConsumer as kc
     from kafka.structs import OffsetAndMetadata
 
@@ -182,7 +229,14 @@ def test_commit_targets_only_this_message_offset():
         fake_storage_factory.return_value.exists.return_value = False
         kc._handle_one_message(tp, msg)
 
-    fake_consumer.commit.assert_called_once_with({tp: OffsetAndMetadata(100, None, -1)})
+    # Dispatched, and NOT committed on the way in.
+    fake_pool.submit.assert_called_once()
+    fake_consumer.commit.assert_not_called()
+
+    # The worker is handed this message's offset alone, so completion commits
+    # exactly what was processed.
+    _fn, _signal, message_offsets = fake_pool.submit.call_args[0]
+    assert message_offsets == {tp: OffsetAndMetadata(100, None, -1)}
 
 
 # ======================================================================

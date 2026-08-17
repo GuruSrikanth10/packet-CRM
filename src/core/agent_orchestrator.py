@@ -3,18 +3,33 @@ import json
 import contextvars
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.sqlite import SqliteSaver
-import sqlite3
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 
+from src.utils import metrics
 from src.utils.llm_utils import get_llm
 from src.utils.env import get_bool_env
-from src.tools.tool_registry import get_tool_by_name, lookup_rule_by_reason_code
+from src.tools.tool_registry import (
+    fetch_logs_for,
+    get_tool_by_name,
+    lookup_rule_for,
+    lookup_rule_text,
+)
+from src.log_pipeline.sources.k8s.filtering import identifiers_from_payload
+from src.models.synthesis import (
+    ACTIONS,
+    RESIDENT_ACTIONS,
+    apply_confidence_policy,
+    parse_synthesis,
+)
 from src.utils.resilience import retry_transient, llm_breaker
 from src.utils.logging_config import get_logger
-from src.utils.paths import CHECKPOINT_DB_PATH
-from src.utils.runbook_store import get_runbook, generate_rule_fingerprint
+from src.core.checkpointer import get_checkpointer
+from src.utils.runbook_store import (
+    generate_rule_fingerprint,
+    get_runbook,
+    is_serve_allowed,
+)
 
 logger = get_logger(__name__)
 
@@ -57,10 +72,10 @@ _agent = None
 def get_agent():
     global _agent
     if _agent is not None:
-        logger.info("Returning cached Deterministic Graph.")
+        logger.info("Returning the cached agent graph")
         return _agent
 
-    logger.info("Building Deterministic LangGraph from scratch...")
+    logger.info("Building the agent graph")
     base_dir = os.path.dirname(os.path.dirname(__file__))
     llm = get_llm("complex")
     simple_llm = get_llm("complex")
@@ -84,17 +99,27 @@ def get_agent():
     log_filter_prompt = load_prompt("LogFilterAgent.md")
     
     def fetch_logs_node(state: GraphState):
-        event_id = state.get("payload", {}).get("eventId", "")
+        payload = state.get("payload", {})
+        event_id = payload.get("eventId", "")
         log = logger.bind(event_id=event_id)
         log.info("Log fetcher node started", state="LOG_FETCHER")
         enable_log_fetching = get_bool_env("ENABLE_LOG_FETCHING", False)
         if not enable_log_fetching:
-            log.info("Log fetching disabled via .env; skipping.")
+            log.info("Log fetching is disabled; skipping the fetch", reason="ENABLE_LOG_FETCHING=false")
             return {"logs": "Log fetching disabled."}
 
-        log.info("Fetching Elasticsearch traces")
-        tool = get_tool_by_name("fetch_elastic_logs")
-        logs = tool.invoke(event_id)
+        # Pull every K8S_SEARCH_FIELDS value out of the payload (refId, srn,
+        # ...) so the Kubernetes source can match lines that never mention
+        # eventId, and so redaction allowlists them. Only eventId was ever
+        # searched before, which made the Kubernetes source silently
+        # unproductive if the services log a different id (F11).
+        extra_identifiers = tuple(
+            value for value in identifiers_from_payload(payload)
+            if value != event_id
+        )
+
+        log.info("Fetching log traces", extra_identifiers=list(extra_identifiers))
+        logs = fetch_logs_for(event_id, extra_identifiers=extra_identifiers)
         log.info("Logs retrieved")
         return {"logs": logs}
 
@@ -102,49 +127,68 @@ def get_agent():
         mode = os.environ.get("RUNBOOK_MODE", "off").lower()
         if mode == "off":
             return {"resolution_source": "agent"}
-            
+
         payload = state.get("payload", {})
         event_id = payload.get("eventId", "unknown")
         log = logger.bind(event_id=event_id)
-        
-        exec_summary = payload.get("packetExecutionSummary") or {}
-        error_data = exec_summary.get("errorData") or []
-        reason_code = None
-        for err in error_data:
-            if err and err.get("errorReasonCode"):
-                reason_code = err.get("errorReasonCode")
-                break
-                
-        if not reason_code:
-            return {"resolution_source": "agent"}
-            
-        packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
-        runbook = get_runbook(reason_code, packet_type)
-        if not runbook:
-            return {"resolution_source": "agent"}
-            
-        runbook_id = runbook["runbook_id"]
-        version = runbook["version"]
-        
-        # Check fingerprint
-        db_etype = "UPDATE" if packet_type == "U" else ("ENROLMENT" if packet_type == "E" else "UPDATE")
-        rule = lookup_rule_by_reason_code(reason_code, db_etype)
-        
-        if rule:
-            current_fp = generate_rule_fingerprint(rule)
-            if current_fp != runbook["rule_fingerprint"]:
-                log.warning("Fingerprint mismatch", runbook_id=runbook_id, expected=runbook["rule_fingerprint"], actual=current_fp)
+
+        # The runbook path is an optimisation, never a correctness
+        # requirement: falling back to the agents always produces a valid
+        # result. Any failure here must therefore degrade to "agent", not
+        # propagate -- an uncaught TypeError from the fingerprint check used
+        # to fail agent.invoke() outright and DLQ every runbook-matching
+        # packet (F2).
+        try:
+            exec_summary = payload.get("packetExecutionSummary") or {}
+            error_data = exec_summary.get("errorData") or []
+            reason_code = None
+            for err in error_data:
+                if err and err.get("errorReasonCode"):
+                    reason_code = err.get("errorReasonCode")
+                    break
+
+            if not reason_code:
                 return {"resolution_source": "agent"}
-        
-        res_source = f"runbook:{runbook_id}@v{version}"
-        synthesis_json = json.dumps(runbook["resolution"])
-        
-        log.info("Runbook hit", runbook_id=runbook_id, version=version, mode=mode)
-        
-        if mode == "shadow":
-            return {"resolution_source": "agent", "shadow_runbook_resolution": synthesis_json}
-            
-        return {"resolution_source": res_source, "synthesis": synthesis_json, "runbook_id": runbook_id}
+
+            packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
+            runbook = get_runbook(reason_code, packet_type)
+            if not runbook:
+                return {"resolution_source": "agent"}
+
+            runbook_id = runbook["runbook_id"]
+            version = runbook["version"]
+
+            # Staleness check: serve the runbook only while the DB rule it was
+            # derived from is unchanged. Fingerprint the *parsed* rows, not the
+            # raw to_json string (F2).
+            rules = lookup_rule_for(reason_code, packet_type)
+            if rules:
+                current_fp = generate_rule_fingerprint(rules)
+                if current_fp != runbook["rule_fingerprint"]:
+                    log.warning("Fingerprint mismatch", runbook_id=runbook_id,
+                                expected=runbook["rule_fingerprint"], actual=current_fp)
+                    return {"resolution_source": "agent"}
+
+            res_source = f"runbook:{runbook_id}@v{version}"
+            synthesis_json = json.dumps(runbook["resolution"])
+
+            log.info("Runbook hit", runbook_id=runbook_id, version=version, mode=mode)
+            metrics.RUNBOOK_LOOKUPS.labels(outcome="hit").inc()
+
+            # A reason code not on the allowlist still runs the agents, but
+            # its runbook is compared against them -- which is how it earns
+            # its place on the allowlist (4.2).
+            if mode == "shadow" or not is_serve_allowed(reason_code):
+                if mode != "shadow":
+                    log.info("Runbook not yet cleared to serve; shadowing instead",
+                             runbook_id=runbook_id)
+                return {"resolution_source": "agent", "shadow_runbook_resolution": synthesis_json}
+
+            return {"resolution_source": res_source, "synthesis": synthesis_json, "runbook_id": runbook_id}
+        except Exception as e:
+            log.error("Runbook lookup failed; falling through to the agents",
+                      error=f"{type(e).__name__}: {e}", exc_info=True)
+            return {"resolution_source": "agent"}
 
     def check_runbook_hit(state: GraphState):
         if state.get("resolution_source", "").startswith("runbook:"):
@@ -243,32 +287,16 @@ def get_agent():
                     break
             
             if reason_code:
-                rule_tool = get_tool_by_name("lookup_rule_by_reason_code")
-                db_rule = rule_tool.invoke(reason_code)
-                
-                # Filter DB rule by enrolmentType if multiple rules are returned
+                # Lookup + enrolment-type filtering now live together in
+                # tool_registry.lookup_rule_text; this node previously carried
+                # its own copy of the filter, which drifted from the three
+                # runbook call sites' copy (F2).
+                packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
                 try:
-                    packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
-                    target_type = "UPDATE" if packet_type == "U" else ("ENROLMENT" if packet_type == "E" else None)
-                    
-                    if target_type and db_rule and db_rule.startswith("["):
-                        rules_list = json.loads(db_rule)
-                        filtered_rules = []
-                        for r in rules_list:
-                            try:
-                                rule_data = json.loads(r.get("rule_data", "{}"))
-                                cond = rule_data.get("statement", {}).get("Condition", {})
-                                str_eq = cond.get("StringEquals", {})
-                                rule_enrol_type = str_eq.get("enrolmentType")
-                                if rule_enrol_type == target_type or not rule_enrol_type:
-                                    filtered_rules.append(r)
-                            except Exception:
-                                filtered_rules.append(r)
-                        
-                        if filtered_rules:
-                            db_rule = json.dumps(filtered_rules)
+                    db_rule = lookup_rule_text(reason_code, packet_type)
                 except Exception as e:
-                    log.warning("Error filtering rules by enrolmentType", error=str(e))
+                    log.warning("Rule lookup failed", error=f"{type(e).__name__}: {e}")
+                    db_rule = f"Rule lookup failed for reason code {reason_code}: {e}"
             else:
                 db_rule = "No errorReasonCode found in payload."
 
@@ -310,6 +338,8 @@ def get_agent():
             ]})
 
         res = invoke_investigator()
+        metrics.record_llm_usage("investigator", res)
+        metrics.LLM_CALLS.labels(node="investigator", outcome="ok").inc()
         log.info("Investigator finished analysis")
         return {"investigation": res["messages"][-1].content, "db_rule": db_rule}
 
@@ -336,6 +366,8 @@ def get_agent():
             ]})
 
         res = invoke_reviewer()
+        metrics.record_llm_usage("reviewer", res)
+        metrics.LLM_CALLS.labels(node="reviewer", outcome="ok").inc()
         feedback = res["messages"][-1].content
         log.info("Reviewer finished assessment")
         return {"reviewer_feedback": feedback, "retry_count": state.get("retry_count", 0) + 1}
@@ -391,8 +423,71 @@ def get_agent():
             ]})
 
         res = invoke_synthesis()
+        metrics.record_llm_usage("synthesis", res)
+        metrics.LLM_CALLS.labels(node="synthesis", outcome="ok").inc()
         synthesis_content = res["messages"][-1].content
+
+        # Validate against the declared contract, and repair once. A malformed
+        # response used to fall back to {"rejection_description": <raw text>},
+        # producing a casebook with action: null that looked identical to a
+        # packet the agents genuinely could not classify (4.3).
+        parsed, error = parse_synthesis(synthesis_content)
+        if parsed is None:
+            log.warning("Synthesis output failed validation; requesting a repair",
+                        error=error)
+            metrics.LLM_CALLS.labels(node="synthesis", outcome="invalid").inc()
+
+            repair_prompt = (
+                f"Your previous response was rejected: {error}\n\n"
+                f"Previous response:\n{synthesis_content}\n\n"
+                f"Return ONLY the corrected JSON object. `action` must be one "
+                f"of {list(ACTIONS)} and `resident_action` one of "
+                f"{list(RESIDENT_ACTIONS)}."
+            )
+
+            @llm_breaker
+            @retry_transient
+            def invoke_repair():
+                return synthesis_agent.invoke({"messages": [
+                    SystemMessage(content=synthesis_prompt),
+                    HumanMessage(content=repair_prompt)
+                ]})
+
+            res = invoke_repair()
+            metrics.record_llm_usage("synthesis", res)
+            synthesis_content = res["messages"][-1].content
+            parsed, error = parse_synthesis(synthesis_content)
+
+        if parsed is None:
+            # Two failures. Escalating is the only honest outcome: we have no
+            # validated action, and inventing one would be worse than saying so.
+            log.error("Synthesis output invalid after repair; escalating",
+                      error=error)
+            metrics.LLM_CALLS.labels(node="synthesis", outcome="unrepairable").inc()
+            synthesis_content = json.dumps({
+                "rejection_description": (
+                    "ESCALATED: the Synthesis agent did not produce a valid "
+                    f"resolution after a repair attempt. Last error: {error}"
+                ),
+                "synthesis": "ESCALATED TO HUMAN REVIEW (invalid agent output).",
+                "action": "MANUAL_REVIEW",
+                "resident_action": "PENDING",
+            })
+        else:
+            parsed, abstained, reason = apply_confidence_policy(
+                parsed, logs=state.get("logs", "")
+            )
+            if reason:
+                log.warning("Confidence policy applied", detail=reason,
+                            abstained=abstained)
+            if abstained:
+                metrics.LLM_CALLS.labels(node="synthesis", outcome="abstained").inc()
+            synthesis_content = parsed.model_dump_json()
+
         log.info("Synthesis finished")
+        # How many Reviewer rejections this packet needed. A rising
+        # distribution is the earliest signal of prompt or model regression.
+        metrics.INVESTIGATOR_RETRIES.observe(max(0, state.get("retry_count", 1) - 1))
         
         shadow_res = state.get("shadow_runbook_resolution")
         if shadow_res:
@@ -409,7 +504,7 @@ def get_agent():
                         agent_synthesis=agent_res.get("synthesis")
                     )
             except Exception as e:
-                log.error("Failed to compare shadow divergence", error=str(e))
+                log.error("Failed to compare the shadow runbook resolution", error=f"{type(e).__name__}: {e}")
                 
         return {"synthesis": synthesis_content, "messages": res["messages"], "resolution_source": "agent"}
 
@@ -432,11 +527,8 @@ def get_agent():
     workflow.add_edge("synthesize", END)
     workflow.add_edge("escalate", END)
     
-    os.makedirs(CHECKPOINT_DB_PATH.parent, exist_ok=True)
-    conn = sqlite3.connect(str(CHECKPOINT_DB_PATH), check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    checkpointer = SqliteSaver(conn)
-    _agent = workflow.compile(checkpointer=checkpointer)
+    # Backend is selectable so two API replicas can share checkpoints (4.7).
+    _agent = workflow.compile(checkpointer=get_checkpointer())
     
-    logger.info("Deterministic Graph successfully constructed!")
+    logger.info("Agent graph constructed")
     return _agent

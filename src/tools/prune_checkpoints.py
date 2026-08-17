@@ -48,13 +48,13 @@ def main():
         return
         
     if args.dry_run:
-        print("\nDRY RUN - Would delete checkpoints for the following threads:")
+        print("\nDry run. Would delete checkpoints for the following threads:")
         for t in to_delete:
             print(f"  - {t}")
         return
         
     # 3. Delete the checkpoints
-    print("\nExecuting deletions...")
+    print("\nExecuting deletions.")
     deleted_checkpoints = 0
     deleted_writes = 0
     deleted_blobs = 0
@@ -83,7 +83,7 @@ def main():
     conn.execute("VACUUM") # Reclaim disk space
     conn.close()
     
-    print("\nPruning Complete!")
+    print("\nPruning complete.")
     print(f"Deleted {deleted_checkpoints} rows from checkpoints")
     print(f"Deleted {deleted_writes} rows from checkpoints_writes")
     print(f"Deleted {deleted_blobs} rows from checkpoints_blobs (if applicable)")

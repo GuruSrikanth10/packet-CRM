@@ -1,11 +1,14 @@
 import os
 import sys
 from pathlib import Path
-import logging
 
 from src.utils.env import get_bool_env
+from src.utils.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+# Every other module logs through structlog; this one used the stdlib logger,
+# so its startup errors arrived as unparseable plain text interleaved with the
+# JSON stream an aggregator expects (F21).
+logger = get_logger(__name__)
 
 def _collect_llm_key_errors() -> list:
     """Return validation errors for whichever LLM provider get_llm() will
@@ -51,7 +54,46 @@ def validate_config():
         if not api_key or api_key == "dev-secret-key":
             errors.append("PACKET_CRM_API_KEY must be explicitly set to a secure value in production (cannot be empty or 'dev-secret-key').")
 
-    # 4. Storage and SQLite checkpointer paths are writable
+    # 4. Scale-out backends are fully configured when selected (4.7). A
+    # half-configured backend must fail at boot, not on the first packet.
+    backend = os.environ.get("CASEBOOK_STORAGE_BACKEND", "local").strip().lower()
+    if backend == "s3":
+        if not (os.environ.get("CASEBOOK_S3_BUCKET") or os.environ.get("S3_LOGS_BUCKET")):
+            errors.append(
+                "CASEBOOK_STORAGE_BACKEND=s3 requires CASEBOOK_S3_BUCKET "
+                "(or S3_LOGS_BUCKET) to be set."
+            )
+    elif backend != "local":
+        errors.append(
+            f"Unknown CASEBOOK_STORAGE_BACKEND '{backend}'; expected 'local' or 's3'."
+        )
+
+    checkpoint_backend = os.environ.get("CHECKPOINT_BACKEND", "sqlite").strip().lower()
+    if checkpoint_backend == "postgres":
+        if not os.environ.get("CHECKPOINT_POSTGRES_URI"):
+            errors.append(
+                "CHECKPOINT_BACKEND=postgres requires CHECKPOINT_POSTGRES_URI to be set."
+            )
+    elif checkpoint_backend != "sqlite":
+        errors.append(
+            f"Unknown CHECKPOINT_BACKEND '{checkpoint_backend}'; expected 'sqlite' or 'postgres'."
+        )
+
+    # Local filelock does not coordinate across pods, so a multi-replica
+    # deployment on local storage silently loses the idempotency guard.
+    if backend == "local" and checkpoint_backend == "sqlite":
+        replicas = os.environ.get("API_REPLICA_COUNT", "1")
+        try:
+            if int(replicas) > 1:
+                errors.append(
+                    "API_REPLICA_COUNT > 1 requires CASEBOOK_STORAGE_BACKEND=s3 and "
+                    "CHECKPOINT_BACKEND=postgres: local filelock and a local SQLite "
+                    "file do not coordinate across pods."
+                )
+        except ValueError:
+            pass
+
+    # 5. Storage and SQLite checkpointer paths are writable
     try:
         from src.storage.factory import get_casebook_storage
         storage = get_casebook_storage()
@@ -73,8 +115,10 @@ def validate_config():
 
     if errors:
         for err in errors:
-            logger.error(f"Startup Validation Error: {err}")
-            print(f"Startup Validation Error: {err}", file=sys.stderr)
+            logger.error("Startup validation error", detail=err)
+            # Also to stderr: a boot failure must be visible even when the log
+            # stream is being shipped elsewhere or the level is raised.
+            print(f"Startup validation error: {err}", file=sys.stderr)
         sys.exit(1)
 
-    logger.info("Configuration validation passed.")
+    logger.info("Configuration validation passed")

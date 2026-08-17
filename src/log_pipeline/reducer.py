@@ -68,8 +68,11 @@ def branch_on_error(logs: list[dict]) -> dict:
     trimmed = logs[context_start:context_end]
 
     logger.info(
-        f"[REDUCER] ERROR branch: found {len(error_indices)} error(s). "
-        f"Trimmed to {len(trimmed)} lines (from index {context_start} to {context_end})."
+        "Reducer took the ERROR branch",
+        error_count=len(error_indices),
+        trimmed_lines=len(trimmed),
+        context_start=context_start,
+        context_end=context_end,
     )
 
     return {"has_error": True, "payload": trimmed}
@@ -188,7 +191,7 @@ def cluster_logs(logs: list[dict], catalog: Optional[TemplateCatalog] = None) ->
     # Sort by first_seen timestamp (not frequency -- the LLM needs the sequence)
     clusters_output.sort(key=lambda c: c["first_seen"])
 
-    logger.info(f"[REDUCER] Clustered {len(logs)} logs into {len(clusters_output)} templates.")
+    logger.info("Reducer clustered log lines", input_lines=len(logs), template_count=len(clusters_output))
     return clusters_output
 
 
@@ -271,9 +274,10 @@ def apply_evidence_guardrails(
             })
 
     logger.info(
-        f"[REDUCER] Guardrails: {len(decision_lines)} decision-vocab lines, "
-        f"{len(boundary_lines)} boundary lines, "
-        f"{sum(1 for c in processed if c.get('classification') == 'rare')} rare templates."
+        "Reducer applied evidence guardrails",
+        decision_vocabulary_lines=len(decision_lines),
+        boundary_lines=len(boundary_lines),
+        rare_templates=sum(1 for c in processed if c.get("classification") == "rare"),
     )
 
     return {

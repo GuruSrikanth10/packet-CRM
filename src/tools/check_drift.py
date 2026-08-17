@@ -1,9 +1,10 @@
 import os
 import csv
 import sys
-import logging
 
-logger = logging.getLogger(__name__)
+from src.utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 # A dummy representation of the expected "DB Schema" policies/columns
 KNOWN_DB_COLUMNS = {
@@ -18,17 +19,17 @@ def check_drift():
     rules_file = os.path.join(base_dir, "rules.csv")
     
     if not os.path.exists(rules_file):
-        logger.error(f"Cannot find rules file at {rules_file}")
+        logger.error("Cannot find the rules file", path=rules_file)
         sys.exit(1)
         
-    print(f"Checking {rules_file} against expected schema...")
+    print(f"Checking {rules_file} against the expected schema.")
     
     with open(rules_file, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         try:
             headers = next(reader)
         except StopIteration:
-            logger.error("Rules file is empty!")
+            logger.error("Rules file is empty", path=rules_file)
             sys.exit(1)
         first_data_row = next(reader, None)
 
@@ -46,7 +47,7 @@ def check_drift():
         sample = (first_data_row[0].strip().lower() if first_data_row else "")
         looks_like_broken_export = sample in KNOWN_DB_COLUMNS or sample == headers[0]
         print(
-            f"[ALERT] {rules_file} parsed as a single column ('{headers[0]}') "
+            f"ALERT: {rules_file} parsed as a single column ('{headers[0]}') "
             f"but {len(KNOWN_DB_COLUMNS)} columns are expected ({sorted(KNOWN_DB_COLUMNS)})."
         )
         if looks_like_broken_export:
@@ -64,11 +65,11 @@ def check_drift():
     drift_detected = False
     
     if unknown_columns:
-        print(f"[ALERT] Drift Detected: Found undocumented columns in rules.csv: {unknown_columns}")
+        print(f"ALERT: drift detected. Undocumented columns in rules.csv: {unknown_columns}")
         drift_detected = True
         
     if missing_columns:
-        print(f"[ALERT] Drift Detected: Expected columns missing from rules.csv: {missing_columns}")
+        print(f"ALERT: drift detected. Expected columns missing from rules.csv: {missing_columns}")
         drift_detected = True
         
     if drift_detected:

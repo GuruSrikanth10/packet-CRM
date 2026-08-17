@@ -1,9 +1,9 @@
 import json
-import logging
 from kafka import KafkaProducer
 from src.utils.env import get_required_env
+from src.utils.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 dlq_topic = get_required_env("KAFKA_DLQ_TOPIC", "rejected-packets-dlq")
 brokers = [
@@ -18,16 +18,21 @@ def get_producer():
         try:
             _producer = KafkaProducer(
                 bootstrap_servers=brokers,
-                value_serializer=lambda v: json.dumps(v).encode("utf-8")
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                # The DLQ is the last line of defence for a packet that failed
+                # everywhere else; losing the record because only the leader
+                # acked would defeat the point.
+                acks="all",
+                retries=3,
             )
         except Exception as e:
-            logger.error(f"Failed to initialize DLQ producer: {e}")
+            logger.error("Failed to initialize DLQ producer", error=str(e))
     return _producer
 
 def publish_to_dlq(payload, error_message: str):
     producer = get_producer()
     if not producer:
-        logger.error("DLQ Producer not available, dropping DLQ message.")
+        logger.error("DLQ producer not available; dropping DLQ message.")
         return
 
     dlq_message = {
@@ -44,6 +49,6 @@ def publish_to_dlq(payload, error_message: str):
     try:
         producer.send(dlq_topic, dlq_message)
         producer.flush()
-        logger.info(f"Successfully published to DLQ for event {event_id}")
+        logger.info("Published to DLQ", event_id=event_id, topic=dlq_topic)
     except Exception as e:
-        logger.error(f"Failed to publish to DLQ: {e}")
+        logger.error("Failed to publish to DLQ", event_id=event_id, error=str(e))

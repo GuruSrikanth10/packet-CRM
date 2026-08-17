@@ -45,7 +45,7 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    print(f"[BUILD_CATALOG] Processing {len(refids)} refids...")
+    print(f"Processing {len(refids)} refids.")
 
     # Track template presence across flows
     # template_id -> { "template": str, "flows_present": set(), "total_count": int }
@@ -53,7 +53,7 @@ def main():
     total_flows = len(refids)
 
     for i, refid in enumerate(refids):
-        print(f"\n--- [{i+1}/{total_flows}] Processing refid: {refid} ---")
+        print(f"\n[{i+1}/{total_flows}] Processing refid: {refid}")
         try:
             raw_logs = fetch_logs(refid, catalog=None)  # No catalog filtering during build
             if not raw_logs:
@@ -106,7 +106,7 @@ def main():
         )
 
     catalog.save()
-    print(f"\n[BUILD_CATALOG] Done. Catalog saved to {args.output} with {catalog.size} templates.")
+    print(f"\nDone. Catalog saved to {args.output} with {catalog.size} templates.")
 
     # Sanity check: before 0.1's Drain3 cross-flow leak fix, every template
     # ever seen (across every flow, not just the ones sampled here) got fed
@@ -120,10 +120,10 @@ def main():
             1 for tid in template_stats if catalog.get_classification(tid) == "boilerplate"
         )
         boilerplate_share = boilerplate_count / catalog.size
-        print(f"[BUILD_CATALOG] Boilerplate share: {boilerplate_share:.1%} ({boilerplate_count}/{catalog.size})")
+        print(f"Boilerplate share: {boilerplate_share:.1%} ({boilerplate_count}/{catalog.size})")
         if boilerplate_share > 0.40:
             print(
-                f"[BUILD_CATALOG] WARNING: {boilerplate_share:.1%} of templates classified as "
+                f"WARNING: {boilerplate_share:.1%} of templates classified as "
                 "boilerplate is implausibly high. Verify the Drain3 state file isn't leaking "
                 "templates across flows (see reducer.cluster_logs) before trusting this catalog."
             )

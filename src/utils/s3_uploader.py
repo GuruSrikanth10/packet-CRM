@@ -1,7 +1,26 @@
 import os
+import threading
 from typing import Optional
 import boto3
 from botocore.exceptions import ClientError
+
+from src.utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+# Cached across uploads: constructing a boto3 client resolves credentials and
+# builds a signer every time, which is wasted work per packet (F20).
+_s3_client = None
+_s3_client_lock = threading.Lock()
+
+
+def _get_s3_client():
+    global _s3_client
+    with _s3_client_lock:
+        if _s3_client is None:
+            _s3_client = boto3.client("s3")
+        return _s3_client
+
 
 def upload_logs_to_s3(event_id: str, logs: str) -> Optional[str]:
     """
@@ -14,17 +33,17 @@ def upload_logs_to_s3(event_id: str, logs: str) -> Optional[str]:
     if it were a real, resolvable link while the actual log text was
     discarded (1.12).
     """
+    log = logger.bind(event_id=event_id)
     bucket_name = os.environ.get("S3_LOGS_BUCKET")
 
     if not bucket_name:
-        print("[S3 UPLOADER] S3_LOGS_BUCKET not configured; cannot upload logs.")
+        log.info("S3_LOGS_BUCKET not configured; cannot upload logs.")
         return None
 
     try:
-        s3_client = boto3.client("s3")
         file_key = f"logs/{event_id}/raw_elastic_logs.txt"
 
-        s3_client.put_object(
+        _get_s3_client().put_object(
             Bucket=bucket_name,
             Key=file_key,
             Body=logs.encode('utf-8'),
@@ -32,12 +51,12 @@ def upload_logs_to_s3(event_id: str, logs: str) -> Optional[str]:
         )
 
         s3_url = f"s3://{bucket_name}/{file_key}"
-        print(f"[S3 UPLOADER] Logs successfully uploaded to: {s3_url}")
+        log.info("Logs uploaded to S3", s3_url=s3_url)
         return s3_url
 
     except ClientError as e:
-        print(f"[S3 UPLOADER] Failed to upload logs to S3: {e}")
+        log.error("Failed to upload logs to S3", error=str(e))
         return None
     except Exception as e:
-        print(f"[S3 UPLOADER] Unexpected S3 upload error: {e}")
+        log.error("Unexpected S3 upload error", error=str(e))
         return None
