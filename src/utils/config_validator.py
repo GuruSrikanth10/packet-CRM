@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 from src.utils.env import get_bool_env
+from src.utils.paths import LOCAL_CHECKPOINTS_DIR
 from src.utils.logging_config import get_logger
 
 # Every other module logs through structlog; this one used the stdlib logger,
@@ -106,7 +107,7 @@ def validate_config():
         errors.append(f"Failed to validate CasebookStorage path: {e}")
 
     try:
-        checkpoints_dir = Path(__file__).resolve().parent.parent.parent / "local_checkpoints"
+        checkpoints_dir = LOCAL_CHECKPOINTS_DIR
         os.makedirs(checkpoints_dir, exist_ok=True)
         if not os.access(checkpoints_dir, os.W_OK):
             errors.append(f"SQLite checkpoints directory ({checkpoints_dir}) is not writable.")

@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from src.utils.paths import CHECKPOINT_DB_PATH, REPO_ROOT
+from src.utils.paths import CHECKPOINT_DB_PATH, LOCAL_CASESHEETS_DIR, REPO_ROOT
 
 def main():
     parser = argparse.ArgumentParser(description="Prune LangGraph checkpoints for completed packets.")
@@ -19,7 +19,7 @@ def main():
         print(f"Database not found at {db_path}")
         return
         
-    casebook_dir = base_dir / "local_casesheets"
+    casebook_dir = LOCAL_CASESHEETS_DIR
     
     print(f"Connecting to SQLite database: {db_path}")
     conn = sqlite3.connect(db_path)

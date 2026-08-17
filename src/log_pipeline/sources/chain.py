@@ -90,10 +90,13 @@ def fetch_with_fallback(identifier: str, window: TimeWindow,
         try:
             result = source.fetch(identifier, window, ctx)
         except Exception as e:
-            # The final source's exception propagates: for Elasticsearch that
-            # preserves the @retry_transient / @es_breaker semantics on
-            # fetch_elastic_logs, which dispatch on exception type. Mid-chain
-            # we swallow it and advance, because a later source may succeed.
+            # The final source's exception propagates: that preserves the
+            # @retry_transient semantics on fetch_logs_for, which dispatch on
+            # exception type, and lets a CircuitBreakerError reach the handler
+            # that turns it into None. Mid-chain we swallow it and advance,
+            # because a later source may succeed -- which is the whole point,
+            # and is what an es_breaker wrapped around the entire chain used to
+            # prevent (G10).
             if is_last:
                 raise
             log.warning(

@@ -7,6 +7,8 @@ without touching pipeline logic.
 import os
 import re
 
+from src.utils.paths import CATALOG_PATH, DRAIN3_STATE_DIR  # noqa: F401
+
 # ---------------------------------------------------------------------------
 # Stage 2 -- ERROR branch
 # ---------------------------------------------------------------------------
@@ -23,11 +25,8 @@ ERROR_TRAILING_LINES = int(os.environ.get("LOG_ERROR_TRAILING_LINES", "200"))
 # ---------------------------------------------------------------------------
 # Path where the Drain3 TemplateMiner persists its parse tree between runs.
 # Keeping it stable across invocations is what gives us stable template IDs.
-DRAIN3_STATE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "local_checkpoints",
-    "drain3_state",
-)
+# Re-exported from utils.paths rather than re-derived with a third
+# dirname(dirname(dirname(...))) walk (G13).
 
 # ---------------------------------------------------------------------------
 # Stage 4 -- Evidence assembly guardrails
@@ -54,8 +53,4 @@ DECISION_VOCABULARY_REGEX = re.compile(
 # Stage 0 -- Offline template catalog
 # ---------------------------------------------------------------------------
 # Path to the persisted catalog JSON built by `build_catalog.py`.
-CATALOG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "local_checkpoints",
-    "template_catalog.json",
-)
+# Also re-exported from utils.paths (G13).

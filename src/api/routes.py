@@ -49,6 +49,76 @@ _agent_invoke_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=_MAX_CONCURRENT_INVESTIGATIONS, thread_name_prefix="agent-invoke"
 )
 
+# Set on SIGTERM so /ready starts failing and the orchestrator stops routing
+# new work here while in-flight investigations finish (G9).
+_draining = threading.Event()
+
+# Event ids currently inside agent.invoke(), so a shutdown can mark whatever
+# it could not finish rather than leaving IN_PROGRESS stubs behind.
+_in_flight_lock = threading.Lock()
+_in_flight_events: set = set()
+
+# How long the API waits for in-flight investigations on shutdown. Kept under
+# a typical terminationGracePeriodSeconds so the drain completes before
+# SIGKILL, mirroring the consumer's SHUTDOWN_DRAIN_SECONDS.
+API_SHUTDOWN_DRAIN_SECONDS = float(os.environ.get("API_SHUTDOWN_DRAIN_SECONDS", "25"))
+
+
+def _in_flight_investigations() -> int:
+    with _in_flight_lock:
+        return len(_in_flight_events)
+
+
+def drain_and_shutdown() -> None:
+    """Stop accepting work, let in-flight investigations finish, mark the rest.
+
+    F12 gave the consumer signal handling, a bounded drain, and a final
+    commit. The API got none of it: uvicorn stopped accepting connections
+    while `agent.invoke()` kept running on non-daemon threads, and SIGKILL
+    landed mid-investigation. Every packet caught that way left an
+    IN_PROGRESS status.json, which blocks reprocessing for
+    MAX_IN_PROGRESS_AGE_SECONDS -- 30 minutes by default. A rolling deploy
+    stalled every in-flight packet for half an hour (G9).
+    """
+    _draining.set()
+    logger.info("API draining", in_flight=_in_flight_investigations(),
+                budget_seconds=API_SHUTDOWN_DRAIN_SECONDS)
+
+    deadline = time.monotonic() + API_SHUTDOWN_DRAIN_SECONDS
+    while time.monotonic() < deadline and _in_flight_investigations() > 0:
+        time.sleep(0.25)
+
+    # A Python thread cannot be interrupted, so anything still running is
+    # abandoned rather than stopped. Its status.json must not be left at
+    # IN_PROGRESS or the packet is unreprocessable until it goes stale.
+    with _in_flight_lock:
+        stragglers = set(_in_flight_events)
+
+    if stragglers:
+        logger.warning("Marking investigations abandoned at shutdown",
+                       count=len(stragglers))
+        storage = get_casebook_storage()
+        for event_id in stragglers:
+            try:
+                if storage.terminal_status(event_id):
+                    continue
+                storage.save_terminal(event_id, {
+                    "packet_metadata": {"eid": event_id},
+                    "packet_status": {"status": "FAILED_SHUTDOWN"},
+                    "resolution": {"synthesis": (
+                        "The API shut down while this investigation was in "
+                        "flight. The Kafka offset was never committed, so the "
+                        "packet will be redelivered."
+                    )},
+                })
+            except Exception as e:
+                logger.error("Could not mark an abandoned investigation",
+                             event_id=event_id,
+                             error=f"{type(e).__name__}: {e}")
+
+    _agent_invoke_executor.shutdown(wait=False, cancel_futures=True)
+    logger.info("API shutdown complete")
+
 # Kafka producer health, cached so a burst of /ready probes (an orchestrator
 # typically polls this every few seconds) doesn't each attempt a fresh
 # connection/DNS resolution against the broker (2.7).
@@ -75,6 +145,24 @@ def _check_kafka_producer_ready() -> bool:
         _producer_health_cache["ready"] = ready
         _producer_health_cache["checked_at"] = now
     return ready
+
+
+@contextlib.contextmanager
+def _tracked_in_flight(event_id: str):
+    """Register a packet as in flight for the duration of the block.
+
+    Paired with `drain_and_shutdown`, which needs to know what it interrupted
+    so those packets can be marked terminal instead of stranded at
+    IN_PROGRESS (G9). Removal is in a finally so every exit path -- success,
+    timeout, DLQ, exception -- deregisters.
+    """
+    with _in_flight_lock:
+        _in_flight_events.add(event_id)
+    try:
+        yield
+    finally:
+        with _in_flight_lock:
+            _in_flight_events.discard(event_id)
 
 
 @contextlib.contextmanager
@@ -234,28 +322,38 @@ def rate_limiter(request: Request):
 
 @router.get("/health")
 def health_check():
-    import time
-    from pathlib import Path
-    
-    heartbeat_file = Path(__file__).resolve().parent.parent.parent / "local_checkpoints" / "consumer_heartbeat.txt"
-    last_heartbeat = None
-    if heartbeat_file.exists():
-        try:
-            with open(heartbeat_file, "r") as f:
-                last_heartbeat = float(f.read().strip())
-        except Exception:
-            pass
-            
-    is_consumer_alive = False
-    if last_heartbeat is not None:
-        # Consumer should poll every 5s, we give it a 30s grace period
-        is_consumer_alive = (time.time() - last_heartbeat) < 30
-        
-    return {
-        "status": "up",
-        "consumer_alive": is_consumer_alive,
-        "last_heartbeat": last_heartbeat
+    """Liveness for THIS process only.
+
+    `consumer_alive` used to be answered by reading the consumer's heartbeat
+    file off the local disk. That works under start.py, where both run on one
+    host, and cannot work when they are separate pods -- the deployment Phase F
+    exists to enable -- so it reported a permanently dead consumer and any
+    alert on it fired forever and got muted (G8). The consumer now serves its
+    own /health (CONSUMER_HEALTH_PORT); this reports what the API can actually
+    observe.
+
+    The heartbeat fields are still emitted when the file is readable, so a
+    single-host start.py deployment keeps the signal it had.
+    """
+    from src.utils.paths import CONSUMER_HEARTBEAT_PATH
+
+    payload = {
+        "status": "draining" if _draining.is_set() else "up",
+        "draining": _draining.is_set(),
+        "in_flight": _in_flight_investigations(),
+        "capacity": _MAX_CONCURRENT_INVESTIGATIONS,
     }
+
+    # Co-located deployment only. Absent is absent, not dead.
+    try:
+        stamp = float(CONSUMER_HEARTBEAT_PATH.read_text(encoding="utf-8").strip())
+        payload["last_heartbeat"] = stamp
+        payload["consumer_alive"] = (time.time() - stamp) < 30
+    except Exception:
+        payload["last_heartbeat"] = None
+        payload["consumer_alive"] = None  # unknown, not false
+
+    return payload
 
 @router.get("/ready")
 def readiness_check():
@@ -271,6 +369,12 @@ def readiness_check():
     # and ran setup()'s DDL every few seconds, never closing any of them, so
     # the probe exhausted max_connections and took the database down with it
     # (G4).
+    # A draining pod must fail readiness immediately: that is what makes the
+    # orchestrator stop sending it new packets while it finishes the ones it
+    # already has (G9).
+    if _draining.is_set():
+        raise HTTPException(status_code=503, detail="Draining")
+
     db_ready = False
     backend = checkpoint_backend_name()
     try:
@@ -356,7 +460,8 @@ async def process_rejection(signal: MessagePayload):
     below yields the event loop instead of occupying a slot in Starlette's
     sync-dispatch threadpool for the whole duration (2.6).
     """
-    with _packet_metrics() as outcome:
+    event_id = str(signal.eventId).strip()
+    with _packet_metrics() as outcome, _tracked_in_flight(event_id):
         response = await _investigate_packet(signal, outcome)
         # Paths that did not classify themselves fall back to the response
         # status, so no exit path goes uncounted (G15).
@@ -418,6 +523,7 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
 
     log = logger.bind(event_id=event_id)
     log.info("Processing Rejection", state="IN_PROGRESS")
+
 
     # Run the agent with exception handling for DLQ. Offloaded onto the
     # module-level bounded executor (not a per-request one) so agent.invoke

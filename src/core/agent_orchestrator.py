@@ -396,15 +396,25 @@ def get_agent():
 
         is_retry = bool(feedback)
         if is_retry:
-            # Retry: the static context (payload/logs/rule) was already sent
-            # on the first attempt and hasn't changed since -- resending it
-            # verbatim on every retry multiplies token cost for no benefit
-            # on a multi-retry packet. Send only the delta: the prior
-            # investigation plus the reviewer's feedback (2.3).
+            # Retry: send the delta plus the evidence.
+            #
+            # 2.3 dropped the payload, the rule AND the logs on retry, on the
+            # reasoning that none had changed since attempt one. That holds
+            # for the payload and the rule -- both are static and both are
+            # already reflected in the prior investigation. It does not hold
+            # for the logs: the Reviewer's most common rejection is that the
+            # findings are not grounded in the log evidence, and the retry
+            # then asked the Investigator to fix a citation problem with the
+            # citations removed from its context. It could not comply, so the
+            # loop ran to MAX_INVESTIGATION_RETRIES and escalated -- saving
+            # one log payload and spending three LLM round-trips plus a manual
+            # review to do it (G12).
             prompt = (
                 f"Your previous analysis:\n{investigation}\n\n"
                 f"Reviewer Feedback (You MUST fix your previous analysis): {feedback}\n\n"
             )
+            if logs and logs != "Log fetching disabled.":
+                prompt += f"Elasticsearch Logs (cite these):\n{logs}\n\n"
         else:
             # Project the payload down to only the fields the prompt
             # actually needs -- the full nested Kafka message carries many

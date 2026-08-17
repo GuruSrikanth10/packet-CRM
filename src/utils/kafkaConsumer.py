@@ -6,12 +6,13 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from kafka import KafkaConsumer
+from kafka import ConsumerRebalanceListener, KafkaConsumer
 from kafka.structs import OffsetAndMetadata
 from pathlib import Path
 from .env import get_required_env
 from src.storage.factory import get_casebook_storage
 from src.utils.logging_config import get_logger
+from src.utils.paths import CONSUMER_HEARTBEAT_PATH
 
 logger = get_logger(__name__)
 
@@ -41,6 +42,16 @@ SHUTDOWN_DRAIN_SECONDS = float(os.environ.get("SHUTDOWN_DRAIN_SECONDS", "25"))
 
 HEARTBEAT_INTERVAL_SECONDS = float(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "5"))
 
+# How old a heartbeat may be before this consumer calls itself dead. Six
+# intervals of grace, so a single slow tick does not fail a liveness probe.
+HEARTBEAT_STALE_SECONDS = float(
+    os.environ.get("HEARTBEAT_STALE_SECONDS", str(HEARTBEAT_INTERVAL_SECONDS * 6))
+)
+
+
+def _heartbeat_path() -> Path:
+    return CONSUMER_HEARTBEAT_PATH
+
 
 class OffsetTracker:
     """Per-partition offset bookkeeping that only ever commits a safe floor.
@@ -68,6 +79,55 @@ class OffsetTracker:
     def completed(self, tp, offset: int):
         with self._lock:
             self._completed[tp].add(offset)
+
+    def committable_for(self, partitions) -> dict:
+        """Take the safe floor for `partitions` only.
+
+        Used on partition revocation, where whatever is safe must be committed
+        before the partition moves to another member.
+        """
+        with self._lock:
+            wanted = set(partitions)
+            commits = {}
+            for tp in list(self._completed):
+                if tp not in wanted:
+                    continue
+                completed = self._completed[tp]
+                if not completed:
+                    continue
+
+                still_running = self._dispatched[tp] - completed
+                if still_running:
+                    floor = min(still_running)
+                    committable = {o for o in completed if o < floor}
+                else:
+                    committable = set(completed)
+
+                if not committable:
+                    continue
+
+                commits[tp] = OffsetAndMetadata(max(committable) + 1, None, -1)
+                self._dispatched[tp] -= committable
+                self._completed[tp] -= committable
+
+            return commits
+
+    def forget(self, partitions):
+        """Drop all state for partitions this consumer no longer owns.
+
+        Without this, revoked partitions kept their entries forever and
+        `_commit_ready_offsets` would happily commit offsets for a partition
+        now owned by a different group member -- moving that member's
+        committed position past messages it is still working on (G7).
+        """
+        with self._lock:
+            for tp in partitions:
+                self._dispatched.pop(tp, None)
+                self._completed.pop(tp, None)
+
+    def tracked_partitions(self) -> set:
+        with self._lock:
+            return set(self._dispatched) | set(self._completed)
 
     def abandoned(self, tp, offset: int):
         """Retire an offset that will never complete, without committing it.
@@ -316,6 +376,47 @@ def _handle_one_message(tp, msg):
             _queue_semaphore.release()
 
 
+class _RebalanceListener(ConsumerRebalanceListener):
+    """Keep offset bookkeeping honest across group rebalances (G7).
+
+    A rebalance happens whenever a member joins, leaves, or is evicted on
+    max_poll_interval_ms -- so running the two consumers that Phase F's exit
+    criteria call for makes it certain, and none of this had ever run.
+
+    On revoke: commit what is safe for those partitions while we still own
+    them, then drop their state. On assign: clear any stale state, because a
+    partition coming back must not inherit offsets from a previous ownership
+    period that another member has since advanced past.
+    """
+
+    def on_partitions_revoked(self, revoked):
+        if not revoked:
+            return
+        logger.info("Partitions revoked; committing and dropping their offsets",
+                    partitions=[str(tp) for tp in revoked])
+        commits = _offset_tracker.committable_for(revoked)
+        if commits and consumer is not None:
+            try:
+                consumer.commit(commits)
+            except Exception as e:
+                # The rebalance is already under way; the new owner will
+                # redeliver from the last committed offset, which is correct.
+                logger.warning("Could not commit on revoke; messages will redeliver",
+                               error=f"{type(e).__name__}: {e}")
+        _offset_tracker.forget(revoked)
+
+    def on_partitions_assigned(self, assigned):
+        if not assigned:
+            return
+        stale = _offset_tracker.tracked_partitions() & set(assigned)
+        if stale:
+            logger.warning("Dropping stale offset state for reassigned partitions",
+                           partitions=[str(tp) for tp in stale])
+            _offset_tracker.forget(stale)
+        logger.info("Partitions assigned",
+                    partitions=[str(tp) for tp in assigned])
+
+
 def _commit_ready_offsets():
     """Commit whatever the tracker says is safe. Never raises."""
     commits = _offset_tracker.take_committable()
@@ -360,6 +461,74 @@ def _start_heartbeat_thread(heartbeat_file: Path) -> threading.Thread:
     thread = threading.Thread(target=_tick, name="consumer-heartbeat", daemon=True)
     thread.start()
     return thread
+
+
+def is_healthy() -> bool:
+    """Has the heartbeat ticked recently enough to call this consumer alive?
+
+    Read by the consumer's own /health listener. The API used to answer this
+    by reading the heartbeat file off its local disk, which works only when
+    both processes share a filesystem -- in the split-pod deployment Phase F
+    exists to enable, `consumer_alive` was permanently false (G8).
+    """
+    if _shutdown.is_set():
+        return False
+    try:
+        stamp = float(_heartbeat_path().read_text(encoding="utf-8").strip())
+    except Exception:
+        return False
+    return (time.time() - stamp) < HEARTBEAT_STALE_SECONDS
+
+
+def _start_health_server():
+    """Serve GET /health for this process, if a port is configured.
+
+    Deliberately stdlib-only and tiny: the consumer is not an HTTP service and
+    should not grow a web framework to answer one boolean. Disabled by default
+    so single-host runs via start.py are unaffected.
+    """
+    port = os.environ.get("CONSUMER_HEALTH_PORT", "").strip()
+    if not port:
+        return None
+
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.rstrip("/") not in ("/health", ""):
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            healthy = is_healthy()
+            body = json.dumps({
+                "status": "up" if healthy else "down",
+                "in_flight": _offset_tracker.in_flight(),
+                "draining": _shutdown.is_set(),
+            }).encode("utf-8")
+
+            self.send_response(200 if healthy else 503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            # Probe traffic through structlog would drown the packet stream.
+            pass
+
+    try:
+        server = HTTPServer(("0.0.0.0", int(port)), _Handler)
+    except Exception as e:
+        logger.error("Could not start the consumer health listener",
+                     port=port, error=f"{type(e).__name__}: {e}")
+        return None
+
+    thread = threading.Thread(target=server.serve_forever,
+                              name="consumer-health", daemon=True)
+    thread.start()
+    logger.info("Consumer health listener started", port=int(port))
+    return server
 
 
 def request_shutdown(signum=None, frame=None):
@@ -407,8 +576,11 @@ def _drain_and_commit():
 def consume_forever():
     global consumer
     if consumer is None:
+        # The topic is NOT passed to the constructor: subscribing separately
+        # is what lets a ConsumerRebalanceListener be attached, which is how
+        # revoked partitions get committed and dropped instead of lingering in
+        # the tracker (G7).
         consumer = KafkaConsumer(
-            kafkaConsumerTopicName,
             group_id=kafkaConsumerGroupId,
             bootstrap_servers=kafkaConsumerBrokers,
             auto_offset_reset="earliest",
@@ -416,14 +588,17 @@ def consume_forever():
             max_poll_records=int(os.environ.get("KAFKA_MAX_POLL_RECORDS", MAX_CONCURRENT_INVESTIGATIONS)),
             max_poll_interval_ms=int(os.environ.get("KAFKA_MAX_POLL_INTERVAL_MS", "900000")),
         )
+        consumer.subscribe([kafkaConsumerTopicName],
+                           listener=_RebalanceListener())
 
     _install_signal_handlers()
 
     logger.info("Kafka consumer started", topic=kafkaConsumerTopicName, brokers=kafkaConsumerBrokers)
 
-    heartbeat_file = Path(__file__).resolve().parent.parent.parent / "local_checkpoints" / "consumer_heartbeat.txt"
+    heartbeat_file = _heartbeat_path()
     os.makedirs(heartbeat_file.parent, exist_ok=True)
     _start_heartbeat_thread(heartbeat_file)
+    _start_health_server()
 
     try:
         while not _shutdown.is_set():

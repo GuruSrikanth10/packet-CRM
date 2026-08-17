@@ -12,6 +12,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LOCAL_CHECKPOINTS_DIR = REPO_ROOT / "local_checkpoints"
 CHECKPOINT_DB_PATH = LOCAL_CHECKPOINTS_DIR / "checkpoints.db"
 
+# The consumer's liveness stamp. Independently re-derived in kafkaConsumer.py
+# and routes.py, which is how the two ended up agreeing only by coincidence
+# (G13).
+CONSUMER_HEARTBEAT_PATH = LOCAL_CHECKPOINTS_DIR / "consumer_heartbeat.txt"
+
+# Drain3's persisted parse tree and the template catalog. Both were derived
+# with their own `dirname(dirname(dirname(...)))` walks in log_pipeline/config.py.
+DRAIN3_STATE_DIR = LOCAL_CHECKPOINTS_DIR / "drain3_state"
+CATALOG_PATH = LOCAL_CHECKPOINTS_DIR / "template_catalog.json"
+
 # Where casebooks and their log artifacts live. This was independently
 # re-derived in storage/local.py, log_pipeline/pipeline.py (twice) and
 # log_pipeline/snapshot.py -- four copies of the same `parent.parent.parent`

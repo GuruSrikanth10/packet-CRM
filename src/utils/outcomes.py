@@ -180,3 +180,75 @@ def summarise(outcomes) -> dict:
             "accuracy": round(correct / total, 4) if total else 0.0,
         })
     return {"rows": rows, "total_outcomes": sum(r["total"] for r in rows)}
+
+
+def summarise_shadow(outcomes) -> dict:
+    """Score shadowed runbooks against the operator's verdict.
+
+    This is the runbook promotion gate (section 4.2, G18).
+
+    `summarise` above can only compare runbooks that are ALREADY serving,
+    because a shadowed packet's `resolution_source` is "agent". A runbook
+    cannot be cleared to serve until it has been compared, so that comparison
+    had no entry point at all. Shadow mode now records what the runbook WOULD
+    have decided, and this reconstructs the counterfactual:
+
+      agreed + CORRECT     -- the runbook would have been right
+      agreed + INCORRECT   -- both were wrong; the runbook is no worse
+      disagreed + CORRECT  -- the agents were right and the runbook was not:
+                              the case against promoting it
+      disagreed + INCORRECT -- the agents were wrong, so the runbook MIGHT
+                              have been right; not counted as a win, because
+                              nobody verified the runbook's own answer
+
+    `would_be_correct` is therefore deliberately conservative: it counts only
+    agreements confirmed correct by a human.
+    """
+    buckets = {}
+    for outcome in outcomes:
+        runbook_id = outcome.get("shadow_runbook_id")
+        if not runbook_id:
+            continue
+
+        key = (
+            outcome.get("reason_code") or "unknown",
+            outcome.get("enrolment_type") or "unknown",
+            runbook_id,
+        )
+        bucket = buckets.setdefault(key, {
+            "shadowed": 0, "agreed": 0, "disagreed": 0,
+            "would_be_correct": 0, "agent_correct": 0, "verdicts": 0,
+        })
+
+        bucket["shadowed"] += 1
+        agreed = bool(outcome.get("shadow_agreed"))
+        bucket["agreed" if agreed else "disagreed"] += 1
+
+        verdict = outcome.get("verdict")
+        if verdict in OUTCOME_VERDICTS:
+            bucket["verdicts"] += 1
+            if verdict == "CORRECT":
+                bucket["agent_correct"] += 1
+                if agreed:
+                    bucket["would_be_correct"] += 1
+
+    rows = []
+    for (reason_code, enrolment_type, runbook_id), counts in sorted(buckets.items()):
+        verdicts = counts["verdicts"]
+        rows.append({
+            "reason_code": reason_code,
+            "enrolment_type": enrolment_type,
+            "runbook_id": runbook_id,
+            **counts,
+            "agreement_rate": round(counts["agreed"] / counts["shadowed"], 4)
+            if counts["shadowed"] else 0.0,
+            # Accuracy the runbook would have achieved, over verified packets.
+            "would_be_accuracy": round(counts["would_be_correct"] / verdicts, 4)
+            if verdicts else 0.0,
+            # The agents' accuracy on the same packets, so the two are
+            # compared on identical traffic rather than across periods.
+            "agent_accuracy": round(counts["agent_correct"] / verdicts, 4)
+            if verdicts else 0.0,
+        })
+
+    return {"rows": rows, "total_shadowed": sum(r["shadowed"] for r in rows)}

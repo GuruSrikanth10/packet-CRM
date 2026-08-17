@@ -25,6 +25,21 @@ logger = get_logger(__name__)
 LOG_MAX_DOCUMENTS = int(os.environ.get("LOG_MAX_DOCUMENTS", "50000"))
 
 
+def _max_documents() -> int:
+    """Read at call time, like every other tunable in this subsystem.
+
+    The comment above promised this function existed; it did not, and line
+    `max_documents = LOG_MAX_DOCUMENTS` read the import-time constant instead.
+    So the one knob governing memory footprint on a noisy event was the only
+    one that could not be changed without a restart, or monkeypatched in a
+    test (G14).
+    """
+    try:
+        return int(os.environ.get("LOG_MAX_DOCUMENTS", str(LOG_MAX_DOCUMENTS)))
+    except ValueError:
+        return LOG_MAX_DOCUMENTS
+
+
 def _app_names() -> list:
     """Which application_name values to fetch.
 
@@ -219,7 +234,7 @@ def fetch_logs(event_id: str, catalog: Optional[TemplateCatalog] = None,
     logs = []
     search_after_values = None
     page_size = 500
-    max_documents = LOG_MAX_DOCUMENTS
+    max_documents = _max_documents()
 
     while True:
         # No seq_no_primary_term: the sort tiebreaker is _id, not _seq_no, so

@@ -9,12 +9,13 @@ from src.utils.llm_utils import get_llm
 from src.utils.runbook_validator import validate_generic_text
 from src.utils.runbook_store import write_draft_runbook, generate_rule_fingerprint
 from src.utils.logging_config import get_logger
+from src.utils.paths import LOCAL_CASESHEETS_DIR
 from src.tools.tool_registry import lookup_rule_for
 
 logger = get_logger(__name__)
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "RunbookGenerator.md"
-CASESHEETS_DIR = Path(__file__).resolve().parent.parent.parent / "local_casesheets"
+CASESHEETS_DIR = LOCAL_CASESHEETS_DIR
 
 def main():
     parser = argparse.ArgumentParser(description="Draft generic runbooks from casebooks.")

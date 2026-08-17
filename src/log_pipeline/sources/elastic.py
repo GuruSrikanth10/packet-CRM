@@ -18,6 +18,7 @@ from src.log_pipeline.types import (
     LogRecord,
     TimeWindow,
 )
+from src.utils.resilience import es_breaker
 
 
 class ElasticLogSource:
@@ -34,22 +35,22 @@ class ElasticLogSource:
         a behaviour change explicitly out of scope for Phase 1. The Kubernetes
         source uses it from Phase 3.
 
-        Exceptions are deliberately NOT caught here.
+        Breaker ownership sits HERE, not on `fetch_logs_for`.
         --------------------------------------------------------------
-        `fetch_elastic_logs` in `src/tools/tool_registry.py` carries
-        `@es_breaker` and `@retry_transient`, both of which dispatch on the
-        *type* of the raised exception. Catching an `ESConnectionError` here
-        and returning `ok=False` -- or wrapping it in a custom error -- would
-        silently disable retries and the circuit breaker, since neither would
-        ever see a type it recognises. Letting exceptions propagate untouched
-        preserves today's resilience semantics exactly.
+        `@es_breaker` used to wrap the whole reduction pipeline, which runs
+        the entire source chain -- so a Kubernetes outage tripped the
+        Elasticsearch breaker and then blocked the Elasticsearch fallback that
+        would have rescued the packet (G10). Scoped to this source, the
+        breaker counts only Elasticsearch failures, and an open breaker means
+        the chain moves on rather than the whole fetch failing.
 
-        `FetchResult.ok` is therefore always True for this source. It becomes
-        meaningful for the Kubernetes source (Phase 3), which handles its own
-        per-pod failures, and for the fallback chain (Phase 9).
+        Exceptions still propagate untouched. `@retry_transient` on
+        `fetch_logs_for` dispatches on exception TYPE, so swallowing an
+        `ESConnectionError` here and returning ok=False would silently disable
+        retries.
         """
         started = time.monotonic()
-        raw_logs = fetch_logs(identifier, catalog=ctx.catalog)
+        raw_logs = es_breaker.call(fetch_logs, identifier, catalog=ctx.catalog)
         latency_ms = (time.monotonic() - started) * 1000.0
 
         records = self._stamp_source(raw_logs or [])

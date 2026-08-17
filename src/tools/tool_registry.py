@@ -184,8 +184,6 @@ def normalize_enrolment_type(value: Optional[str]) -> Optional[str]:
     return _ENROLMENT_TYPE_ALIASES.get(str(value).strip().upper())
 
 
-@db_breaker
-@retry_transient
 def _lookup_rule_json(reason_code: str) -> str:
     """Cached, breaker-protected raw lookup. Returns the impl's JSON string
     (or its human-readable failure message).
@@ -193,6 +191,14 @@ def _lookup_rule_json(reason_code: str) -> str:
     This is the single protected path shared by the LLM-facing `@tool` and by
     the typed `lookup_rule_for` / `lookup_rule_text` helpers, so callers can't
     accidentally bypass the cache, the retry, or the circuit breaker.
+
+    The cache read is deliberately OUTSIDE the breaker. With it inside, an open
+    `db_breaker` raised CircuitBreakerError before the function body ran, so a
+    reason code whose rule was already cached and unexpired still failed --
+    and investigator_node substituted "Rule lookup failed for reason code X"
+    into the prompt. Every packet got a degraded prompt during a 60-second
+    MySQL blip, including the high-volume codes sitting valid in memory, which
+    is exactly what the TTL cache was added to prevent (G11).
     """
     with _rule_cache_lock:
         cached_result = _rule_cache.get(reason_code)
@@ -200,17 +206,27 @@ def _lookup_rule_json(reason_code: str) -> str:
         logger.info("Rule lookup cache hit", reason_code=reason_code)
         return cached_result
 
-    # The lookup itself runs OUTSIDE the lock: it can take seconds against a
-    # live DB, and holding the lock across it would serialise every concurrent
-    # packet behind one query. A duplicate concurrent lookup is cheap; a
-    # serialised pipeline is not.
-    result = _lookup_rule_by_reason_code_impl(reason_code)
+    result = _lookup_rule_uncached(reason_code)
 
     if not _is_uncacheable_result(result):
         with _rule_cache_lock:
             _rule_cache[reason_code] = result
 
     return result
+
+
+@db_breaker
+@retry_transient
+def _lookup_rule_uncached(reason_code: str) -> str:
+    """The protected path: retried, breaker-guarded, and only reached on a
+    cache miss.
+
+    Runs outside `_rule_cache_lock` on purpose: a live-DB query can take
+    seconds, and holding the lock across it would serialise every concurrent
+    packet behind one query. A duplicate concurrent lookup is cheap; a
+    serialised pipeline is not.
+    """
+    return _lookup_rule_by_reason_code_impl(reason_code)
 
 
 # Registry mimicking agentic-fms
@@ -342,7 +358,6 @@ def _lookup_rule_by_reason_code_impl(reason_code: str) -> str:
             return f"Failed to query live DB: {e}"
 
 
-@es_breaker
 @retry_transient
 def fetch_logs_for(event_id: str, extra_identifiers: tuple = ()) -> Optional[str]:
     """Fetch and reduce logs from Elastic using the 6-stage log reduction pipeline.
@@ -360,6 +375,14 @@ def fetch_logs_for(event_id: str, extra_identifiers: tuple = ()) -> Optional[str
     and "Failed to process logs...") and callers only ever checked for one
     of them, so the other silently flowed downstream as if it were log
     content (1.6).
+
+    Carries NO circuit breaker of its own. `@es_breaker` here guarded the
+    whole source chain, so Kubernetes failures were counted against the
+    Elasticsearch breaker -- twice, since k8s_breaker already wraps
+    KubernetesLogSource.fetch -- and, once it opened, the healthy
+    Elasticsearch fallback was refused too. The fallback chain was disabled
+    by exactly the failure it exists to absorb (G10). Each source now owns
+    its own breaker, where the failure is attributable.
     """
     log = logger.bind(event_id=event_id)
     log.info("Log fetch started", extra_identifiers=list(extra_identifiers or ()))

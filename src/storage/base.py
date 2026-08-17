@@ -24,6 +24,10 @@ TERMINAL_STATUSES = (
     # with a packet the agents genuinely could not classify -- the two used to
     # be indistinguishable, both surfacing as action: null (G5).
     "FAILED_SYNTHESIS_PARSE",
+    # The API shut down mid-investigation. Terminal so the packet is not
+    # stranded at IN_PROGRESS for MAX_IN_PROGRESS_AGE_SECONDS; its Kafka
+    # offset was never committed, so it is redelivered regardless (G9).
+    "FAILED_SHUTDOWN",
 )
 
 #: Terminal statuses recorded by an actor *other* than the API's own success
