@@ -101,6 +101,451 @@ sequenceDiagram
     API->>FS: Save to local_casesheets/casebook_{eventId}/casebook.json
 ```
 
+### 1.3 Complete Flow -- Every Path
+
+Sections 1.1 and 1.2 show the happy path. This section is the normative
+reference: every branch, degradation, and duplicate-arrival case the code
+actually implements. Where a diagram and the prose disagree, the code wins --
+each node below is annotated with the module that owns it.
+
+Five views, because one diagram covering all of it would be unreadable:
+
+| View | Answers |
+| --- | --- |
+| 1.3.1 Master flow | What happens to a packet from Kafka to terminal casebook |
+| 1.3.2 Log acquisition | Where logs come from, and what happens when they do not arrive |
+| 1.3.3 LangGraph state machine | Runbook modes, the retry loop, synthesis repair, abstention |
+| 1.3.4 Idempotency | What happens when the same packet arrives twice |
+| 1.3.5 Offset and failure matrix | Which failures commit, which redeliver, which stall |
+
+#### 1.3.1 Master flow
+
+```mermaid
+flowchart TD
+    classDef term fill:#7f1d1d,stroke:#450a0a,color:#ffffff
+    classDef skip fill:#1e40af,stroke:#1e3a8a,color:#ffffff
+    classDef good fill:#14532d,stroke:#052e16,color:#ffffff
+    classDef store fill:#334155,stroke:#0f172a,color:#ffffff
+    classDef dlq fill:#78350f,stroke:#451a03,color:#ffffff
+
+    K1(["Kafka: rejections topic"])
+
+    subgraph FAST["fast_consumer.py -- CONSUMER_ROLE=fast, kafkaConsumer.py"]
+        K1 --> POLL["poll, enable_auto_commit=false"]
+        POLL --> SEM{"worker slot free?<br/>_queue_semaphore"}
+        SEM -->|"no: block BEFORE parsing"| POLL
+        SEM -->|yes| TRK["OffsetTracker.dispatched tp, offset"]
+        TRK --> VAL{"decode utf-8, json.loads,<br/>MessagePayload validate"}
+        VAL -->|"invalid: poison pill"| PP["publish_to_dlq raw string"]
+        VAL -->|valid| RJ{"packetStatus == REJECTED?"}
+        RJ -->|no| SK1["skip: non-rejected packet"]
+        RJ -->|yes| D1{"terminal casebook exists?<br/>storage.exists terminal_only"}
+        D1 -->|"yes: DUPLICATE"| SK2["skip: already processed"]
+        D1 -->|no| SUB["worker pool submit"]
+    end
+
+    PP --> RC1["record_completion -- offset commits"]
+    SK1 --> RC1
+    SK2 --> RC1
+
+    SUB --> POST1["POST /fetch-logs<br/>FAST_CONSUMER_TIMEOUT_SECONDS=90"]
+
+    subgraph FL["POST /fetch-logs -- routes.py, sync, no LLM"]
+        POST1 --> AUTH1{"X-API-Key valid?<br/>hmac.compare_digest"}
+        AUTH1 -->|no| E403["403"]
+        AUTH1 -->|yes| RL1{"rate limit<br/>exempt CIDR or under RATE_LIMIT?"}
+        RL1 -->|no| E429["429"]
+        RL1 -->|yes| T1{"terminal_status in<br/>TERMINAL_STATUSES?"}
+        T1 -->|"yes: DUPLICATE"| AP1["200 already_processed"]
+        T1 -->|no| ART{"fetched_logs.txt exists?"}
+        ART -->|"yes: reuse artifact"| STAT
+        ART -->|no| FETCH["fetch_and_persist_logs<br/>see 1.3.2"]
+        FETCH --> FOK{"logs returned?"}
+        FOK -->|"yes or 'Log fetching disabled.'"| SAVEA["save_artifact fetched_logs.txt"]
+        FOK -->|"None: breaker open or pipeline raised"| NOSAVE["persist nothing<br/>slow side will retry live"]
+        SAVEA --> STAT
+        NOSAVE --> STAT
+        STAT{"status.json is<br/>absent or LOGS_FETCHED?"}
+        STAT -->|yes| WSTAT["write status.json = LOGS_FETCHED"]
+        STAT -->|"no: IN_PROGRESS or terminal"| KEEP["leave status.json untouched<br/>must not mask the IN_PROGRESS guard"]
+        WSTAT --> PUB
+        KEEP --> PUB
+        PUB{"publish_to_analysis_queue"}
+        PUB -->|raises| E500["500 -- offset NOT committed"]
+        PUB -->|ok| Q200["200 queued_for_analysis"]
+    end
+
+    E403 --> DLQ1
+    E429 --> DLQ1
+    E500 --> DLQ1["_dlq_and_abandon:<br/>publish DLQ, then release the floor"]
+    AP1 --> RC1
+    Q200 --> RC1
+
+    Q200 --> K2(["Kafka: packet-analysis-queue"])
+
+    subgraph SLOW["slow_consumer.py -- CONSUMER_ROLE=slow, same module"]
+        K2 --> POLL2["identical guards:<br/>poison pill, REJECTED, terminal dedupe"]
+        POLL2 --> POST2["POST /analyze-rejection<br/>PACKET_TIMEOUT_SECONDS=500"]
+    end
+
+    subgraph AN["POST /analyze-rejection -- _investigate_packet, async"]
+        POST2 --> T2{"casebook.json terminal?"}
+        T2 -->|"yes: DUPLICATE"| AP2["already_processed"]
+        T2 -->|no| CKPT["agent.get_state thread_id=eventId<br/>has_active_checkpoint = bool state.next"]
+        CKPT --> IP{"status.json == IN_PROGRESS?"}
+        IP -->|no| STUB
+        IP -->|yes| STALE{"age exceeds MAX_IN_PROGRESS_AGE_SECONDS<br/>default 1800s?"}
+        STALE -->|"no + active checkpoint"| RES["already_processing_resumed<br/>invoke None, resumes graph"]
+        STALE -->|"no + no checkpoint"| BUSY["already_processing -- skip"]
+        STALE -->|"yes + no checkpoint"| STUB["write status.json = IN_PROGRESS"]
+        STALE -->|"yes + active checkpoint"| RES
+        STUB --> INV["run_in_executor _agent_invoke_executor<br/>asyncio.wait_for AGENT_INVOKE_TIMEOUT_SECONDS"]
+        RES --> INV
+        INV --> GRAPH["LangGraph -- see 1.3.3"]
+        GRAPH --> OUT{"outcome"}
+        OUT -->|"asyncio.TimeoutError"| FT["save_terminal FAILED_TIMEOUT"]
+        OUT -->|"unhandled exception"| DQ["publish_to_dlq +<br/>save_terminal DLQ"]
+        OUT -->|"returned a state"| PARSE{"parse_synthesis<br/>against the contract"}
+        PARSE -->|invalid| FSP["FAILED_SYNTHESIS_PARSE<br/>evidence kept, verdict replaced"]
+        PARSE -->|valid| LOGSZ{"raw logs size"}
+        LOGSZ -->|"none / 'Log fetching disabled.'"| BUILD
+        LOGSZ -->|"5000 chars or fewer"| BUILD["build casebook"]
+        LOGSZ -->|"over 5000 chars"| S3{"upload_logs_to_s3"}
+        S3 -->|"URL"| BUILD
+        S3 -->|"None: no bucket or failed"| TRUNC["truncate to 5000 + notice"] --> BUILD
+        FSP --> BUILD
+        BUILD --> LATE{"terminal_status in<br/>PROTECTED_TERMINAL_STATUSES<br/>FAILED_TIMEOUT, DLQ?"}
+        LATE -->|"yes: another actor won"| DISC["discard late result"]
+        LATE -->|no| SAVE["save_terminal<br/>casebook.json + status.json together"]
+    end
+
+    AP2 --> RC2["record_completion -- offset commits"]
+    FT --> RC2
+    DQ --> RC2
+    RES --> RC2
+    BUSY --> RC2
+    DISC --> RC2
+    SAVE --> RC2
+
+    class PP,DLQ1,DQ,FT dlq
+    class SK1,SK2,AP1,AP2,BUSY,DISC,KEEP,NOSAVE skip
+    class SAVE,Q200,RC1,RC2 good
+    class SAVEA,WSTAT,STUB store
+    class E403,E429,E500,FSP term
+```
+
+#### 1.3.2 Log acquisition -- source chain and every failure mode
+
+`LOG_SOURCE` is an ordered chain, default `kubernetes,elastic`. Fallback fires
+when a source fails **or** returns zero records -- both mean "we did not get
+logs here". Sources are never merged; one wins per fetch.
+
+```mermaid
+flowchart TD
+    classDef gap fill:#78350f,stroke:#451a03,color:#ffffff
+    classDef bad fill:#7f1d1d,stroke:#450a0a,color:#ffffff
+    classDef good fill:#14532d,stroke:#052e16,color:#ffffff
+
+    A["fetch_and_persist_logs<br/>tool_registry.py"] --> EN{"ENABLE_LOG_FETCHING?"}
+    EN -->|false| DIS["logs = 'Log fetching disabled.'<br/>persisted verbatim"]
+    EN -->|true| CHAIN["reduce_logs, then fetch_with_fallback<br/>over the LOG_SOURCE chain"]
+
+    subgraph K8S["Kubernetes source -- sources/k8s/"]
+        CHAIN --> BRK{"k8s_breaker open?<br/>3 failures / 60s"}
+        BRK -->|"yes: fail fast"| KFAIL["FetchResult.failure"]
+        BRK -->|no| SNAP{"LOG_SNAPSHOT_REUSE<br/>and snapshot exists?"}
+        SNAP -->|"yes: replay capture"| KOK["records from raw_logs_k8s.jsonl<br/>deterministic, free, no API call"]
+        SNAP -->|no| DISC1{"namespace resolved?<br/>K8S_DEFAULT_NAMESPACE / K8S_SERVICE_MAP"}
+        DISC1 -->|no| KFAIL
+        DISC1 -->|yes| CLI{"client available?<br/>in-cluster, then kubeconfig"}
+        CLI -->|"no: unconfigured"| KFAIL
+        CLI -->|yes| NSV{"read_namespace ok?"}
+        NSV -->|"403 RBAC / 404"| KFAIL
+        NSV -->|yes| LIST["list_namespaced_pod<br/>label or name_contains match"]
+        LIST --> PHASE["skip Pending only<br/>Failed and Succeeded ARE read"]
+        PHASE --> CAP{"pods over K8S_MAX_PODS<br/>default 20?"}
+        CAP -->|yes| GAPT["gap: TRUNCATED<br/>newest-started kept"]
+        CAP -->|no| TGT
+        GAPT --> TGT{"any targets?"}
+        TGT -->|"no: looked, found nothing"| KEMPTY["ok=true, records=[]"]
+        TGT -->|yes| READ["read_all: bounded fan-out<br/>K8S_FETCH_CONCURRENCY=5"]
+        READ --> PER["per pod: previous instance if restarted,<br/>then current; streamed, filtered client-side"]
+        PER --> PERR{"per-pod outcome"}
+        PERR -->|404| GV["gap: POD_VANISHED"]
+        PERR -->|403| RBAC["logged distinctly, pod failed"]
+        PERR -->|"429 / 5xx"| RETRY["retry with jitter<br/>never retries 400/401/403/404/410"]
+        PERR -->|"byte cap K8S_MAX_BYTES_PER_POD"| GT2["gap: TRUNCATED"]
+        PERR -->|ok| COLLECT
+        RETRY --> COLLECT
+        GV --> COLLECT
+        RBAC --> COLLECT
+        GT2 --> COLLECT["collect records"]
+        READ --> DEAD{"K8S_TOTAL_FETCH_TIMEOUT_SECONDS<br/>expired?"}
+        DEAD -->|yes| GT3["gap: TRUNCATED, N pods unread<br/>pool shutdown wait=false"]
+        GT3 --> COLLECT
+        COLLECT --> ALLF{"every queried pod failed?"}
+        ALLF -->|"yes: COULD NOT LOOK"| KFAIL
+        ALLF -->|no| GAPS["detect LOG_ROTATION,<br/>POD_REPLACED, LEVEL_PARSE_DEGRADED"]
+        GAPS --> RED["redact PII<br/>allowlist = eventId, refId"]
+        RED --> SS["snapshot.save if records"]
+        SS --> KOK
+    end
+
+    KFAIL --> FB{"another source in the chain?"}
+    KEMPTY --> FB
+    FB -->|"yes: fall through"| ES
+    FB -->|"no: last source raises through"| NONE
+
+    subgraph ELASTIC["Elasticsearch source -- fetcher.py"]
+        ES{"ES_MOCK_FILE set?"}
+        ES -->|yes| MOCK["read CSV fixture"]
+        ES -->|no| HOST{"ES_HOST set?"}
+        HOST -->|no| MOCK2["single synthetic MOCK record"]
+        HOST -->|yes| EBRK{"es_breaker open?"}
+        EBRK -->|yes| EFAIL["raises through"]
+        EBRK -->|no| QUERY["paginated search_after<br/>capped at LOG_MAX_DOCUMENTS=50000"]
+        QUERY --> EOK["records"]
+    end
+
+    MOCK --> WIN
+    MOCK2 --> WIN
+    EOK --> WIN["winner selected<br/>gap: SOURCE_FALLBACK if anything was skipped"]
+    EFAIL --> NONE
+    KOK --> WIN
+
+    NONE["no source returned logs"] --> EMPTY["'No logs found for ID: X'<br/>+ gap banner"]
+
+    WIN --> RED2["redact before ANY persistence"]
+    RED2 --> RAW["save raw_logs.txt"]
+    RAW --> SIZE{"record count under 50?"}
+    SIZE -->|yes| DIRECT["emit full trace verbatim"]
+    SIZE -->|no| BR{"any level == ERROR?"}
+    BR -->|"yes: stuck path"| ERRP["ERROR + 200 lines before<br/>+ 200 lines after"]
+    BR -->|"no: approve/reject path"| CLU["Drain3 clustering<br/>+ evidence guardrails"]
+    DIRECT --> RDX
+    ERRP --> RDX
+    CLU --> RDX["save reduced_logs.txt<br/>banner FIRST if gaps exist"]
+    RDX --> PERSIST["save_artifact fetched_logs.txt"]
+    EMPTY --> PERSIST
+    DIS --> PERSIST
+
+    class KFAIL,EFAIL,NONE bad
+    class GAPT,GV,GT2,GT3,GAPS,EMPTY gap
+    class KOK,EOK,PERSIST,SS good
+```
+
+> **Why an empty result is not a failure.** `FetchResult.ok` separates
+> *could-not-look* from *looked-and-found-nothing*. Collapsing the two would let
+> the Investigator conclude "no errors occurred" when the truth is "we could not
+> read the logs". Every gap above is rendered into a banner placed **before** the
+> trace, and `apply_confidence_policy` caps confidence at
+> `SYNTHESIS_GAP_CONFIDENCE_CEILING` (0.6) whenever that banner is present.
+
+#### 1.3.3 LangGraph state machine
+
+Nodes are compiled once and cached (`get_agent`); the checkpointer is keyed on
+`thread_id = eventId`, which is what makes a resume possible.
+
+```mermaid
+stateDiagram-v2
+    [*] --> fetch_logs
+
+    fetch_logs: fetch_logs_node
+    note right of fetch_logs
+        Cache-first: fetched_logs.txt from /fetch-logs.
+        Artifact PRESENT - whatever its content, including
+        the disabled/no-logs sentinels - means a fetch was
+        already attempted. Absent falls back to a live
+        fetch, which is what keeps /process-rejection and
+        local_run.py working unchanged.
+    end note
+
+    fetch_logs --> runbook_lookup
+
+    state runbook_lookup {
+        [*] --> mode_check
+        mode_check: RUNBOOK_MODE?
+        mode_check --> agents_off: off (default) - counted as no lookup
+        mode_check --> resolve: shadow or serve
+        resolve --> miss_norc: no errorReasonCode
+        resolve --> miss_none: no runbook file
+        resolve --> miss_fp: rule_fingerprint mismatch (DB rule changed)
+        resolve --> miss_err: any exception - never propagates
+        resolve --> shadow_path: mode=shadow OR code not in RUNBOOK_SERVE_ALLOWLIST
+        resolve --> hit: mode=serve AND code allowlisted
+    }
+
+    hit --> [*]: SHORT-CIRCUIT - zero LLM calls, synthesis = runbook resolution
+    miss_norc --> route
+    miss_none --> route
+    miss_fp --> route
+    miss_err --> route
+    agents_off --> route
+    shadow_path --> route: runbook answer carried as shadow_runbook_resolution
+
+    route: check_runbook_hit
+    route --> filter_logs: ENABLE_LOG_FILTER_AGENT=true
+    route --> investigate: otherwise
+
+    filter_logs --> investigate: skipped when logs<br/>empty or disabled
+
+    investigate: investigator_node
+    note left of investigate
+        First pass sends a PROJECTED payload, the logs, and
+        the DB rule. Retry sends prior analysis + reviewer
+        feedback + the LOGS AGAIN - the reviewer's most
+        common rejection is unsupported citations, so the
+        retry must keep the evidence.
+    end note
+
+    investigate --> review
+    review: reviewer_node - retry_count += 1
+
+    state review_decision <<choice>>
+    review --> review_decision
+    review_decision --> synthesize: verdict starts with APPROVED
+    review_decision --> escalate: retry_count reached MAX_INVESTIGATION_RETRIES, default 3
+    review_decision --> investigate: rejected - loop back
+
+    note right of review
+        A rejection may also call add_learning_rule, which
+        is validated (injection markers, identifiers, length)
+        and queued to pending_rules.jsonl. Nothing reaches
+        the Investigator prompt without a human typing
+        "promote".
+    end note
+
+    state synthesize {
+        [*] --> parse1
+        parse1: parse_synthesis
+        parse1 --> policy: valid
+        parse1 --> repair: invalid - one repair attempt
+        repair --> parse2
+        parse2 --> policy: valid
+        parse2 --> unrepairable: still invalid
+        policy: apply_confidence_policy
+        policy --> capped: gap banner present - cap at GAP_CONFIDENCE_CEILING
+        policy --> abstain: confidence below SYNTHESIS_CONFIDENCE_THRESHOLD, 0 disables this
+        policy --> ok
+        capped --> ok
+        abstain --> ok: action forced to MANUAL_REVIEW
+        unrepairable --> ok: action forced to MANUAL_REVIEW
+    }
+
+    escalate: escalate_node - MANUAL_REVIEW plus full transcript
+    synthesize --> [*]
+    escalate --> [*]
+
+    note left of synthesize
+        Shadow comparison runs here: the runbook's action is
+        compared against the agents' and RETURNED as
+        shadow_comparison, so accuracy_report --shadow can
+        answer "would this runbook have been right?" -
+        the gate for promoting it to serve.
+    end note
+```
+
+Every LLM node is wrapped in `@llm_breaker` over `@retry_transient`: three
+tenacity attempts on transient provider errors, then the breaker opens after
+three consecutive failures and fails fast for 60s.
+
+#### 1.3.4 Idempotency -- the same packet arriving twice
+
+There are **nine** distinct duplicate-arrival guards. They exist at different
+layers because a duplicate can enter at any of them.
+
+```mermaid
+flowchart TD
+    classDef skip fill:#1e40af,stroke:#1e3a8a,color:#ffffff
+    classDef work fill:#14532d,stroke:#052e16,color:#ffffff
+
+    DUP(["Same eventId arrives again"]) --> WHERE{"where?"}
+
+    WHERE -->|"rejections topic redelivery"| G1{"terminal casebook?"}
+    G1 -->|yes| S1["G1: consumer skips,<br/>commits offset"]
+    G1 -->|no| G2
+
+    WHERE -->|"POST /fetch-logs"| G2{"terminal_status set?"}
+    G2 -->|yes| S2["G2: 200 already_processed"]
+    G2 -->|no| G3{"fetched_logs.txt exists?"}
+    G3 -->|yes| S3["G3: reuse artifact,<br/>no second cluster hit"]
+    G3 -->|no| W1["fetch"]
+    S3 --> G4
+    W1 --> G4{"status.json already<br/>IN_PROGRESS or terminal?"}
+    G4 -->|yes| S4["G4: do NOT rewrite to LOGS_FETCHED<br/>- would mask the IN_PROGRESS guard"]
+    G4 -->|no| W2["write LOGS_FETCHED"]
+
+    WHERE -->|"POST /analyze-rejection"| G5{"casebook.json terminal?"}
+    G5 -->|yes| S5["G5: already_processed"]
+    G5 -->|no| G6{"status.json IN_PROGRESS?"}
+    G6 -->|no| W3["proceed: fresh investigation"]
+    G6 -->|yes| G7{"active checkpoint?<br/>state.next non-empty"}
+    G7 -->|yes| S6["G6: already_processing_resumed<br/>- invoke None, continues mid-graph"]
+    G7 -->|"no + not stale"| S7["G7: already_processing<br/>- in flight between checkpoint writes"]
+    G7 -->|"no + stale over 1800s"| W4["G8: reprocess from scratch,<br/>retry_count reset to 0"]
+
+    WHERE -->|"slow run finishes AFTER<br/>a timeout/DLQ was recorded"| G9{"terminal_status in<br/>FAILED_TIMEOUT, DLQ?"}
+    G9 -->|yes| S8["G9: discard late result<br/>- checks BOTH files, closing F4"]
+    G9 -->|no| W5["save_terminal"]
+
+    class S1,S2,S3,S4,S5,S6,S7,S8 skip
+    class W1,W2,W3,W4,W5 work
+```
+
+| Guard | Location | Trigger | Result |
+| --- | --- | --- | --- |
+| G1 | `kafkaConsumer._handle_one_message` | terminal casebook exists | skip, commit offset |
+| G2 | `routes.fetch_logs` | `terminal_status` in `TERMINAL_STATUSES` | `already_processed` |
+| G3 | `routes.fetch_logs` | `fetched_logs.txt` present | reuse, no refetch |
+| G4 | `routes.fetch_logs` | status is `IN_PROGRESS`/terminal | leave status alone |
+| G5 | `_investigate_packet` | `casebook.json` terminal | `already_processed` |
+| G6 | `_investigate_packet` | `IN_PROGRESS` + active checkpoint | `already_processing_resumed` |
+| G7 | `_investigate_packet` | `IN_PROGRESS`, fresh, no checkpoint | `already_processing` |
+| G8 | `_investigate_packet` | `IN_PROGRESS` stale, no checkpoint | reprocess, `retry_count=0` |
+| G9 | `_investigate_packet` | `PROTECTED_TERMINAL_STATUSES` set | discard late result |
+
+> **`retry_count` is reset explicitly on G8.** `thread_id` is the `eventId`, so a
+> redelivered "fresh" invocation can otherwise resume a persisted checkpoint whose
+> `retry_count` is already at `MAX_INVESTIGATION_RETRIES` and escalate instantly
+> without doing any work.
+
+> **Scope limit.** G3/G4 rely on `filelock` (local backend) or last-writer-wins
+> (S3). Neither coordinates across pods, which is why `config_validator` refuses
+> to boot with `API_REPLICA_COUNT > 1` unless both `CASEBOOK_STORAGE_BACKEND=s3`
+> and `CHECKPOINT_BACKEND=postgres` are set.
+
+#### 1.3.5 Offset and failure matrix
+
+Offsets are never committed per message. `OffsetTracker` commits only the
+**low-water mark**: the highest offset below which every dispatched message has
+completed. Offsets 10, 11, 12 dispatched together with 12 finishing first
+commits nothing until 10 and 11 land.
+
+```mermaid
+flowchart LR
+    classDef good fill:#14532d,stroke:#052e16,color:#ffffff
+    classDef warn fill:#78350f,stroke:#451a03,color:#ffffff
+    classDef bad fill:#7f1d1d,stroke:#450a0a,color:#ffffff
+
+    F{"failure"} --> A["poison pill"] --> C1["DLQ + completed, then COMMIT"]
+    F --> B["non-REJECTED / duplicate"] --> C1
+    F --> C["/fetch-logs returns 2xx"] --> C1
+    F --> D["HTTP timeout"] --> D1["FAILED_TIMEOUT written best-effort,<br/>then DLQ, then COMMIT"]
+    F --> E["any other forward error"] --> E1["DLQ, then abandoned,<br/>so the floor advances"]
+    F --> G["DLQ itself unreachable"] --> G1["offset HELD uncommitted,<br/>stalls then redelivers"]
+    F --> H["consumer SIGTERM"] --> H1["drain SHUTDOWN_DRAIN_SECONDS,<br/>commit what finished, rest redelivers"]
+    F --> I["API SIGTERM mid-investigation"] --> I1["FAILED_SHUTDOWN written<br/>so nothing strands at IN_PROGRESS"]
+    F --> J["partition revoked"] --> J1["commit safe floor, then forget<br/>- never commit for a partition we lost"]
+
+    class C1,D1,E1,H1,I1,J1 good
+    class G1 bad
+```
+
+The one deliberate stall is `G1`. If the DLQ publish fails there is nowhere left
+to escalate to, so the offset stays dispatched: commits freeze for that
+partition rather than advancing past a message that would then exist nowhere.
+It self-heals on redelivery once the broker is reachable.
+
 ---
 
 ## 2. Directory Structure
