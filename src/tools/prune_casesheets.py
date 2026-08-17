@@ -30,7 +30,13 @@ TERMINAL_STATUSES = {
 }
 
 #: Bulky evidence files, safe to drop while keeping the casebook itself.
+#: outcome.json is deliberately NOT here: it is human-supplied ground truth
+#: and the entire accuracy dataset. Routine disk hygiene must not delete the
+#: only record of whether the system's resolutions were correct (G2).
 LOG_ARTEFACTS = ("raw_logs.txt", "reduced_logs.txt", "raw_logs_k8s.jsonl")
+
+#: Files worth keeping even when a whole casebook directory is pruned.
+PRESERVED_ON_PRUNE = ("outcome.json",)
 
 
 def _casebook_status(directory: Path):
@@ -113,6 +119,18 @@ def main():
                     if target.exists():
                         target.unlink()
                         removed += 1
+            elif any((directory / name).exists() for name in PRESERVED_ON_PRUNE):
+                # Recorded ground truth lives here. Drop everything else and
+                # keep the directory, rather than deleting the accuracy
+                # dataset as a side effect of reclaiming disk (G2).
+                for entry in directory.iterdir():
+                    if entry.name in PRESERVED_ON_PRUNE:
+                        continue
+                    if entry.is_dir():
+                        shutil.rmtree(entry)
+                    else:
+                        entry.unlink()
+                removed += 1
             else:
                 shutil.rmtree(directory)
                 removed += 1

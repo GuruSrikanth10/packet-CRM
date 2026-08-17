@@ -109,8 +109,50 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
         data = self.load(event_id, filename=filename)
         if not data:
             return False
-            
+
         if terminal_only:
             return data.get("packet_status", {}).get("status") in TERMINAL_STATUSES
 
         return True
+
+    # ------------------------------------------------------------------
+    # Blob artifacts (G3)
+    # ------------------------------------------------------------------
+
+    def save_artifact(self, event_id: str, filename: str, content: str) -> str:
+        """Atomic write, same discipline as save(): a crash mid-write must not
+        leave a half-written trace for a later run to trust."""
+        target_dir = self._get_dir(event_id)
+        final_path = target_dir / filename
+        tmp_path = target_dir / f"{filename}.tmp"
+        lock_path = target_dir / f"{filename}.lock"
+
+        with FileLock(str(lock_path), timeout=10):
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp_path, final_path)
+
+        return str(final_path)
+
+    def load_artifact(self, event_id: str, filename: str) -> Optional[str]:
+        final_path = self._resolve_dir(event_id) / filename
+        if not final_path.exists():
+            return None
+        lock_path = self._resolve_dir(event_id) / f"{filename}.lock"
+        with FileLock(str(lock_path), timeout=10):
+            try:
+                return final_path.read_text(encoding="utf-8")
+            except Exception:
+                return None
+
+    def artifact_exists(self, event_id: str, filename: str) -> bool:
+        return (self._resolve_dir(event_id) / filename).exists()
+
+    def list_events(self) -> list:
+        if not self.base_dir.exists():
+            return []
+        return sorted(
+            path.name[len("casebook_"):]
+            for path in self.base_dir.iterdir()
+            if path.is_dir() and path.name.startswith("casebook_")
+        )

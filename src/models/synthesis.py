@@ -52,6 +52,15 @@ class SynthesisResult(BaseModel):
     #: whereas defaulting to 1.0 would manufacture false certainty.
     confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
+    #: True when `apply_confidence_policy` overrode the model's own action and
+    #: routed to manual review. Set by the policy, never by the LLM.
+    #:
+    #: It lives on the model so it survives `model_dump_json()` and reaches the
+    #: casebook. Previously the policy returned it as a separate value that the
+    #: orchestrator logged and dropped, so nothing downstream could tell an
+    #: abstention apart from a genuine MANUAL_REVIEW verdict (G5).
+    abstained: bool = False
+
 
 def extract_json_block(text: str) -> Optional[str]:
     """Pull the JSON object out of an LLM response.
@@ -167,7 +176,8 @@ def apply_confidence_policy(result: SynthesisResult, logs: str = ""):
             f"routing to manual review instead of acting."
         )
 
-    updated = result.model_copy(update={"confidence": confidence})
+    updated = result.model_copy(update={"confidence": confidence,
+                                        "abstained": abstained})
     if abstained:
         updated = updated.model_copy(update={
             "action": "MANUAL_REVIEW",

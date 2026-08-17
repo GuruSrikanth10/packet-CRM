@@ -15,16 +15,13 @@ into casebook.json would mean rewriting a terminal record long after the fact
 and would make "what did the agent conclude" and "was it right" impossible to
 tell apart in an audit.
 """
-import json
-import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from filelock import FileLock
-
 from src.storage.base import OUTCOME_VERDICTS
+from src.storage.factory import get_casebook_storage
 from src.utils.logging_config import get_logger
-from src.utils.paths import LOCAL_CASESHEETS_DIR, casebook_dir
+from src.utils.paths import casebook_dir
 
 logger = get_logger(__name__)
 
@@ -57,12 +54,16 @@ def record_outcome(event_id: str, verdict: str, verified_by: str,
             f"verdict must be one of {OUTCOME_VERDICTS}, got {verdict!r}"
         )
 
-    directory = casebook_dir(event_id)
-    casebook_file = directory / "casebook.json"
-    if not casebook_file.exists():
+    # Through CasebookStorage, not the local filesystem. Reading casebook.json
+    # off disk meant that under CASEBOOK_STORAGE_BACKEND=s3 -- the backend
+    # Phase F added for scale-out -- no casebook was ever found locally, so
+    # POST /outcome/{id} returned 404 for every event and the accuracy dataset
+    # was permanently empty while looking merely unused (G2).
+    storage = get_casebook_storage()
+    casebook = storage.load(event_id, filename="casebook.json")
+    if not casebook:
         raise UnknownEventError(f"No casebook found for event {event_id}")
 
-    casebook = json.loads(casebook_file.read_text(encoding="utf-8"))
     resolution = casebook.get("resolution") or {}
     rejection_data = (casebook.get("packet_status") or {}).get("rejection_data") or {}
 
@@ -82,12 +83,10 @@ def record_outcome(event_id: str, verdict: str, verified_by: str,
         "corrected_action": corrected_action,
     }
 
-    path = outcome_path(event_id)
-    tmp_path = path.with_suffix(".json.tmp")
-    with FileLock(str(path) + ".lock", timeout=10):
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(outcome, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, path)
+    # The storage layer already writes atomically under a lock (local) or via
+    # an atomic PutObject (S3), so the temp-file dance that used to live here
+    # is redundant as well as filesystem-only.
+    storage.save(event_id, outcome, filename=OUTCOME_FILENAME)
 
     logger.info("Resolution outcome recorded", event_id=event_id, verdict=verdict,
                 resolution_source=outcome["resolution_source"])
@@ -95,32 +94,39 @@ def record_outcome(event_id: str, verdict: str, verified_by: str,
 
 
 def load_outcome(event_id: str) -> Optional[dict]:
-    path = outcome_path(event_id)
-    if not path.exists():
-        return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return get_casebook_storage().load(event_id, filename=OUTCOME_FILENAME)
     except Exception as e:
-        logger.warning("Unusable outcome file; ignoring", event_id=event_id,
-                       error=str(e))
+        logger.warning("Unusable outcome record; ignoring", event_id=event_id,
+                       error=f"{type(e).__name__}: {e}")
         return None
 
 
 def iter_outcomes():
-    """Yield every recorded outcome across all casebooks."""
-    if not LOCAL_CASESHEETS_DIR.exists():
+    """Yield every recorded outcome across all casebooks.
+
+    Enumerates through the storage layer rather than walking
+    LOCAL_CASESHEETS_DIR, which on the S3 backend is empty -- so this silently
+    yielded nothing and `accuracy_report` reported "No outcomes recorded yet"
+    no matter how many verdicts existed (G2).
+    """
+    storage = get_casebook_storage()
+    try:
+        event_ids = storage.list_events()
+    except Exception as e:
+        logger.warning("Could not enumerate casebooks",
+                       error=f"{type(e).__name__}: {e}")
         return
-    for directory in LOCAL_CASESHEETS_DIR.iterdir():
-        if not directory.is_dir():
-            continue
-        path = directory / OUTCOME_FILENAME
-        if not path.exists():
-            continue
+
+    for event_id in event_ids:
         try:
-            yield json.loads(path.read_text(encoding="utf-8"))
+            outcome = storage.load(event_id, filename=OUTCOME_FILENAME)
         except Exception as e:
-            logger.warning("Skipping unusable outcome file", path=str(path),
-                           error=str(e))
+            logger.warning("Skipping unusable outcome record", event_id=event_id,
+                           error=f"{type(e).__name__}: {e}")
+            continue
+        if outcome:
+            yield outcome
 
 
 def summarise(outcomes) -> dict:

@@ -244,7 +244,11 @@ def test_routes_falls_back_to_truncated_logs_when_s3_unset(monkeypatch):
     mock_agent = MagicMock()
     mock_agent.get_state.return_value = None
     mock_agent.invoke.return_value = {
-        "synthesis": json.dumps({"synthesis": "ok", "action": "NEW_PACKET", "resident_action": "NONE"}),
+        # Valid enum values: this test is about log truncation, and an invalid
+        # action here would route the packet down the FAILED_SYNTHESIS_PARSE
+        # path instead, testing something else entirely (G5).
+        "synthesis": json.dumps({"synthesis": "ok", "action": "REPLAY",
+                                 "resident_action": "NEW_PACKET"}),
         "logs": big_logs,
     }
 

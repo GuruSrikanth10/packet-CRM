@@ -78,6 +78,15 @@ def get_agent():
     logger.info("Building the agent graph")
     base_dir = os.path.dirname(os.path.dirname(__file__))
     llm = get_llm("complex")
+    # DELIBERATE DEVIATION (ENHANCEMENT_PLAN section 7.1, AUDIT_2026_08 G6).
+    # This reads "complex" on purpose. The Reviewer is a bounded verdict task
+    # and the cheaper "simple" tier would suit it -- that is the documented
+    # recommendation, and it is roughly a third of all LLM calls -- but the
+    # change was explicitly declined by the requester and has not been
+    # re-authorised. Flipping it is a one-word edit here; the regression test
+    # (tests/test_phase2_fixes.py::test_reviewer_built_once_with_simple_llm)
+    # is marked xfail(strict=True) against this exact line, so applying the
+    # fix turns that test green again and the xfail marker must then come off.
     simple_llm = get_llm("complex")
     
     def load_prompt(filename):
@@ -233,8 +242,10 @@ def get_agent():
     # event_id/investigation -- rebuilding a React agent (with the tool
     # schema binding that implies) on every single review call, and every
     # retry loop, was pure waste.
-    # 2.2: the Reviewer is a bounded verdict task, a natural fit for the
-    # cheaper "simple" tier, which was otherwise constructed and unused.
+    # 2.2: the Reviewer would be a natural fit for the cheaper "simple" tier.
+    # It is NOT on that tier today -- `simple_llm` is bound to "complex" by the
+    # deliberate deviation documented at its assignment above. The name is kept
+    # so the one-word fix stays a one-word fix.
     reviewer_agent = create_react_agent(simple_llm, tools=[add_learning_rule])
 
     def filter_logs_node(state: GraphState):

@@ -21,11 +21,21 @@ from src.utils import metrics, outcomes
 
 @pytest.fixture
 def casesheets(tmp_path, monkeypatch):
-    """Point every casesheets consumer at a tmp root."""
+    """Point every casesheets consumer at a tmp root.
+
+    Outcomes now read and write through CasebookStorage rather than the local
+    filesystem, so that a verdict can be recorded on any backend (G2). The
+    fixture therefore redirects the storage layer, not just the path
+    constants.
+    """
+    from src.storage.local import LocalFilesystemCasebookStorage
+
     monkeypatch.setattr("src.utils.paths.LOCAL_CASESHEETS_DIR", tmp_path)
-    monkeypatch.setattr(outcomes, "LOCAL_CASESHEETS_DIR", tmp_path)
     monkeypatch.setattr(outcomes, "casebook_dir",
                         lambda event_id: tmp_path / f"casebook_{event_id}")
+
+    storage = LocalFilesystemCasebookStorage(base_dir=str(tmp_path))
+    monkeypatch.setattr(outcomes, "get_casebook_storage", lambda: storage)
     return tmp_path
 
 

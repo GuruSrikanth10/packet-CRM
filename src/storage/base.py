@@ -19,6 +19,11 @@ TERMINAL_STATUSES = (
     "FAILED_PERMANENT",
     "DLQ",
     "FAILED_TIMEOUT",
+    # The agents produced output that does not satisfy the Synthesis contract,
+    # even after a repair attempt. Named distinctly so it is never confused
+    # with a packet the agents genuinely could not classify -- the two used to
+    # be indistinguishable, both surfacing as action: null (G5).
+    "FAILED_SYNTHESIS_PARSE",
 )
 
 #: Terminal statuses recorded by an actor *other* than the API's own success
@@ -56,5 +61,39 @@ class CasebookStorage(Protocol):
 
         Checking both is what closes F4: whichever actor got there first, its
         verdict is visible to every other actor.
+        """
+        ...
+
+    # ------------------------------------------------------------------
+    # Blob artifacts (G3)
+    # ------------------------------------------------------------------
+    # The JSON methods above cover casebook.json / status.json / outcome.json.
+    # Everything else beside a casebook -- raw_logs.txt, reduced_logs.txt, the
+    # Kubernetes snapshot JSONL -- was written straight to the local
+    # filesystem, bypassing this abstraction entirely. Under
+    # CASEBOOK_STORAGE_BACKEND=s3 those artifacts lived on whichever pod ran
+    # the packet and died with it, which silently disabled snapshot reuse --
+    # the mechanism that makes the short-retention Kubernetes source viable
+    # across retries, DLQ replays, and checkpoint resumes.
+
+    def save_artifact(self, event_id: str, filename: str, content: str) -> str:
+        """Persist a text artifact beside the casebook. Returns its locator."""
+        ...
+
+    def load_artifact(self, event_id: str, filename: str) -> Optional[str]:
+        """Read a text artifact back, or None when it is absent/unreadable."""
+        ...
+
+    def artifact_exists(self, event_id: str, filename: str) -> bool:
+        """Is this artifact present?"""
+        ...
+
+    def list_events(self) -> list:
+        """Every event id this store holds a casebook directory for.
+
+        Needed so `iter_outcomes()` can aggregate accuracy without walking the
+        local filesystem, which returned nothing at all on the S3 backend and
+        made `accuracy_report` print "No outcomes recorded yet" regardless of
+        how many verdicts had been recorded (G2).
         """
         ...

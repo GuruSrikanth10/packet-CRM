@@ -126,3 +126,65 @@ class S3CasebookStorage(CasebookStorage):
             if status in TERMINAL_STATUSES:
                 return status
         return None
+
+    # ------------------------------------------------------------------
+    # Blob artifacts (G3)
+    # ------------------------------------------------------------------
+
+    def save_artifact(self, event_id: str, filename: str, content: str) -> str:
+        """PutObject is atomic at the object level, so no temp-key dance --
+        the same reasoning as save() above."""
+        key = self._key(event_id, filename)
+        _get_client().put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=content.encode("utf-8"),
+            ContentType="text/plain; charset=utf-8",
+        )
+        return f"s3://{self.bucket}/{key}"
+
+    def load_artifact(self, event_id: str, filename: str) -> Optional[str]:
+        try:
+            response = _get_client().get_object(
+                Bucket=self.bucket, Key=self._key(event_id, filename)
+            )
+            return response["Body"].read().decode("utf-8")
+        except Exception as e:
+            # A missing artifact is the common case (every fresh packet probes
+            # for a snapshot), so only a non-404 is worth reporting.
+            if getattr(e, "response", {}).get("Error", {}).get("Code") not in ("NoSuchKey", "404"):
+                logger.warning("Failed to load artifact from S3", event_id=event_id,
+                               filename=filename, error=f"{type(e).__name__}: {e}")
+            return None
+
+    def artifact_exists(self, event_id: str, filename: str) -> bool:
+        try:
+            _get_client().head_object(
+                Bucket=self.bucket, Key=self._key(event_id, filename)
+            )
+            return True
+        except Exception:
+            return False
+
+    def list_events(self) -> list:
+        """List casebook prefixes, paginated.
+
+        Delimiter="/" makes S3 return the directory-like CommonPrefixes rather
+        than every object under them, so this stays one round-trip per 1000
+        events instead of one per artifact.
+        """
+        prefix = f"{self.prefix}/casebook_" if self.prefix else "casebook_"
+        events = []
+        try:
+            paginator = _get_client().get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix,
+                                           Delimiter="/"):
+                for entry in page.get("CommonPrefixes", []):
+                    name = entry["Prefix"][len(prefix):].rstrip("/")
+                    if name:
+                        events.append(name)
+        except Exception as e:
+            logger.warning("Failed to list casebooks from S3",
+                           error=f"{type(e).__name__}: {e}")
+            return []
+        return sorted(events)

@@ -69,6 +69,26 @@ class OffsetTracker:
         with self._lock:
             self._completed[tp].add(offset)
 
+    def abandoned(self, tp, offset: int):
+        """Retire an offset that will never complete, without committing it.
+
+        Registering an offset as dispatched and then never completing it used
+        to strand it in `_dispatched` forever. `take_committable` takes
+        `min(still_running)` as its floor, so that one offset became a
+        permanent floor and NOTHING on the partition could ever be committed
+        again -- the consumer kept processing packets correctly and silently
+        stopped committing until it was restarted (G1). One `FileLock` timeout
+        or S3 blip inside `_handle_one_message` was enough to trigger it.
+
+        Retiring it here advances the floor past a message this process did
+        not finish, so callers MUST hand the message to the DLQ in the same
+        branch. That is the trade: a bounded, visible DLQ entry instead of an
+        unbounded, invisible commit stall.
+        """
+        with self._lock:
+            self._dispatched[tp].discard(offset)
+            self._completed[tp].discard(offset)
+
     def in_flight(self) -> int:
         with self._lock:
             return sum(len(self._dispatched[tp] - self._completed[tp])
@@ -141,6 +161,32 @@ def _record_completion(message_offsets):
         _offset_tracker.completed(tp, offset_and_metadata.offset - 1)
 
 
+def _record_abandonment(message_offsets):
+    """Retire offsets this process will not finish, so the floor can advance.
+
+    Always paired with a DLQ publish by the caller -- see
+    `OffsetTracker.abandoned` for why the pairing is mandatory (G1).
+    """
+    if not message_offsets:
+        return
+    for tp, offset_and_metadata in message_offsets.items():
+        _offset_tracker.abandoned(tp, offset_and_metadata.offset - 1)
+
+
+def _dlq_and_abandon(payload, error_message: str, message_offsets: dict):
+    """Hand a message to the DLQ and release its hold on the commit floor.
+
+    Order matters: publish first, retire second. If the DLQ publish itself
+    fails, the offset stays dispatched and the floor stays put -- a commit
+    stall is bad, but it is better than advancing past a message that now
+    exists nowhere at all.
+    """
+    from src.utils.dlq_publisher import publish_to_dlq
+
+    publish_to_dlq(payload, error_message)
+    _record_abandonment(message_offsets)
+
+
 def _process_and_commit(signal_payload: dict, message_offsets: dict = None):
     event_id = signal_payload.get("eventId")
     success = False
@@ -165,8 +211,27 @@ def _process_and_commit(signal_payload: dict, message_offsets: dict = None):
         from src.utils.dlq_publisher import publish_to_dlq
         publish_to_dlq(signal_payload, "Pipeline timed out (PACKET_TIMEOUT_SECONDS exceeded)")
         success = True  # Successfully handled via DLQ, so we should commit
-    except Exception:
-        logger.exception("Error forwarding Kafka message; will not commit offset", event_id=event_id)
+    except Exception as e:
+        # Not committed -- but not left dangling either. Leaving the offset
+        # dispatched-and-never-completed pinned the partition's commit floor
+        # forever, so a single failed forward silently froze commits for every
+        # later message on that partition (G1). Route it to the DLQ, where it
+        # is visible and replayable, and release the floor.
+        logger.exception("Error forwarding Kafka message; routing to the DLQ",
+                         event_id=event_id)
+        try:
+            _dlq_and_abandon(
+                signal_payload,
+                f"Forwarding to the internal endpoint failed: {type(e).__name__}: {e}",
+                message_offsets,
+            )
+        except Exception as dlq_error:
+            # DLQ unreachable too. The offset intentionally stays dispatched:
+            # stalling commits is the lesser evil against advancing past a
+            # message that would then exist nowhere.
+            logger.error("DLQ publish failed; holding the offset uncommitted",
+                         event_id=event_id,
+                         error=f"{type(dlq_error).__name__}: {dlq_error}")
     finally:
         if success:
             _record_completion(message_offsets)
@@ -187,6 +252,7 @@ def _handle_one_message(tp, msg):
     commit 12 and strand 10.
     """
     submitted = False
+    signal_payload = None
 
     # Track only this message's offset, never the whole polled batch -- a bare
     # consumer.commit() advances past every message in the batch, including
@@ -227,9 +293,24 @@ def _handle_one_message(tp, msg):
 
         _worker_pool.submit(_process_and_commit, signal_payload, message_offsets)
         submitted = True
-    except Exception:
+    except Exception as e:
         payload_sample = payload[:500] if 'payload' in locals() else 'Decode failed'
-        logger.exception("Error processing Kafka message", payload_sample=payload_sample)
+        logger.exception("Error processing Kafka message; routing to the DLQ",
+                         payload_sample=payload_sample)
+        # This branch is reached by anything the happy path can raise: a
+        # FileLock timeout or S3 error inside storage.exists(), a
+        # get_casebook_storage() failure, a decode fault. Every one of them
+        # used to leave this offset dispatched forever and freeze the
+        # partition's commit floor (G1).
+        try:
+            _dlq_and_abandon(
+                signal_payload if signal_payload is not None else payload_sample,
+                f"Consumer-side processing failed: {type(e).__name__}: {e}",
+                message_offsets,
+            )
+        except Exception as dlq_error:
+            logger.error("DLQ publish failed; holding the offset uncommitted",
+                         error=f"{type(dlq_error).__name__}: {dlq_error}")
     finally:
         if not submitted:
             _queue_semaphore.release()

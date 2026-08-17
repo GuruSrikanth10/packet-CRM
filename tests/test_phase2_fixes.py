@@ -5,6 +5,8 @@ import inspect
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.models.schemas import MessagePayload
 from src.storage.factory import get_casebook_storage
 from src.api.routes import process_rejection
@@ -80,6 +82,18 @@ def test_investigator_prompt_trims_context_on_retry(monkeypatch):
 # the cheaper "simple" LLM tier instead of the unused-but-constructed one.
 # ======================================================================
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Deliberate deviation: the Reviewer is bound to the 'complex' tier at "
+        "agent_orchestrator.py get_agent(). The 'simple'-tier fix was explicitly "
+        "declined by the requester (ENHANCEMENT_PLAN section 7.1, AUDIT_2026_08 "
+        "G6). This assertion is kept -- and kept failing -- so the cost signal "
+        "survives rather than being deleted. strict=True means that if the fix "
+        "is ever applied, this test fails as XPASS and forces the marker off, "
+        "so the two can never silently drift apart."
+    ),
+)
 def test_reviewer_built_once_with_simple_llm(monkeypatch):
     import src.core.agent_orchestrator as orch
 

@@ -19,8 +19,19 @@ from src.tools import prune_casesheets
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
+    """Point snapshots at a tmp root.
+
+    Snapshots now persist through CasebookStorage rather than writing to the
+    local filesystem directly, so that they survive on any backend and remain
+    reusable across replicas (G3). The isolation therefore has to redirect the
+    storage layer as well as the path helper.
+    """
+    from src.storage.local import LocalFilesystemCasebookStorage
+
     monkeypatch.delenv("LOG_SNAPSHOT_REUSE", raising=False)
     monkeypatch.setattr(snapshot, "_casesheets_root", lambda: tmp_path)
+    monkeypatch.setattr(snapshot, "get_casebook_storage",
+                        lambda: LocalFilesystemCasebookStorage(base_dir=str(tmp_path)))
     yield
 
 
@@ -109,9 +120,17 @@ def test_missing_meta_still_loads_records(tmp_path):
 
 
 def test_save_failure_is_not_fatal(monkeypatch):
-    """Failing to write a snapshot must not fail the packet."""
-    monkeypatch.setattr(snapshot, "snapshot_dir",
-                        lambda _e: Path("/proc/nonexistent/nope"))
+    """Failing to write a snapshot must not fail the packet.
+
+    Induced at the storage seam rather than by pointing snapshot_dir at an
+    unwritable path: persistence goes through CasebookStorage now, so the
+    old path-based fault never reached the write (G3).
+    """
+    class BrokenStorage:
+        def save_artifact(self, *_args, **_kwargs):
+            raise OSError("backing store unavailable")
+
+    monkeypatch.setattr(snapshot, "get_casebook_storage", BrokenStorage)
     assert snapshot.save("evt-8", _records()) is False
 
 

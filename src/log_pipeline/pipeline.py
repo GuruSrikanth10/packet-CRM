@@ -18,9 +18,9 @@ from src.log_pipeline.reducer import branch_on_error, cluster_logs, apply_eviden
 from src.log_pipeline.sources import chain as source_chain
 from src.log_pipeline.sources.k8s import gaps as k8s_gaps
 from src.log_pipeline.types import FetchContext, TimeWindow
+from src.storage.factory import get_casebook_storage
 from src.utils import metrics
 from src.utils.logging_config import get_logger
-from src.utils.paths import casebook_dir
 
 logger = get_logger(__name__)
 
@@ -262,36 +262,33 @@ def _format_normal_path(event_id: str, assembled: dict,
 # Disk persistence
 # ======================================================================
 
-def _write_artifact(event_id: str, filename: str, render) -> str:
-    """Write one log artifact beside the casebook and return its path.
+def _write_artifact(event_id: str, filename: str, content: str) -> str:
+    """Persist one log artifact beside the casebook and return its locator.
 
-    The directory comes from utils.paths rather than a local
-    `parent.parent.parent` walk -- this module used to re-derive it twice, and
-    storage/local.py and snapshot.py once each, so a change to the casesheets
-    root silently split them apart (F22).
+    Goes through CasebookStorage rather than writing to the local filesystem.
+    F22 consolidated the *path* derivation here but left the storage bypass in
+    place, so under CASEBOOK_STORAGE_BACKEND=s3 these artifacts still landed on
+    whichever pod ran the packet and died with it (G3). The casebook itself was
+    in S3, its evidence was not.
     """
     try:
-        log_dir = casebook_dir(event_id)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file_path = log_dir / filename
-        with open(log_file_path, "w", encoding="utf-8") as f:
-            render(f)
-        logger.bind(event_id=event_id).info("Log artifact saved", filename=filename, path=str(log_file_path))
-        return str(log_file_path)
+        locator = get_casebook_storage().save_artifact(event_id, filename, content)
+        logger.bind(event_id=event_id).info("Log artifact saved", filename=filename, path=locator)
+        return locator
     except Exception as e:
         logger.bind(event_id=event_id).error("Failed to save log artifact", filename=filename, error=f"{type(e).__name__}: {e}")
         return "Failed to save"
 
 
 def _save_raw_logs(event_id: str, logs: list[dict]) -> str:
-    """Write raw logs to disk and return the file path."""
-    def render(f):
-        for log in logs:
-            f.write(f"[{log['timestamp']}] [{_origin(log)}] [{log['level']}] {log['message']}\n")
-
-    return _write_artifact(event_id, "raw_logs.txt", render)
+    """Persist raw logs and return the artifact locator."""
+    body = "".join(
+        f"[{log['timestamp']}] [{_origin(log)}] [{log['level']}] {log['message']}\n"
+        for log in logs
+    )
+    return _write_artifact(event_id, "raw_logs.txt", body)
 
 
 def _save_reduced_logs(event_id: str, reduced_text: str) -> str:
-    """Write reduced logs to disk and return the file path."""
-    return _write_artifact(event_id, "reduced_logs.txt", lambda f: f.write(reduced_text))
+    """Persist reduced logs and return the artifact locator."""
+    return _write_artifact(event_id, "reduced_logs.txt", reduced_text)

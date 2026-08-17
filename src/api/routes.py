@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Security, Request, Respon
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from src.models.schemas import EVENT_ID_PATTERN, MessagePayload
+from src.models.synthesis import parse_synthesis
 from src.utils import metrics
 from src.utils.outcomes import (
     InvalidVerdictError,
@@ -225,31 +226,22 @@ def health_check():
 
 @router.get("/ready")
 def readiness_check():
-    import sqlite3
-    from src.utils.paths import CHECKPOINT_DB_PATH
     from src.core.checkpointer import backend_name as checkpoint_backend_name
-    from src.core.checkpointer import get_checkpointer
+    from src.core.checkpointer import health_check as checkpoint_health_check
 
     # Check checkpoint storage. Probing SQLite unconditionally would report a
     # Postgres-backed deployment as unready forever, since it has no local
     # checkpoint file at all (4.7).
+    #
+    # This probes the checkpointer the graph is already holding rather than
+    # building a new one. Building one per probe opened a Postgres connection
+    # and ran setup()'s DDL every few seconds, never closing any of them, so
+    # the probe exhausted max_connections and took the database down with it
+    # (G4).
     db_ready = False
     backend = checkpoint_backend_name()
     try:
-        if backend == "postgres":
-            # Building the saver connects and runs setup(); if that succeeds
-            # the store is reachable.
-            get_checkpointer()
-            db_ready = True
-        else:
-            # A missing DB file should fail the probe, not be silently created
-            # by sqlite3.connect().
-            if not CHECKPOINT_DB_PATH.exists():
-                raise FileNotFoundError(f"Checkpoint DB not found at {CHECKPOINT_DB_PATH}")
-            conn = sqlite3.connect(str(CHECKPOINT_DB_PATH))
-            conn.execute("SELECT 1")
-            conn.close()
-            db_ready = True
+        db_ready = checkpoint_health_check()
     except Exception as e:
         logger.error("Readiness check failed on the checkpoint store", backend=backend, error=f"{type(e).__name__}: {e}")
 
@@ -436,21 +428,24 @@ async def process_rejection(signal: MessagePayload):
 
     log.info("Agent investigation complete", state="COMPLETED_GRAPH")
     final_message = result.get("synthesis", "{}")
-    
-    try:
-        # Fix: support matching both JSON objects {} and arrays []
-        fenced_match = re.search(r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```", final_message, re.DOTALL)
-        if fenced_match:
-            investigation_result = json.loads(fenced_match.group(1))
-        else:
-            json_match = re.search(r"(\{.*\})", final_message, re.DOTALL)
-            if json_match:
-                investigation_result = json.loads(json_match.group(1))
-            else:
-                investigation_result = json.loads(final_message)
-    except Exception:
-        investigation_result = final_message
-    
+
+    # Parse through the one contract, not a second private one.
+    #
+    # This used to run its own regex/json.loads/str() fallback chain over the
+    # same string the orchestrator had already validated and serialised. Two
+    # parsers on one payload, and this one accepted anything: a malformed
+    # response became {"rejection_description": "<raw text>"} and produced a
+    # casebook with action: null, indistinguishable downstream from a packet
+    # the agents genuinely could not classify -- the exact failure the
+    # Synthesis contract was introduced to eliminate (G5).
+    synthesis_result, synthesis_error = parse_synthesis(final_message)
+    if synthesis_result is None:
+        log.error(
+            "Synthesis output failed the contract at persistence time",
+            error=synthesis_error,
+            state="FAILED_SYNTHESIS_PARSE",
+        )
+
     # Extract metadata safely
     packet_meta = signal_dict.get("packetMetaData") or {}
     flow_meta = signal_dict.get("flowMetaData") or {}
@@ -464,10 +459,6 @@ async def process_rejection(signal: MessagePayload):
             rejection_code = err.get("errorReasonCode")
             break
             
-    # Handle investigation result defaults if it's not a dict
-    if not isinstance(investigation_result, dict):
-        investigation_result = {"rejection_description": str(investigation_result)}
-    
     # Handle Rejection_logs logic
     # The original logs fetch string is in result.get("logs") if we passed it back, 
     # but the orchestrator state keeps it inside the graph state memory.
@@ -498,6 +489,50 @@ async def process_rejection(signal: MessagePayload):
     else:
         processed_logs = raw_logs
         
+    # Resolve the fields the casebook needs from the validated model. On a
+    # parse failure the evidence is still persisted -- metadata, rejection
+    # code, logs -- and only the verdict is replaced, so a contract breach
+    # never costs us the trace that explains it.
+    if synthesis_result is not None:
+        packet_status = (
+            "NEEDS_MANUAL_REVIEW" if synthesis_result.action == "MANUAL_REVIEW"
+            else exec_summary.get("packetStatus")
+        )
+        rejection_description = synthesis_result.rejection_description
+        resolution = {
+            "source": result.get("resolution_source", "agent"),
+            "synthesis": synthesis_result.synthesis,
+            "action": synthesis_result.action,
+            "resident_action": synthesis_result.resident_action,
+            # Persisted so accuracy_report can correlate stated confidence
+            # against recorded correctness. Without this the abstention
+            # threshold could never be calibrated, and so could never be
+            # responsibly enabled (G5, N2).
+            "confidence": synthesis_result.confidence,
+            "abstained": synthesis_result.abstained,
+        }
+    else:
+        packet_status = "FAILED_SYNTHESIS_PARSE"
+        rejection_description = (
+            "The agents produced output that does not satisfy the Synthesis "
+            f"contract: {synthesis_error}"
+        )
+        resolution = {
+            "source": result.get("resolution_source", "agent"),
+            "synthesis": (
+                "No valid resolution was produced. This packet needs a human: "
+                "the agent output could not be validated against the contract."
+            ),
+            # Explicit, not null. A reader can tell this apart from a genuine
+            # MANUAL_REVIEW verdict by packet_status.
+            "action": "MANUAL_REVIEW",
+            "resident_action": "PENDING",
+            "confidence": None,
+            "abstained": False,
+            "parse_error": synthesis_error,
+            "raw_output": final_message[:2000],
+        }
+
     casebook_data = {
         "packet_metadata": {
             "srn": packet_meta.get("srn"),
@@ -512,23 +547,18 @@ async def process_rejection(signal: MessagePayload):
             "uploaded_at": signal_dict.get("eventTimestamp")
         },
         "packet_status": {
-            "status": "NEEDS_MANUAL_REVIEW" if investigation_result.get("action") == "MANUAL_REVIEW" else exec_summary.get("packetStatus"),
+            "status": packet_status,
             "service": flow_meta.get("stage"),
             "sub_service": flow_meta.get("subStage"),
             "last_updated": None,
             "is_in_process": False if exec_summary.get("packetStatus") == "REJECTED" else None,
             "rejection_data": {
                 "rejection_code": rejection_code,
-                "rejection_description": investigation_result.get("rejection_description"),
+                "rejection_description": rejection_description,
                 "rejection_logs": processed_logs
             }
         },
-        "resolution": {
-            "source": result.get("resolution_source", "agent"),
-            "synthesis": investigation_result.get("synthesis"),
-            "action": investigation_result.get("action"),
-            "resident_action": investigation_result.get("resident_action")
-        }
+        "resolution": resolution
     }
     
     # Guard against overwriting a terminal status another actor already
