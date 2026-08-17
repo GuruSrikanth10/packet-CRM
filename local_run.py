@@ -2,6 +2,12 @@ import json
 import sys
 import os
 import requests
+from dotenv import load_dotenv
+
+# Without this, PACKET_CRM_API_KEY falls back to "dev-secret-key" while the
+# API server -- which does load .env -- validates against the real key, so
+# every local run got a 403 that looked like a server problem.
+load_dotenv()
 
 def run_local(file_path: str):
     if not os.path.exists(file_path):

@@ -124,8 +124,12 @@ def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
     # If logs are small enough, return directly
     if total_fetched < 50:
         lines = [f"--- Log Trace for ID: {event_id} ---"]
-        for log in raw_logs:
-            lines.append(f"[{log['timestamp']}] [{_origin(log)}] [{log['level']}] {log['message']}")
+        # `record`, not `log`: this loop used to rebind `log`, the bound
+        # structlog logger created above, to a log-record dict. It survived
+        # only because this branch returns immediately -- any line added
+        # between here and the return would have raised AttributeError.
+        for record in raw_logs:
+            lines.append(f"[{record['timestamp']}] [{_origin(record)}] [{record['level']}] {record['message']}")
         lines.append(f"--- End of Trace ({total_fetched} logs total) ---")
         formatted = _with_banner(gap_banner, "\n".join(lines))
         _save_reduced_logs(event_id, formatted)

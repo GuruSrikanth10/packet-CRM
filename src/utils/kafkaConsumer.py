@@ -296,20 +296,45 @@ def _process_and_commit(signal_payload: dict, message_offsets: dict = None):
         success = True
     except requests.exceptions.Timeout:
         logger.error("Timeout forwarding Kafka message", event_id=event_id)
-        storage = get_casebook_storage()
+        # Every call in this handler can fail -- a FileLock timeout or S3 blip
+        # inside save_terminal, an unreachable broker inside publish_to_dlq.
+        # An exception raised HERE is not caught by the sibling `except
+        # Exception` below (Python does not offer a raising except clause to
+        # its siblings); it escapes _process_and_commit entirely, leaving
+        # `success` False. The offset is then neither completed nor abandoned,
+        # so it stays in `_dispatched` forever and pins the partition's commit
+        # floor permanently -- the exact G1 stall the abandon/DLQ pairing
+        # exists to prevent. Both steps are therefore guarded.
+        #
         # Both casebook.json and status.json move to FAILED_TIMEOUT together.
         # Writing only casebook.json left the API's late-result guard -- which
         # reads status.json -- unable to see this verdict, so a slow agent run
         # could overwrite it with COMPLETED while the DLQ message stayed
         # queued (F4).
-        storage.save_terminal(event_id, {
-            "packet_metadata": {"eid": event_id},
-            "packet_status": {"status": "FAILED_TIMEOUT"},
-            "resolution": {"synthesis": "Investigation exceeded maximum allowed time."}
-        })
-        from src.utils.dlq_publisher import publish_to_dlq
-        publish_to_dlq(signal_payload, "Pipeline timed out (PACKET_TIMEOUT_SECONDS exceeded)")
-        success = True  # Successfully handled via DLQ, so we should commit
+        try:
+            get_casebook_storage().save_terminal(event_id, {
+                "packet_metadata": {"eid": event_id},
+                "packet_status": {"status": "FAILED_TIMEOUT"},
+                "resolution": {"synthesis": "Investigation exceeded maximum allowed time."}
+            })
+        except Exception as storage_error:
+            # Best-effort: the DLQ publish below is what actually authorises the
+            # commit, so a failed terminal write must not skip it.
+            logger.error("Could not record FAILED_TIMEOUT; continuing to the DLQ",
+                         event_id=event_id,
+                         error=f"{type(storage_error).__name__}: {storage_error}")
+
+        try:
+            from src.utils.dlq_publisher import publish_to_dlq
+            publish_to_dlq(signal_payload, "Pipeline timed out (PACKET_TIMEOUT_SECONDS exceeded)")
+            success = True  # Successfully handled via DLQ, so we should commit
+        except Exception as dlq_error:
+            # Same trade as the generic branch below: the offset stays
+            # dispatched and commits stall, rather than advancing past a
+            # message that would then exist nowhere.
+            logger.error("DLQ publish failed after a timeout; holding the offset uncommitted",
+                         event_id=event_id,
+                         error=f"{type(dlq_error).__name__}: {dlq_error}")
     except Exception as e:
         # Not committed -- but not left dangling either. Leaving the offset
         # dispatched-and-never-completed pinned the partition's commit floor

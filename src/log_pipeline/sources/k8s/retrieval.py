@@ -25,6 +25,7 @@ from concurrent.futures import (
     as_completed,
 )
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Iterator, Optional
 
 from src.log_pipeline.sources.k8s import client as k8s_client_module
@@ -77,7 +78,10 @@ class RetrievalOutcome:
     pods_queried: int = 0
     pods_failed: int = 0
     oldest_line_timestamp: Optional[str] = None
-    earliest_pod_start = None
+    # Annotated, so @dataclass treats it as a field. Without the annotation it
+    # was a bare class attribute: absent from __init__/__repr__/__eq__, and a
+    # constructor keyword away from a TypeError.
+    earliest_pod_start: Optional[datetime] = None
     redaction_counts: dict = field(default_factory=dict)
 
 
@@ -405,6 +409,16 @@ def read_all(targets: list, window: TimeWindow,
                         pod_name=futures[future].pod_name,
                         error=f"{type(e).__name__}: {e}",
                     )
+                    # Both counters, not just pods_failed. The loop below
+                    # increments pods_queried only for pods that returned an
+                    # outcome, so counting a raised read as failed-but-never-
+                    # queried let pods_failed exceed pods_queried -- and
+                    # KubernetesLogSource decides "could not look" versus
+                    # "looked and found nothing" on `pods_failed ==
+                    # pods_queried`. A fetch where every pod failed then
+                    # reported ok=True with zero records, which is exactly the
+                    # confirmed-absent verdict design principle 3 forbids.
+                    outcome.pods_queried += 1
                     outcome.pods_failed += 1
         except FuturesTimeoutError:
             timed_out = True

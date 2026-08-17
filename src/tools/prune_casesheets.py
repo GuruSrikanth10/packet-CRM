@@ -22,12 +22,17 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-TERMINAL_STATUSES = {
-    "COMPLETED", "REJECTED", "NEEDS_MANUAL_REVIEW",
-    "FAILED_PERMANENT", "DLQ", "FAILED_TIMEOUT",
-}
+# Before importing anything that resolves a configured path: LOCAL_CASESHEETS_DIR
+# is read at import time in src/utils/paths.py, so an unloaded .env would point
+# this tool at the default directory and silently prune nothing.
+load_dotenv()
+
+from src.storage.base import TERMINAL_STATUSES  # noqa: E402
+from src.utils.paths import LOCAL_CASESHEETS_DIR  # noqa: E402
 
 #: Bulky evidence files, safe to drop while keeping the casebook itself.
 #: outcome.json is deliberately NOT here: it is human-supplied ground truth
@@ -67,9 +72,11 @@ def main():
     parser.add_argument("--root", type=str, help="Override the casesheets root.")
     args = parser.parse_args()
 
-    root = Path(args.root) if args.root else (
-        Path(__file__).resolve().parent.parent.parent / "local_casesheets"
-    )
+    # Honours LOCAL_CASESHEETS_DIR via utils.paths rather than re-deriving
+    # repo_root/local_casesheets, which ignored the override every other
+    # component respects -- so a deployment with a relocated casesheets root
+    # pruned an empty default directory and reported nothing to do (F22).
+    root = Path(args.root) if args.root else LOCAL_CASESHEETS_DIR
     if not root.is_dir():
         print(f"Nothing to do: {root} does not exist.")
         return 0

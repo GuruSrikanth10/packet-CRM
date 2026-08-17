@@ -4,8 +4,16 @@ import argparse
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from src.utils.paths import CHECKPOINT_DB_PATH, LOCAL_CASESHEETS_DIR, REPO_ROOT
+
+# utils.paths resolves LOCAL_CASESHEETS_DIR at import time, so .env has to be
+# loaded first or this prunes checkpoints against the wrong casebook root --
+# which would delete the checkpoints of packets it simply could not see.
+load_dotenv()
+
+from src.utils.paths import CHECKPOINT_DB_PATH, LOCAL_CASESHEETS_DIR, REPO_ROOT  # noqa: E402
 
 def main():
     parser = argparse.ArgumentParser(description="Prune LangGraph checkpoints for completed packets.")

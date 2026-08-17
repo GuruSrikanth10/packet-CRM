@@ -15,14 +15,22 @@ import getpass
 import json
 import sys
 
-from src.storage.base import OUTCOME_VERDICTS, TERMINAL_STATUSES
-from src.utils.outcomes import (
+from dotenv import load_dotenv
+
+# Before the storage layer and utils.paths resolve their configuration --
+# otherwise CASEBOOK_STORAGE_BACKEND and LOCAL_CASESHEETS_DIR from .env are
+# invisible here and every verdict is written to, or looked for in, the
+# default local directory instead of the configured store.
+load_dotenv()
+
+from src.storage.base import OUTCOME_VERDICTS, TERMINAL_STATUSES  # noqa: E402
+from src.utils.outcomes import (  # noqa: E402
     InvalidVerdictError,
     UnknownEventError,
     load_outcome,
     record_outcome,
 )
-from src.utils.paths import LOCAL_CASESHEETS_DIR
+from src.utils.paths import LOCAL_CASESHEETS_DIR  # noqa: E402
 
 
 def _list_pending():

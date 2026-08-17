@@ -14,7 +14,15 @@ import argparse
 import json
 import sys
 
-from src.utils.outcomes import iter_outcomes, summarise, summarise_shadow
+from dotenv import load_dotenv
+
+# Before the storage layer resolves its backend: without this,
+# CASEBOOK_STORAGE_BACKEND=s3 in .env was never seen, so this read the local
+# filesystem and reported "No outcomes recorded yet" against a populated
+# bucket -- the same G2 symptom iter_outcomes() was rewritten to fix.
+load_dotenv()
+
+from src.utils.outcomes import iter_outcomes, summarise, summarise_shadow  # noqa: E402
 
 
 def _shadow_report(args) -> int:
