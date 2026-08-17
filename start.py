@@ -13,6 +13,9 @@ import signal
 import subprocess
 import sys
 import time
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # How long a child gets to shut down gracefully before SIGKILL. Must exceed
 # the consumer's SHUTDOWN_DRAIN_SECONDS so its drain can actually finish.
@@ -62,7 +65,7 @@ def main():
 
     # Give the API a moment to bind its port before either consumer starts
     # forwarding to it.
-    time.sleep(2)
+    time.sleep(8)
 
     print("Starting the fast consumer (fast_consumer.py) -- rejections -> /fetch-logs.")
     _children.append(("FastConsumer", subprocess.Popen([sys.executable, "src/fast_consumer.py"])))
