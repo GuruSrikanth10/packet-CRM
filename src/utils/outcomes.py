@@ -81,6 +81,19 @@ def record_outcome(event_id: str, verdict: str, verified_by: str,
         "resolution_source": resolution.get("source"),
         "agent_action": resolution.get("action"),
         "corrected_action": corrected_action,
+        # Confidence, so a reliability curve can be built from recorded
+        # correctness and SYNTHESIS_CONFIDENCE_THRESHOLD set from evidence
+        # rather than intuition (G5, N2).
+        "confidence": resolution.get("confidence"),
+        "abstained": resolution.get("abstained", False),
+        # What the shadowed runbook would have decided. This is what makes
+        # "would the runbook have been right?" answerable, and therefore what
+        # makes promotion to serve an evidence-based decision (G18).
+        "shadow_action": (resolution.get("shadow") or {}).get("action"),
+        "shadow_runbook_id": (resolution.get("shadow") or {}).get("runbook_id"),
+        "shadow_agreed": (resolution.get("shadow") or {}).get("agreed"),
+        # Which prompts produced the verdict being judged (G23).
+        "prompt_fingerprint": (resolution.get("provenance") or {}).get("prompt_fingerprint"),
     }
 
     # The storage layer already writes atomically under a lock (local) or via

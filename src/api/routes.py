@@ -4,6 +4,7 @@ import re
 import time
 import hmac
 import asyncio
+import contextlib
 import functools
 import ipaddress
 import threading
@@ -20,7 +21,7 @@ from src.utils.outcomes import (
     UnknownEventError,
     record_outcome,
 )
-from src.core.agent_orchestrator import get_agent
+from src.core.agent_orchestrator import get_agent, prompt_fingerprint
 from src.utils.s3_uploader import upload_logs_to_s3
 from src.storage.factory import get_casebook_storage
 from src.utils.dlq_publisher import publish_to_dlq
@@ -74,6 +75,38 @@ def _check_kafka_producer_ready() -> bool:
         _producer_health_cache["ready"] = ready
         _producer_health_cache["checked_at"] = now
     return ready
+
+
+@contextlib.contextmanager
+def _packet_metrics(resolution_source: str = "agent"):
+    """Record PACKETS_TOTAL and PACKET_DURATION however the packet exits.
+
+    Both used to be incremented on the last line of process_rejection, so
+    every early return skipped them: FAILED_TIMEOUT, DLQ, already-processed,
+    already-processing, and the late-result discard. The `status` label could
+    therefore only ever take success values, which made the timeout and DLQ
+    rates -- the two numbers worth paging on -- structurally unobservable, and
+    biased p95 latency downward by dropping exactly the slow tail it measures
+    (G15).
+
+    The caller sets `outcome["status"]` and, optionally, `outcome["source"]`.
+    """
+    outcome = {"status": None, "source": resolution_source}
+    started = time.monotonic()
+    try:
+        yield outcome
+    finally:
+        # Collapse runbook:<id>@v<n> so the label set stays bounded -- a
+        # per-runbook label would grow cardinality with the runbook catalog.
+        source = str(outcome.get("source") or "agent")
+        source_kind = "runbook" if source.startswith("runbook:") else "agent"
+        metrics.PACKETS_TOTAL.labels(
+            status=str(outcome.get("status") or "unknown"),
+            resolution_source=source_kind,
+        ).inc()
+        metrics.PACKET_DURATION.labels(resolution_source=source_kind).observe(
+            time.monotonic() - started
+        )
 
 
 def _get_agent_invoke_timeout_seconds() -> float:
@@ -260,6 +293,11 @@ def metrics_endpoint():
     operators route around. It exposes counters and latencies only, never
     packet content or resident data.
     """
+    # Breaker state is sampled at scrape time: pybreaker offers no transition
+    # hook here, and a breaker that reset on its own timeout would otherwise
+    # leave a stale "open" reading behind (G17).
+    metrics.sample_breaker_states()
+
     payload = metrics.render_latest()
     if payload is None:
         raise HTTPException(
@@ -318,6 +356,18 @@ async def process_rejection(signal: MessagePayload):
     below yields the event loop instead of occupying a slot in Starlette's
     sync-dispatch threadpool for the whole duration (2.6).
     """
+    with _packet_metrics() as outcome:
+        response = await _investigate_packet(signal, outcome)
+        # Paths that did not classify themselves fall back to the response
+        # status, so no exit path goes uncounted (G15).
+        if not outcome["status"]:
+            outcome["status"] = response.get("status", "unknown")
+        return response
+
+
+async def _investigate_packet(signal: MessagePayload, outcome: dict):
+    """The packet lifecycle. `outcome` carries the terminal status back out to
+    the metrics wrapper above."""
     signal_dict = signal.model_dump()
     event_id = str(signal.eventId).strip()
 
@@ -368,8 +418,7 @@ async def process_rejection(signal: MessagePayload):
 
     log = logger.bind(event_id=event_id)
     log.info("Processing Rejection", state="IN_PROGRESS")
-    packet_started_at = time.monotonic()
-    
+
     # Run the agent with exception handling for DLQ. Offloaded onto the
     # module-level bounded executor (not a per-request one) so agent.invoke
     # never occupies Starlette's own threadpool for its multi-minute
@@ -403,6 +452,7 @@ async def process_rejection(signal: MessagePayload):
             )
             # Both files move together, so the consumer (and any later
             # redelivery) sees the same verdict whichever one it reads (F4).
+            outcome["status"] = "FAILED_TIMEOUT"
             storage.save_terminal(event_id, {
                 "packet_metadata": {"eid": event_id},
                 "packet_status": {"status": "FAILED_TIMEOUT"},
@@ -419,6 +469,7 @@ async def process_rejection(signal: MessagePayload):
         # files must move to a terminal status together -- leaving
         # status.json at IN_PROGRESS here previously left it stuck forever,
         # since only casebook.json was written (1.5).
+        outcome["status"] = "DLQ"
         storage.save_terminal(event_id, {
             "packet_metadata": {"eid": event_id},
             "packet_status": {"status": "DLQ"},
@@ -511,6 +562,7 @@ async def process_rejection(signal: MessagePayload):
             "confidence": synthesis_result.confidence,
             "abstained": synthesis_result.abstained,
         }
+
     else:
         packet_status = "FAILED_SYNTHESIS_PARSE"
         rejection_description = (
@@ -560,7 +612,22 @@ async def process_rejection(signal: MessagePayload):
         },
         "resolution": resolution
     }
-    
+
+    # What the shadowed runbook would have decided. Persisted so
+    # accuracy_report can score it against the operator's verdict and answer
+    # "would this runbook have been right?" -- the question that gates
+    # promotion to serve, and which shadow mode previously answered only in
+    # unaggregatable warning lines (G18).
+    shadow = result.get("shadow_comparison")
+    if shadow:
+        casebook_data["resolution"]["shadow"] = shadow
+
+    # Which prompts produced this. Lets an accuracy movement be attributed to
+    # a prompt change instead of merely correlated with one (G23).
+    casebook_data["resolution"]["provenance"] = {
+        "prompt_fingerprint": prompt_fingerprint(),
+    }
+
     # Guard against overwriting a terminal status another actor already
     # recorded while this invocation was still in flight -- e.g. the
     # consumer's own client-side timeout fired and wrote FAILED_TIMEOUT/DLQ
@@ -574,6 +641,7 @@ async def process_rejection(signal: MessagePayload):
             recorded_status=current_status,
             state=current_status,
         )
+        outcome["status"] = "discarded_late_result"
         return {"status": "already_processed", "event_id": event_id}
 
     # casebook.json and status.json reach the terminal status together, so a
@@ -582,15 +650,10 @@ async def process_rejection(signal: MessagePayload):
 
     final_status = casebook_data["packet_status"]["status"]
     resolution_source = casebook_data["resolution"]["source"] or "agent"
-    # Collapse runbook:<id>@v<n> so the label set stays bounded -- a per-runbook
-    # label would make cardinality grow with the runbook catalog.
-    source_kind = "runbook" if str(resolution_source).startswith("runbook:") else "agent"
-    metrics.PACKETS_TOTAL.labels(
-        status=str(final_status), resolution_source=source_kind
-    ).inc()
-    metrics.PACKET_DURATION.labels(resolution_source=source_kind).observe(
-        time.monotonic() - packet_started_at
-    )
+    # Recorded by the _packet_metrics wrapper on the way out, so the timeout,
+    # DLQ, and skip paths are counted on the same footing (G15).
+    outcome["status"] = str(final_status)
+    outcome["source"] = resolution_source
 
     log.info("Successfully saved finalized Casebook", final_status=final_status,
              resolution_source=resolution_source, state="COMPLETED")

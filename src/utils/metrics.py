@@ -20,6 +20,7 @@ try:
     from prometheus_client import (
         CONTENT_TYPE_LATEST,
         Counter,
+        Gauge,
         Histogram,
         generate_latest,
     )
@@ -41,6 +42,9 @@ class _NoOpMetric:
     def observe(self, *_args, **_kwargs):
         pass
 
+    def set(self, *_args, **_kwargs):
+        pass
+
 
 def _counter(name, documentation, labelnames=()):
     if not METRICS_AVAILABLE:
@@ -53,6 +57,12 @@ def _histogram(name, documentation, labelnames=(), buckets=None):
         return _NoOpMetric()
     kwargs = {"buckets": buckets} if buckets else {}
     return Histogram(name, documentation, labelnames, **kwargs)
+
+
+def _gauge(name, documentation, labelnames=()):
+    if not METRICS_AVAILABLE:
+        return _NoOpMetric()
+    return Gauge(name, documentation, labelnames)
 
 
 # Packet lifecycle -----------------------------------------------------
@@ -79,8 +89,16 @@ INVESTIGATOR_RETRIES = _histogram(
 
 RUNBOOK_LOOKUPS = _counter(
     "packetcrm_runbook_lookups_total",
-    "Runbook lookups by outcome (hit, miss, fingerprint_mismatch, error).",
+    "Runbook lookups by outcome (hit, shadow, miss, no_reason_code, "
+    "fingerprint_mismatch, error). Every outcome is recorded, so the hit rate "
+    "has a denominator.",
     ("outcome",),
+)
+
+SHADOW_DIVERGENCE = _counter(
+    "packetcrm_shadow_divergence_total",
+    "Shadowed runbooks whose action disagreed with the agents' verdict.",
+    ("runbook_id",),
 )
 
 # Log pipeline ---------------------------------------------------------
@@ -125,9 +143,43 @@ LLM_TOKENS = _counter(
 
 LLM_CALLS = _counter(
     "packetcrm_llm_calls_total",
-    "LLM invocations by agent node and outcome.",
+    "LLM invocations by agent node and outcome (ok, error, invalid, ...).",
     ("node", "outcome"),
 )
+
+# Circuit breakers ------------------------------------------------------
+#: 0 closed, 1 half-open, 2 open. Breaker trip frequency is named in
+#: ENHANCEMENT_PLAN section 4.5 as an unknowable, and it stayed one: a call that
+#: raised propagated through the breaker and was counted nowhere (G17).
+BREAKER_STATE = _gauge(
+    "packetcrm_breaker_state",
+    "Circuit breaker state: 0 closed, 1 half-open, 2 open.",
+    ("breaker",),
+)
+
+_BREAKER_STATE_VALUES = {"closed": 0, "half-open": 1, "open": 2}
+
+
+def sample_breaker_states() -> None:
+    """Publish the current state of every circuit breaker.
+
+    Sampled on scrape rather than pushed on transition: pybreaker has no
+    transition hook we control from here, and a breaker that resets on a
+    timeout would otherwise leave a stale "open" reading behind.
+    """
+    try:
+        from src.utils import resilience
+
+        for name in ("db_breaker", "es_breaker", "llm_breaker", "k8s_breaker"):
+            breaker = getattr(resilience, name, None)
+            if breaker is None:
+                continue
+            state = str(getattr(breaker, "current_state", "closed"))
+            BREAKER_STATE.labels(breaker=name).set(
+                _BREAKER_STATE_VALUES.get(state, 0)
+            )
+    except Exception as e:
+        logger.debug("Could not sample breaker states", error=str(e))
 
 
 def record_fetch_diagnostics(diagnostics, ok: bool, gaps=None):

@@ -41,6 +41,22 @@ logger = get_logger(__name__)
 _current_event_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_event_id", default="unknown")
 _current_investigation: contextvars.ContextVar[str] = contextvars.ContextVar("current_investigation", default="")
 
+def _counted(node: str, invoke):
+    """Run an LLM invocation, counting failures as well as successes.
+
+    Every LLM_CALLS call site recorded a success-shaped outcome (ok, invalid,
+    unrepairable, abstained). A call that raised propagated through
+    @retry_transient and @llm_breaker and was counted nowhere, so LLM error
+    rate -- and with it the breaker-trip frequency ENHANCEMENT_PLAN section 4.5
+    lists as unknowable -- could not be computed at all (G17).
+    """
+    try:
+        return invoke()
+    except Exception:
+        metrics.LLM_CALLS.labels(node=node, outcome="error").inc()
+        raise
+
+
 def is_reviewer_approved(feedback: str) -> bool:
     """Return True only if the Reviewer's verdict is an unqualified APPROVED.
 
@@ -66,17 +82,71 @@ class GraphState(TypedDict):
     runbook_id: str
     resolution_source: str
     shadow_runbook_resolution: str
+    #: What the shadowed runbook would have decided, and whether it agreed
+    #: with the agents. Carried out of the graph so it reaches the casebook
+    #: and the outcome record, which is what turns shadow mode into evidence
+    #: instead of log noise (G18).
+    shadow_comparison: dict
 
 _agent = None
 
+#: Hash of the prompts and policy the cached graph was built from.
+#: Written into every casebook so an accuracy movement can be attributed to a
+#: prompt change rather than merely coinciding with one. The rule side of this
+#: is already solved by `rule_fingerprint`; the prompt side had no equivalent,
+#: so after Phase D there was an accuracy figure per reason code and no way to
+#: tell what moved it (G23).
+_prompt_fingerprint = "unknown"
+
+PROMPT_FILES = (
+    "InvestigatorAgent.md",
+    "ReviewerAgent.md",
+    "SynthesisAgent.md",
+    "LogFilterAgent.md",
+)
+
+
+def compute_prompt_fingerprint(base_dir: str) -> str:
+    """SHA256 over the four agent prompts plus the shared policy context.
+
+    Sorted and length-prefixed so the digest cannot be changed by reordering
+    or by content shifting across a boundary.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    paths = [os.path.join(base_dir, "prompts", name) for name in PROMPT_FILES]
+    paths.append(os.path.join(os.path.dirname(base_dir), "agent_policy_context.md"))
+
+    for path in sorted(paths):
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except OSError:
+            # A missing prompt is itself a meaningful configuration, so record
+            # its absence rather than skipping it and colliding with present.
+            body = b""
+        digest.update(os.path.basename(path).encode("utf-8"))
+        digest.update(str(len(body)).encode("utf-8"))
+        digest.update(body)
+
+    return "sha256:" + digest.hexdigest()
+
+
+def prompt_fingerprint() -> str:
+    return _prompt_fingerprint
+
+
 def get_agent():
-    global _agent
+    global _agent, _prompt_fingerprint
     if _agent is not None:
         logger.info("Returning the cached agent graph")
         return _agent
 
     logger.info("Building the agent graph")
     base_dir = os.path.dirname(os.path.dirname(__file__))
+    _prompt_fingerprint = compute_prompt_fingerprint(base_dir)
+    logger.info("Prompt fingerprint computed", prompt_fingerprint=_prompt_fingerprint)
     llm = get_llm("complex")
     # DELIBERATE DEVIATION (ENHANCEMENT_PLAN section 7.1, AUDIT_2026_08 G6).
     # This reads "complex" on purpose. The Reviewer is a bounded verdict task
@@ -141,6 +211,14 @@ def get_agent():
         event_id = payload.get("eventId", "unknown")
         log = logger.bind(event_id=event_id)
 
+        # Every outcome is counted, not just hits. A counter that only ever
+        # records "hit" has no denominator, so the runbook hit RATE -- named in
+        # ENHANCEMENT_PLAN section 4.5 as one of the unknowables and the primary
+        # input to the section 4.2 rollout decision -- stayed unknowable (G16).
+        def _miss(reason: str):
+            metrics.RUNBOOK_LOOKUPS.labels(outcome=reason).inc()
+            return {"resolution_source": "agent"}
+
         # The runbook path is an optimisation, never a correctness
         # requirement: falling back to the agents always produces a valid
         # result. Any failure here must therefore degrade to "agent", not
@@ -157,12 +235,12 @@ def get_agent():
                     break
 
             if not reason_code:
-                return {"resolution_source": "agent"}
+                return _miss("no_reason_code")
 
             packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
             runbook = get_runbook(reason_code, packet_type)
             if not runbook:
-                return {"resolution_source": "agent"}
+                return _miss("miss")
 
             runbook_id = runbook["runbook_id"]
             version = runbook["version"]
@@ -176,13 +254,10 @@ def get_agent():
                 if current_fp != runbook["rule_fingerprint"]:
                     log.warning("Fingerprint mismatch", runbook_id=runbook_id,
                                 expected=runbook["rule_fingerprint"], actual=current_fp)
-                    return {"resolution_source": "agent"}
+                    return _miss("fingerprint_mismatch")
 
             res_source = f"runbook:{runbook_id}@v{version}"
             synthesis_json = json.dumps(runbook["resolution"])
-
-            log.info("Runbook hit", runbook_id=runbook_id, version=version, mode=mode)
-            metrics.RUNBOOK_LOOKUPS.labels(outcome="hit").inc()
 
             # A reason code not on the allowlist still runs the agents, but
             # its runbook is compared against them -- which is how it earns
@@ -191,13 +266,21 @@ def get_agent():
                 if mode != "shadow":
                     log.info("Runbook not yet cleared to serve; shadowing instead",
                              runbook_id=runbook_id)
-                return {"resolution_source": "agent", "shadow_runbook_resolution": synthesis_json}
+                log.info("Runbook shadowed", runbook_id=runbook_id, version=version, mode=mode)
+                metrics.RUNBOOK_LOOKUPS.labels(outcome="shadow").inc()
+                return {
+                    "resolution_source": "agent",
+                    "shadow_runbook_resolution": synthesis_json,
+                    "runbook_id": runbook_id,
+                }
 
+            log.info("Runbook hit", runbook_id=runbook_id, version=version, mode=mode)
+            metrics.RUNBOOK_LOOKUPS.labels(outcome="hit").inc()
             return {"resolution_source": res_source, "synthesis": synthesis_json, "runbook_id": runbook_id}
         except Exception as e:
             log.error("Runbook lookup failed; falling through to the agents",
                       error=f"{type(e).__name__}: {e}", exc_info=True)
-            return {"resolution_source": "agent"}
+            return _miss("error")
 
     def check_runbook_hit(state: GraphState):
         if state.get("resolution_source", "").startswith("runbook:"):
@@ -272,7 +355,7 @@ def get_agent():
                 HumanMessage(content=prompt)
             ]})
             
-        res = invoke_filter()
+        res = _counted("log_filter", invoke_filter)
         filtered_logs = res["messages"][-1].content
         log.info("Log Filter node finished")
         return {"logs": filtered_logs}
@@ -348,7 +431,7 @@ def get_agent():
                 HumanMessage(content=prompt)
             ]})
 
-        res = invoke_investigator()
+        res = _counted("investigator", invoke_investigator)
         metrics.record_llm_usage("investigator", res)
         metrics.LLM_CALLS.labels(node="investigator", outcome="ok").inc()
         log.info("Investigator finished analysis")
@@ -376,7 +459,7 @@ def get_agent():
                 HumanMessage(content=prompt)
             ]})
 
-        res = invoke_reviewer()
+        res = _counted("reviewer", invoke_reviewer)
         metrics.record_llm_usage("reviewer", res)
         metrics.LLM_CALLS.labels(node="reviewer", outcome="ok").inc()
         feedback = res["messages"][-1].content
@@ -433,7 +516,7 @@ def get_agent():
                 HumanMessage(content=prompt)
             ]})
 
-        res = invoke_synthesis()
+        res = _counted("synthesis", invoke_synthesis)
         metrics.record_llm_usage("synthesis", res)
         metrics.LLM_CALLS.labels(node="synthesis", outcome="ok").inc()
         synthesis_content = res["messages"][-1].content
@@ -464,7 +547,7 @@ def get_agent():
                     HumanMessage(content=repair_prompt)
                 ]})
 
-            res = invoke_repair()
+            res = _counted("synthesis", invoke_repair)
             metrics.record_llm_usage("synthesis", res)
             synthesis_content = res["messages"][-1].content
             parsed, error = parse_synthesis(synthesis_content)
@@ -500,24 +583,50 @@ def get_agent():
         # distribution is the earliest signal of prompt or model regression.
         metrics.INVESTIGATOR_RETRIES.observe(max(0, state.get("retry_count", 1) - 1))
         
+        # Shadow comparison. The verdict is RETURNED, not just logged.
+        #
+        # It used to exist only as a warning line. `outcomes.summarise` groups
+        # by resolution_source, which for a shadowed packet is "agent", so
+        # accuracy_report could only compare runbooks that were ALREADY being
+        # served -- and a runbook cannot be cleared to serve until it has been
+        # compared. That closed loop had no entry point, which made section 4.2's
+        # "shadow, measure, then serve" sequence unimplementable as built (G18).
+        shadow = None
         shadow_res = state.get("shadow_runbook_resolution")
         if shadow_res:
+            runbook_id = state.get("runbook_id", "unknown")
             try:
                 agent_res = json.loads(synthesis_content)
                 rb_res = json.loads(shadow_res)
-                if agent_res.get("action") != rb_res.get("action"):
+                agreed = agent_res.get("action") == rb_res.get("action")
+
+                shadow = {
+                    "runbook_id": runbook_id,
+                    "action": rb_res.get("action"),
+                    "resident_action": rb_res.get("resident_action"),
+                    "synthesis": rb_res.get("synthesis"),
+                    "agreed": agreed,
+                }
+
+                if not agreed:
+                    metrics.SHADOW_DIVERGENCE.labels(runbook_id=runbook_id).inc()
                     log.warning(
-                        "Shadow divergence", 
-                        runbook_id=state.get("runbook_id", "unknown"),
-                        runbook_action=rb_res.get("action"), 
+                        "Shadow divergence",
+                        runbook_id=runbook_id,
+                        runbook_action=rb_res.get("action"),
                         agent_action=agent_res.get("action"),
                         runbook_synthesis=rb_res.get("synthesis"),
                         agent_synthesis=agent_res.get("synthesis")
                     )
             except Exception as e:
                 log.error("Failed to compare the shadow runbook resolution", error=f"{type(e).__name__}: {e}")
-                
-        return {"synthesis": synthesis_content, "messages": res["messages"], "resolution_source": "agent"}
+
+        return {
+            "synthesis": synthesis_content,
+            "messages": res["messages"],
+            "resolution_source": "agent",
+            "shadow_comparison": shadow,
+        }
 
     # Build Graph
     workflow = StateGraph(GraphState)
