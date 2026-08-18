@@ -23,7 +23,6 @@ Never invent a parameter value. If a value is not present in the payload, do not
 When generating the synthesis, you MUST output your final findings strictly in the following JSON format without any surrounding text or markdown formatting:
 {
   "rejection_description": "<detailed explanation of why the rejection occurred>",
-  "rejection_logs": "<file_path or log snippet if applicable, otherwise null>",
   "synthesis": "<what did the resident intend to do, when and where did the packet fail or deviate from the intended result, and the resolution. MAXIMUM 2 to 3 sentences. Be extremely concise.>",
   "action": "<must be one of: REPLAY, WHITELISTING, QC_REPLAY, RO_APPROVAL, RESIDENT_PACKET_RESUBMIT, MANUAL_REVIEW>",
   "resident_action": "<must be one of: NEW_PACKET, NEW_PACKET_WITH_DIFFERENT_ARTIFACTS, RO_APPLICATION, PENDING>",

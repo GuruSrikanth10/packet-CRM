@@ -42,7 +42,6 @@ class SynthesisResult(BaseModel):
     """The strict JSON contract the Synthesis agent must produce."""
 
     rejection_description: str = ""
-    rejection_logs: Optional[str] = None
     synthesis: str = ""
     action: Literal[ACTIONS]  # type: ignore[valid-type]
     resident_action: Literal[RESIDENT_ACTIONS]  # type: ignore[valid-type]

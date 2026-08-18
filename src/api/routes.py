@@ -726,28 +726,26 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
     # fetch_elastic_logs returns None (not an error-prefixed string) on
     # failure, so a plain falsiness check is sufficient and doesn't miss
     # failure modes with a different message prefix (1.6).
+    from src.log_pipeline.sources.k8s.gaps import BANNER_HEADER, BANNER_FOOTER
+
     raw_logs = result.get("logs")
-    processed_logs = None
+    extracted_gaps = None
+
+    if raw_logs and BANNER_HEADER in raw_logs and BANNER_FOOTER in raw_logs:
+        start_idx = raw_logs.find(BANNER_HEADER)
+        end_idx = raw_logs.find(BANNER_FOOTER) + len(BANNER_FOOTER)
+        extracted_gaps = raw_logs[start_idx:end_idx]
 
     if not raw_logs or raw_logs == "Log fetching disabled.":
-        processed_logs = None
-    elif len(raw_logs) > 5000:
-        log.info("Logs exceed the inline size limit; uploading to S3", log_chars=len(raw_logs))
+        processed_logs = {"path": "No logs found", "gaps": None}
+    else:
         uploaded_url = upload_logs_to_s3(event_id, raw_logs)
         if uploaded_url:
-            processed_logs = uploaded_url
+            path_str = uploaded_url
         else:
-            # S3 not configured or the upload failed -- previously this
-            # silently substituted a fake s3://mock-bucket/... URL while
-            # discarding the actual log text (1.12). Keep a truncated copy
-            # inline instead of losing the evidence entirely.
-            log.warning(
-                "S3 upload unavailable; embedding truncated logs inline instead of an S3 URL",
-                state="LOGS_TRUNCATED",
-            )
-            processed_logs = raw_logs[:5000] + "\n...[TRUNCATED: S3 upload unavailable, see raw_logs.txt on disk for the full trace]"
-    else:
-        processed_logs = raw_logs
+            log.warning("S3 upload unavailable; embedding local path instead", state="LOGS_TRUNCATED")
+            path_str = "Logs persisted to local storage (S3 unavailable)."
+        processed_logs = {"path": path_str, "gaps": extracted_gaps}
         
     # Resolve the fields the casebook needs from the validated model. On a
     # parse failure the evidence is still persisted -- metadata, rejection
