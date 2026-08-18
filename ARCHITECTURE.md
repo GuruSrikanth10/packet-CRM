@@ -973,6 +973,45 @@ python3 -m src.tools.eval_harness --test-cases test_cases.json # Stage 6 evaluat
 
 ---
 
+## 4.4 Dead-Letter Topic (DLT) Analysis
+
+A **parallel flow** to the rejection pipeline, specified in full in
+`DLT_PLAN.md`. It consumes a Spring `@RetryableTopic` dead-letter topic,
+fingerprints the failure from its stack trace, checks that trace against the
+service's own pod logs, and writes an advisory casebook. **It does not
+remediate** -- no replay, no redrive, no writes to any upstream system.
+
+It shares this system's log pipeline, storage abstraction, consumer
+scaffolding and confidence policy. It shares neither `MessagePayload`, the
+rejection casebook schema, `rules.csv`, nor the runbook key space.
+
+```
+dlt_consumer.py  -> POST /fetch-dlt-logs  -> dlt-analysis-queue
+                 -> dlt_analysis_consumer.py -> POST /analyze-dlt -> casebook
+```
+
+Four things are worth knowing without reading the whole plan:
+
+1. **The root cause is the last `Caused by:`, never the headers.**
+   `kafka_exception-cause-fqcn` carries a Spring/JDK wrapper that is identical
+   for every failure in every consumer in the organisation.
+
+2. **The log window is anchored on `retry_topic-backoff-timestamp`**, not
+   `kafka_original-timestamp`. In the reference sample those are 43 hours
+   apart, so the wrong anchor searches a stale window and finds nothing.
+
+3. **A cached recommendation is never served blind.** Logs are fetched and
+   corroborated on every message; only the LLM call is skipped. That keeps the
+   mis-cast detector -- the system's highest-value output -- live on every
+   occurrence.
+
+4. **Nothing is enabled by default.** `DLT_ENABLED=false` keeps the consumers
+   out of `start.py`.
+
+Operator entry point: `python -m src.tools.dlt_report --top`.
+
+---
+
 ## 5. Known Gaps & Deviations
 
 This section records where the running code diverges from the design intent above.

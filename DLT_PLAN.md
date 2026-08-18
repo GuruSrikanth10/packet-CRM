@@ -1,7 +1,14 @@
 # Packet-CRM: Dead-Letter Topic (DLT) Analysis -- Engineering Design
 
-Design date: 2026-08-18. Status: **Not started.** Phase 0 is a data-gathering
-gate and must be run before Phase 4 goes anywhere near the packet path.
+Design date: 2026-08-18. Status: **Phases 1-9 implemented; Phase 0 outstanding.**
+The code is complete and unit-tested against fixtures, but has never run
+against a real broker, cluster or registry. Phase 0 (the corpus capture and
+its five measurements) still has to be run from a host with Kafka access, and
+its item 5 -- confirming `enu-biometric` pod log lines carry `refId` -- remains
+a hard gate on the log lane being useful at all.
+
+**Nothing is enabled by default.** `DLT_ENABLED=false` keeps the consumers out
+of `start.py`, and the rejection pipeline is untouched.
 
 **How to use this document.** Sections 1-9 are the design. Section 10 is the
 implementation plan, broken into self-contained phases. Each phase lists the
@@ -567,7 +574,7 @@ called until Phase 8.
 | 6 | **Complete** | `src/dlt/corroborate.py`. 25 tests. Verdicts stay advisory and matching is deliberately generous (FQCN, simple name, or business code all count) -- a false CONTRADICTED is worse than a missed one. Open Question 2 is still open. |
 | 7 | **Complete** | `src/dlt/groups.py`, `src/dlt/reuse.py`. 35 tests, including the cost-model proof: 400 messages across 3 bugs yield 3 groups and 3 LLM calls. Real-corpus numbers still need Phase 0. |
 | 8 | **Complete** | `src/dlt/orchestrator.py`, `src/dlt/canned.py`, `src/models/dlt_synthesis.py`, three prompts, `POST /analyze-dlt`, `src/dlt_analysis_consumer.py`. 24 tests with a mocked LLM. Occurrence recording moved ahead of the reuse decision so a canned finding's count includes the case it describes. |
-| 9 | Not started | |
+| 9 | **Complete** | `src/tools/dlt_report.py` (`--top`, `--group`, `--case`, `--unreviewed`, `--stats`); DLT metrics in `metrics.py`; all four consumer heartbeats on `/health`. 21 tests. |
 
 ---
 

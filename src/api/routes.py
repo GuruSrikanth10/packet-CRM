@@ -343,7 +343,12 @@ def health_check():
     already meant before the split -- so nothing that previously read those
     top-level keys breaks.
     """
-    from src.utils.paths import CONSUMER_HEARTBEAT_PATH, SLOW_CONSUMER_HEARTBEAT_PATH
+    from src.utils.paths import (
+        CONSUMER_HEARTBEAT_PATH,
+        DLT_ANALYSIS_HEARTBEAT_PATH,
+        DLT_CONSUMER_HEARTBEAT_PATH,
+        SLOW_CONSUMER_HEARTBEAT_PATH,
+    )
 
     def _heartbeat(path) -> dict:
         # Co-located deployment only. Absent is absent, not dead: a
@@ -358,6 +363,11 @@ def health_check():
 
     fast = _heartbeat(CONSUMER_HEARTBEAT_PATH)
     slow = _heartbeat(SLOW_CONSUMER_HEARTBEAT_PATH)
+    # The DLT roles are optional (DLT_ENABLED, off by default), so their
+    # heartbeats read as "unknown" rather than dead when not deployed --
+    # the same convention the split-pod case already relies on.
+    dlt = _heartbeat(DLT_CONSUMER_HEARTBEAT_PATH)
+    dlt_analysis = _heartbeat(DLT_ANALYSIS_HEARTBEAT_PATH)
 
     payload = {
         "status": "draining" if _draining.is_set() else "up",
@@ -368,6 +378,8 @@ def health_check():
         "consumer_alive": fast["alive"],
         "fast_consumer": fast,
         "slow_consumer": slow,
+        "dlt_consumer": dlt,
+        "dlt_analysis_consumer": dlt_analysis,
     }
 
     return payload
