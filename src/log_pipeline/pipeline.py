@@ -10,6 +10,7 @@ Flow:
     -> Normal path:  Stage 3 (cluster) -> Stage 4 (guardrails) -> format, return
 """
 import os
+from typing import Optional
 
 from src.log_pipeline import redaction
 from src.log_pipeline.catalog import TemplateCatalog
@@ -47,7 +48,10 @@ def _default_window() -> TimeWindow:
         return TimeWindow.default()
 
 
-def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
+def reduce_logs(event_id: str, extra_identifiers: tuple = (),
+                storage_key: Optional[str] = None,
+                window: Optional[TimeWindow] = None,
+                storage=None) -> str:
     """Run the full log reduction pipeline for an event_id.
 
     `extra_identifiers` are additional correlation ids (refId, srn) that the
@@ -56,10 +60,23 @@ def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
     Phase C (F11); defaults to empty so callers that don't have them work
     unchanged.
 
+    `storage_key` separates *what we search for* from *where we persist*. The
+    rejection path uses one value for both, and passes neither. The DLT path
+    searches on `refId` -- the only identifier the service actually logs --
+    but persists under its own `case_id`, since one packet can be dead-lettered
+    at several stages and each occurrence is a distinct case (DLT_PLAN.md 5.5).
+
+    `window` overrides the `K8S_DEFAULT_SINCE_HOURS` look-back. The DLT path
+    derives its window from `retry_topic-backoff-timestamp` instead: in the
+    reference sample the last attempt is 43 hours after the original produce
+    time, so the default two-hour look-back would search the wrong window
+    entirely and find nothing (DLT_PLAN.md 3.2, Trap 2).
+
     Returns a formatted string suitable for LLM context injection.
     Raw logs are also persisted to disk for audit.
     """
     extra_identifiers = tuple(v for v in (extra_identifiers or ()) if v)
+    artifact_key = storage_key or event_id
     # Load catalog (cached -- only reads disk once)
     catalog = _get_catalog()
 
@@ -68,7 +85,7 @@ def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
     # ------------------------------------------------------------------
     fetch_result = source_chain.fetch_with_fallback(
         event_id,
-        _default_window(),
+        window or _default_window(),
         FetchContext(event_id=event_id, catalog=catalog,
                      extra_identifiers=extra_identifiers),
     )
@@ -119,7 +136,7 @@ def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
             metrics.REDACTIONS.labels(pattern=label).inc(count)
 
     # Persist raw logs to disk for audit
-    log_file_path = _save_raw_logs(event_id, raw_logs)
+    log_file_path = _save_raw_logs(artifact_key, raw_logs, storage=storage)
 
     # If logs are small enough, return directly
     if total_fetched < 50:
@@ -132,7 +149,7 @@ def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
             lines.append(f"[{record['timestamp']}] [{_origin(record)}] [{record['level']}] {record['message']}")
         lines.append(f"--- End of Trace ({total_fetched} logs total) ---")
         formatted = _with_banner(gap_banner, "\n".join(lines))
-        _save_reduced_logs(event_id, formatted)
+        _save_reduced_logs(artifact_key, formatted, storage=storage)
         return formatted
 
     # ------------------------------------------------------------------
@@ -146,7 +163,7 @@ def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
             gap_banner,
             _format_error_path(event_id, branch_result["payload"], total_fetched, log_file_path),
         )
-        _save_reduced_logs(event_id, formatted)
+        _save_reduced_logs(artifact_key, formatted, storage=storage)
         return formatted
 
     # ------------------------------------------------------------------
@@ -166,7 +183,7 @@ def reduce_logs(event_id: str, extra_identifiers: tuple = ()) -> str:
         gap_banner,
         _format_normal_path(event_id, assembled, total_fetched, log_file_path),
     )
-    _save_reduced_logs(event_id, formatted)
+    _save_reduced_logs(artifact_key, formatted, storage=storage)
     return formatted
 
 
@@ -265,8 +282,12 @@ def _format_normal_path(event_id: str, assembled: dict,
 # Disk persistence
 # ======================================================================
 
-def _write_artifact(event_id: str, filename: str, content: str) -> str:
+def _write_artifact(event_id: str, filename: str, content: str, storage=None) -> str:
     """Persist one log artifact beside the casebook and return its locator.
+
+    `storage` lets a caller target a different root -- the DLT path writes into
+    `dlt_cases/` rather than beside the rejection casebooks (DLT_PLAN.md 7).
+    Defaults to the rejection store, so existing callers are unaffected.
 
     Goes through CasebookStorage rather than writing to the local filesystem.
     F22 consolidated the *path* derivation here but left the storage bypass in
@@ -275,7 +296,8 @@ def _write_artifact(event_id: str, filename: str, content: str) -> str:
     in S3, its evidence was not.
     """
     try:
-        locator = get_casebook_storage().save_artifact(event_id, filename, content)
+        target = storage or get_casebook_storage()
+        locator = target.save_artifact(event_id, filename, content)
         logger.bind(event_id=event_id).info("Log artifact saved", filename=filename, path=locator)
         return locator
     except Exception as e:
@@ -283,15 +305,15 @@ def _write_artifact(event_id: str, filename: str, content: str) -> str:
         return "Failed to save"
 
 
-def _save_raw_logs(event_id: str, logs: list[dict]) -> str:
+def _save_raw_logs(event_id: str, logs: list[dict], storage=None) -> str:
     """Persist raw logs and return the artifact locator."""
     body = "".join(
         f"[{log['timestamp']}] [{_origin(log)}] [{log['level']}] {log['message']}\n"
         for log in logs
     )
-    return _write_artifact(event_id, "raw_logs.txt", body)
+    return _write_artifact(event_id, "raw_logs.txt", body, storage=storage)
 
 
-def _save_reduced_logs(event_id: str, reduced_text: str) -> str:
+def _save_reduced_logs(event_id: str, reduced_text: str, storage=None) -> str:
     """Persist reduced logs and return the artifact locator."""
-    return _write_artifact(event_id, "reduced_logs.txt", reduced_text)
+    return _write_artifact(event_id, "reduced_logs.txt", reduced_text, storage=storage)

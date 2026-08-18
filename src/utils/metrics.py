@@ -151,6 +151,64 @@ LLM_CALLS = _counter(
 #: 0 closed, 1 half-open, 2 open. Breaker trip frequency is named in
 #: ENHANCEMENT_PLAN section 4.5 as an unknowable, and it stayed one: a call that
 #: raised propagated through the breaker and was counted nowhere (G17).
+# ---------------------------------------------------------------------------
+# DLT analysis (DLT_PLAN.md)
+# ---------------------------------------------------------------------------
+DLT_CASES = _counter(
+    "packetcrm_dlt_cases_total",
+    "Dead-lettered records processed, by failure class (A/B/C/U).",
+    ("failure_class",),
+)
+
+DLT_CORROBORATION = _counter(
+    "packetcrm_dlt_corroboration_total",
+    "Trace-vs-log corroboration verdicts.",
+    ("verdict",),
+)
+
+DLT_REUSE = _counter(
+    "packetcrm_dlt_reuse_total",
+    "Reuse decisions: LLM_REQUIRED, REUSE_GROUP or CANNED.",
+    ("decision",),
+)
+
+DLT_REGISTRY_MISSES = _counter(
+    "packetcrm_dlt_registry_misses_total",
+    "BusinessException codes with no registry entry.",
+)
+
+DLT_WINDOW_AGE_HOURS = _histogram(
+    "packetcrm_dlt_window_age_hours",
+    "Age of the log window at fetch time. The reference sample sits at 43h.",
+    buckets=(0.5, 1, 2, 4, 8, 12, 24, 48, 96),
+)
+
+
+def record_dlt_case(failure_class: str) -> None:
+    if DLT_CASES is not None:
+        DLT_CASES.labels(failure_class=failure_class).inc()
+
+
+def record_dlt_corroboration(verdict: str) -> None:
+    if DLT_CORROBORATION is not None:
+        DLT_CORROBORATION.labels(verdict=verdict).inc()
+
+
+def record_dlt_reuse(decision: str) -> None:
+    if DLT_REUSE is not None:
+        DLT_REUSE.labels(decision=decision).inc()
+
+
+def record_dlt_registry_miss() -> None:
+    if DLT_REGISTRY_MISSES is not None:
+        DLT_REGISTRY_MISSES.inc()
+
+
+def record_dlt_window_age(age_seconds: float) -> None:
+    if DLT_WINDOW_AGE_HOURS is not None:
+        DLT_WINDOW_AGE_HOURS.observe(max(0.0, age_seconds) / 3600.0)
+
+
 BREAKER_STATE = _gauge(
     "packetcrm_breaker_state",
     "Circuit breaker state: 0 closed, 1 half-open, 2 open.",

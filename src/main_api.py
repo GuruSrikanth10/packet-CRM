@@ -38,6 +38,11 @@ app = FastAPI(
 )
 app.include_router(api_router)
 
+# DLT analysis (DLT_PLAN.md). A separate router on the same app: the flow is
+# parallel to the rejection pipeline, not part of it.
+from src.api.dlt_routes import router as dlt_router  # noqa: E402
+app.include_router(dlt_router)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

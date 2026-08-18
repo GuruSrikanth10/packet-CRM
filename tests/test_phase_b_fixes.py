@@ -308,7 +308,9 @@ def test_elasticsearch_path_records_are_redacted_before_persistence(tmp_path, mo
 
     written = {}
 
-    def capture_raw(event_id, logs):
+    # **_kw absorbs the `storage=` argument the artifact writers gained in
+    # Phase 5 of DLT_PLAN.md, matching the other stubs in this file.
+    def capture_raw(event_id, logs, **_kw):
         written["logs"] = [dict(entry) for entry in logs]
         return "raw_logs.txt"
 

@@ -58,3 +58,49 @@ def publish_to_analysis_queue(payload: dict) -> bool:
     producer.flush()
     logger.info("Published to analysis queue", event_id=event_id, topic=analysis_topic)
     return True
+
+
+# ---------------------------------------------------------------------------
+# DLT analysis queue (DLT_PLAN.md Phase 5)
+# ---------------------------------------------------------------------------
+# A second topic and a second producer rather than a parameter on the one
+# above: the two queues carry different message shapes, are consumed by
+# different roles, and a backlog on one must not be able to stall the other.
+
+_dlt_producer = None
+
+
+def get_dlt_producer():
+    global _dlt_producer
+    if _dlt_producer is None:
+        try:
+            _dlt_producer = KafkaProducer(
+                bootstrap_servers=brokers,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                acks="all",
+                retries=3,
+            )
+        except Exception as e:
+            logger.error("Failed to initialize DLT analysis-queue producer", error=str(e))
+    return _dlt_producer
+
+
+def publish_to_dlt_analysis_queue(message: dict) -> bool:
+    """Hand a fetched DLT case to the analysis consumer.
+
+    Raises on failure for the same reason as `publish_to_analysis_queue`: the
+    non-2xx response stops the DLT consumer committing its offset, so Kafka
+    redelivers rather than the case being silently dropped between stages.
+    """
+    import os
+
+    topic = os.environ.get("DLT_ANALYSIS_TOPIC_NAME", "dlt-analysis-queue")
+    producer = get_dlt_producer()
+    if not producer:
+        raise RuntimeError("DLT analysis-queue producer is not available")
+
+    case_id = message.get("case_id", "unknown") if isinstance(message, dict) else "unknown"
+    producer.send(topic, message)
+    producer.flush()
+    logger.info("Published to DLT analysis queue", case_id=case_id, topic=topic)
+    return True
