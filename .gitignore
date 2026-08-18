@@ -18,3 +18,6 @@ local_checkpoints/
 
 # filelock artifacts
 *.lock
+
+# Captured DLT corpus (real production messages -- never commit)
+tests/fixtures/dlt/corpus/
