@@ -2,6 +2,10 @@ import logging
 import os
 import structlog
 import sys
+import urllib3
+
+# Suppress expected warning when K8S_VERIFY_SSL=false
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def _resolve_level() -> int:
@@ -14,10 +18,25 @@ def _resolve_level() -> int:
     return getattr(logging, raw, logging.INFO)
 
 
+def _add_section_separator(logger, method_name, event_dict):
+    """Add visual patterns to key orchestration events."""
+    event = event_dict.get("event", "")
+    if isinstance(event, str):
+        lower_event = event.lower()
+        if "node started" in lower_event:
+            event_dict["event"] = f"\n{'='*70}\n[ >>  {event.upper()}  << ]\n{'='*70}"
+        elif "finished" in lower_event or "completed" in lower_event:
+            event_dict["event"] = f"--- {event.upper()} ---"
+    return event_dict
+
+
 def setup_logging():
     # Only configure once
     if structlog.is_configured():
         return
+
+    # Route Python warnings through structlog
+    logging.captureWarnings(True)
 
     logging.basicConfig(
         format="%(message)s",
@@ -25,6 +44,17 @@ def setup_logging():
         level=_resolve_level(),
     )
     
+    # Silence verbose 3rd-party libraries
+    logging.getLogger("kafka").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    
+    log_format = os.environ.get("LOG_FORMAT", "TEXT").strip().upper()
+    if log_format == "JSON":
+        renderer = structlog.processors.JSONRenderer()
+    else:
+        renderer = structlog.dev.ConsoleRenderer(colors=True)
+
     structlog.configure(
         processors=[
             structlog.stdlib.add_log_level,
@@ -32,7 +62,8 @@ def setup_logging():
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
-            structlog.processors.JSONRenderer()
+            _add_section_separator,
+            renderer
         ],
         context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),
