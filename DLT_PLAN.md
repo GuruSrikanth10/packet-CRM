@@ -507,7 +507,8 @@ All new. Added to `.env.example` in the phase that first reads them.
 | `DLT_APP_PACKAGES` | `com.uidai.,in.gov.uidai.` | Frames kept during normalisation |
 | `DLT_FINGERPRINT_FRAMES` | `5` | Frames in the fingerprint |
 | `DLT_BOILERPLATE_FRAMES` | `in.gov.uidai.common.factory.CommonErrorFactory` | Exception-plumbing frames dropped before fingerprinting (5.1). Empty disables |
-| `DLT_CLASS_MAP` | (built-in) | JSON, exception FQCN prefix -> class |
+| `DLT_CLASS_MAP` | (built-in) | JSON, exception FQCN prefix -> class. **Extends** the built-in map, never replaces it |
+| `DLT_BUSINESS_EXCEPTIONS` | `in.gov.uidai.common.exception.BusinessException` | Extra business-exception FQCNs; any `*BusinessException` already qualifies |
 | `DLT_REFID_PATH` | (unset) | Dotted path to refId in the payload |
 | `DLT_REFID_KEYS` | `refId,ref_id,referenceId` | Recursive-search fallback keys |
 | `DLT_REGISTRY_PATH` | `business_errors.csv` | BusinessException registry |
@@ -559,7 +560,7 @@ called until Phase 8.
 |---|---|---|
 | 0 | **Tooling ready, awaiting data** | `src/tools/dlt_sample.py` built and tested; the reference sample is committed as a fixture. Must be run against the live DLT from a host with broker access; results go in Section 11. |
 | 1 | **Complete** | `src/dlt/headers.py`, `src/dlt/stacktrace.py`. 39 tests, including both trap regressions. Boilerplate-frame filter added during the phase -- see 5.1 step 4. |
-| 2 | Not started | |
+| 2 | **Complete** | `src/dlt/classify.py`, `src/dlt/registry.py`, fixture registry CSV. 36 tests. `dlt_sample.py` gained `--analyze`, which computes the Section 11 measurements from a captured corpus. |
 | 3 | Not started | |
 | 4 | Not started | |
 | 5 | Not started | |
@@ -589,8 +590,11 @@ code.
      not, the log lane cannot filter and Phase 5 must be redesigned.
   6. Whether any message shows a mis-cast exception (Open Question 2).
   7. Observed lag between `retry_topic-backoff-timestamp` and DLT arrival.
-- **Tooling:** a throwaway script is fine; if it is kept, it goes in
-  `src/tools/dlt_sample.py` with `--limit` and `--redact`.
+- **Tooling:** `src/tools/dlt_sample.py`, built in this phase. Capture with
+  `--limit`/`--redact` (needs broker access); then `--analyze <dir>` computes
+  items 1, 2, 3, 4 and 7 above and writes `_analysis.json` (needs no broker,
+  so the two halves can run on different hosts). Item 5 is still a manual
+  `kubectl logs` check.
 - **Exit criteria:** items 1-5 answered and recorded in Section 11. Item 5 is a
   hard gate on Phase 5.
 - **Out of scope:** everything else.

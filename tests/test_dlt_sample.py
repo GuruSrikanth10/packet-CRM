@@ -151,3 +151,100 @@ def test_reference_fixture_is_intact(reference):
     assert trace.count("\nCaused by: ") == 4
     assert trace.rstrip().endswith("... 43 more")
     assert "UID_ORIGIN_TRACKER_DATA_NOT_FOUND" in trace
+
+
+# ======================================================================
+# Corpus analysis (Phase 0 measurements, computable once Phase 2 exists)
+# ======================================================================
+
+def _write_corpus(tmp_path, reference):
+    """Four copies of the real Class A message, one NPE, one unknown."""
+    for i in range(4):
+        headers = dict(reference["headers"])
+        headers["kafka_original-offset"] = str(3352 + i)
+        (tmp_path / f"a{i}.json").write_text(json.dumps({
+            "_source": {"dlt_offset": 100 + i, "dlt_timestamp": 1787019620000},
+            "headers": headers,
+            "payload": {"packetMetaData": {"refId": f"REF{i}"}},
+        }), encoding="utf-8")
+
+    (tmp_path / "b.json").write_text(json.dumps({
+        "_source": {"dlt_offset": 7, "dlt_timestamp": 1787019620000},
+        "headers": {"retry_topic-backoff-timestamp": "01A012AB41BF",
+                    "kafka_exception-stacktrace":
+                    "org.springframework.X: outer\n\tat org.springframework.A.b(A.java:1)"
+                    "\nCaused by: java.lang.NullPointerException: boom"
+                    "\n\tat com.uidai.enu.biometric.Svc.doWork(Svc.java:88)\n\t... 3 more\n"},
+        "payload": {"packetMetaData": {"refId": "REFNPE"}},
+    }), encoding="utf-8")
+
+    (tmp_path / "u.json").write_text(json.dumps({
+        "_source": {"dlt_offset": 8, "dlt_timestamp": 1787019620000},
+        "headers": {"kafka_exception-stacktrace":
+                    "org.springframework.X: outer\n\tat org.springframework.A.b(A.java:1)"
+                    "\nCaused by: com.example.WeirdFault: unseen"
+                    "\n\tat com.uidai.enu.biometric.Other.go(Other.java:5)\n\t... 3 more\n"},
+        "payload": {},
+    }), encoding="utf-8")
+    return tmp_path
+
+
+def test_analyse_reports_class_distribution(tmp_path, reference):
+    from src.tools.dlt_sample import analyse
+
+    report = analyse(_write_corpus(tmp_path, reference))
+    assert report["messages"] == 6
+    assert report["class_distribution"] == {"A": 4, "B": 1, "C": 0, "U": 1}
+
+
+def test_analyse_collapses_identical_failures_into_one_fingerprint(tmp_path, reference):
+    """The measurement Phase 7's exit criteria depends on: four occurrences of
+    one bug must be one group, not four."""
+    from src.tools.dlt_sample import analyse
+
+    report = analyse(_write_corpus(tmp_path, reference))
+    assert report["distinct_fingerprints"] == 3
+    assert report["class_a_messages"] == 4
+    assert report["class_a_distinct_fingerprints"] == 1
+    assert report["top_fingerprints"][0]["count"] == 4
+    assert "UID_ORIGIN_TRACKER_DATA_NOT_FOUND" in report["top_fingerprints"][0]["signature"]
+
+
+def test_analyse_finds_the_refid_path(tmp_path, reference):
+    """Phase 0 item 4 -- the value that becomes DLT_REFID_PATH."""
+    from src.tools.dlt_sample import analyse
+
+    report = analyse(_write_corpus(tmp_path, reference))
+    assert report["refid_paths"]["packetMetaData.refId"] == 5
+
+
+def test_analyse_handles_an_empty_corpus(tmp_path):
+    from src.tools.dlt_sample import analyse
+
+    assert analyse(tmp_path)["messages"] == 0
+
+
+def test_analyse_skips_underscore_and_unreadable_files(tmp_path, reference):
+    from src.tools.dlt_sample import analyse
+
+    _write_corpus(tmp_path, reference)
+    (tmp_path / "_summary.json").write_text('{"captured": 6}', encoding="utf-8")
+    (tmp_path / "broken.json").write_text("{not json", encoding="utf-8")
+    assert analyse(tmp_path)["messages"] == 6
+
+
+def test_refid_search_is_depth_capped():
+    from src.tools.dlt_sample import _find_refid_paths
+
+    node = current = {}
+    for _ in range(20):
+        current["nested"] = {}
+        current = current["nested"]
+    current["refId"] = "deep"
+    assert _find_refid_paths(node) == []
+
+
+def test_refid_search_descends_into_lists():
+    from src.tools.dlt_sample import _find_refid_paths
+
+    assert _find_refid_paths({"items": [{"refId": "x"}]}) == ["items[].refId"]

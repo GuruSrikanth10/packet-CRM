@@ -21,3 +21,6 @@ local_checkpoints/
 
 # Captured DLT corpus (real production messages -- never commit)
 tests/fixtures/dlt/corpus/
+
+# ...but test fixture registries must be committed (DLT BusinessException registry)
+!tests/fixtures/**/*.csv
