@@ -83,7 +83,10 @@ def test_processing_failure_publishes_to_dlq_and_frees_the_floor(monkeypatch):
     def exploding_storage():
         raise RuntimeError("S3 is having a moment")
 
-    monkeypatch.setattr(kc, "get_casebook_storage", exploding_storage)
+    # Phase 4 moved the dedupe check into RejectionAdapter.should_skip, which
+    # imports the factory at call time. Patching the factory itself injects the
+    # same failure at the same point and survives further refactors.
+    monkeypatch.setattr("src.storage.factory.get_casebook_storage", exploding_storage)
     monkeypatch.setattr(kc._queue_semaphore, "release", lambda: None)
 
     msg = SimpleNamespace(
@@ -114,7 +117,7 @@ def test_dlq_failure_holds_the_offset_rather_than_losing_the_message(monkeypatch
         raise ConnectionError("broker unreachable")
 
     monkeypatch.setattr("src.utils.dlq_publisher.publish_to_dlq", dead_dlq)
-    monkeypatch.setattr(kc, "get_casebook_storage",
+    monkeypatch.setattr("src.storage.factory.get_casebook_storage",
                         lambda: (_ for _ in ()).throw(RuntimeError("storage down")))
     monkeypatch.setattr(kc._queue_semaphore, "release", lambda: None)
 

@@ -9,10 +9,16 @@ from concurrent.futures import ThreadPoolExecutor
 from kafka import ConsumerRebalanceListener, KafkaConsumer
 from kafka.structs import OffsetAndMetadata
 from pathlib import Path
+from typing import Optional
 from .env import get_required_env
-from src.storage.factory import get_casebook_storage
+from src.utils import message_adapters
 from src.utils.logging_config import get_logger
-from src.utils.paths import CONSUMER_HEARTBEAT_PATH, SLOW_CONSUMER_HEARTBEAT_PATH
+from src.utils.paths import (
+    CONSUMER_HEARTBEAT_PATH,
+    DLT_ANALYSIS_HEARTBEAT_PATH,
+    DLT_CONSUMER_HEARTBEAT_PATH,
+    SLOW_CONSUMER_HEARTBEAT_PATH,
+)
 
 logger = get_logger(__name__)
 
@@ -35,7 +41,29 @@ kafkaConsumerBrokers = [
 # both, unmodified.
 CONSUMER_ROLE = os.environ.get("CONSUMER_ROLE", "fast").strip().lower()
 
-if CONSUMER_ROLE == "slow":
+if CONSUMER_ROLE == "dlt":
+    # Reads the dead-letter topic and forwards to /fetch-dlt-logs. Bounded
+    # I/O only, exactly like the fast consumer -- see DLT_PLAN.md 6.1.
+    kafkaConsumerTopicName = get_required_env("DLT_CONSUMER_TOPIC_NAME", "packet-dlt")
+    kafkaConsumerGroupId = get_required_env("DLT_CONSUMER_GROUP_ID", "dlt-analysis-group")
+    kafkaConsumerInternalEndpoint = get_required_env(
+        "DLT_CONSUMER_ENDPOINT", "http://localhost:8000/fetch-dlt-logs")
+    kafkaConsumerInternalTimeoutSec = float(
+        os.environ.get("DLT_CONSUMER_TIMEOUT_SECONDS", "90"))
+    _HEARTBEAT_PATH = DLT_CONSUMER_HEARTBEAT_PATH
+    _HEALTH_PORT_ENV = "DLT_HEALTH_PORT"
+elif CONSUMER_ROLE == "dlt_analysis":
+    # Reads the DLT analysis queue and forwards to /analyze-dlt. LLM-bound,
+    # so it carries the long timeout and is the role to scale out.
+    kafkaConsumerTopicName = get_required_env("DLT_ANALYSIS_TOPIC_NAME", "dlt-analysis-queue")
+    kafkaConsumerGroupId = get_required_env("DLT_ANALYSIS_GROUP_ID", "dlt-analysis-slow-group")
+    kafkaConsumerInternalEndpoint = get_required_env(
+        "DLT_ANALYSIS_ENDPOINT", "http://localhost:8000/analyze-dlt")
+    kafkaConsumerInternalTimeoutSec = float(
+        os.environ.get("DLT_ANALYSIS_TIMEOUT_SECONDS", "300"))
+    _HEARTBEAT_PATH = DLT_ANALYSIS_HEARTBEAT_PATH
+    _HEALTH_PORT_ENV = "DLT_ANALYSIS_HEALTH_PORT"
+elif CONSUMER_ROLE == "slow":
     # Reads the analysis queue that POST /fetch-logs publishes to, and
     # forwards each message to /analyze-rejection for the LLM-driven
     # investigation. This is the process meant to scale out to many pods to
@@ -226,6 +254,11 @@ class OffsetTracker:
 
 _offset_tracker = OffsetTracker()
 
+# Per-role validation, skip rules, identity and request body (Phase 4). The
+# rejection roles get today's logic moved verbatim; only `dlt`/`dlt_analysis`
+# behave differently.
+_adapter = message_adapters.for_role(CONSUMER_ROLE)
+
 
 def forward_signal_to_internal_endpoint(signal_payload: dict):
     api_key = os.environ.get("PACKET_CRM_API_KEY", "dev-secret-key")
@@ -286,8 +319,10 @@ def _dlq_and_abandon(payload, error_message: str, message_offsets: dict):
     _record_abandonment(message_offsets)
 
 
-def _process_and_commit(signal_payload: dict, message_offsets: dict = None):
-    event_id = signal_payload.get("eventId")
+def _process_and_commit(signal_payload: dict, message_offsets: Optional[dict] = None):
+    # Storage key and log identifier -- eventId for the rejection roles,
+    # case_id for the DLT roles (Phase 4).
+    event_id = _adapter.identity_of(signal_payload)
     success = False
     try:
         logger.info("Forwarding event to internal endpoint", event_id=event_id)
@@ -312,11 +347,10 @@ def _process_and_commit(signal_payload: dict, message_offsets: dict = None):
         # could overwrite it with COMPLETED while the DLQ message stayed
         # queued (F4).
         try:
-            get_casebook_storage().save_terminal(event_id, {
-                "packet_metadata": {"eid": event_id},
-                "packet_status": {"status": "FAILED_TIMEOUT"},
-                "resolution": {"synthesis": "Investigation exceeded maximum allowed time."}
-            })
+            # Routed through the adapter so a DLT timeout writes into
+            # dlt_cases/, not beside the rejection casebooks.
+            if event_id:
+                _adapter.save_terminal(event_id, _adapter.timeout_casebook(signal_payload))
         except Exception as storage_error:
             # Best-effort: the DLQ publish below is what actually authorises the
             # commit, so a failed terminal write must not skip it.
@@ -377,6 +411,7 @@ def _handle_one_message(tp, msg):
     """
     submitted = False
     signal_payload = None
+    payload = None
 
     # Track only this message's offset, never the whole polled batch -- a bare
     # consumer.commit() advances past every message in the batch, including
@@ -385,40 +420,35 @@ def _handle_one_message(tp, msg):
     _offset_tracker.dispatched(tp, msg.offset)
 
     try:
-        payload = msg.value.decode("utf-8", errors="replace")
-        try:
-            signal_payload = json.loads(payload)
-            from src.models.schemas import MessagePayload
-            # Validate payload structure (Poison-pill check)
-            MessagePayload(**signal_payload)
-        except Exception as validation_err:
-            logger.error("Poison-pill payload detected", error=str(validation_err))
+        # Validation, the skip rules, the identity and the request body are the
+        # only per-role parts; everything above and below is shared (Phase 4).
+        parsed = _adapter.parse(msg)
+        payload = parsed.raw_text
+        if parsed.is_poison:
             from src.utils.dlq_publisher import publish_to_dlq
-            publish_to_dlq(payload, f"Structural validation failed: {validation_err}")
+            publish_to_dlq(parsed.raw_text, parsed.error or "Message failed validation")
             _record_completion(message_offsets)
             return
 
-        # Check packetStatus if it's REJECTED
-        summary = signal_payload.get("packetExecutionSummary", {})
-        if summary.get("packetStatus") != "REJECTED":
-            logger.info("Skipping non-rejected packet", event_id=signal_payload.get("eventId"))
+        signal_payload = parsed.body or {}
+        event_id = _adapter.identity_of(signal_payload)
+
+        # May raise (FileLock timeout, S3 blip) -- the outer handler DLQs the
+        # *parsed* payload and abandons the offset, which is why parsing and
+        # skipping are separate calls.
+        skip_reason = _adapter.should_skip(signal_payload)
+        if skip_reason:
+            logger.info("Skipping message", event_id=event_id, reason=skip_reason)
             _record_completion(message_offsets)
             return
 
-        # Dedupe check
-        event_id = signal_payload.get("eventId")
-        storage = get_casebook_storage()
-        if storage.exists(event_id, terminal_only=True):
-            logger.info("Skipping event; terminal casebook already exists", event_id=event_id)
-            _record_completion(message_offsets)
-            return
-
-        logger.info("Received REJECTED packet; enqueueing for analysis", event_id=event_id)
+        logger.info("Received message; enqueueing for processing",
+                    event_id=event_id, role=CONSUMER_ROLE)
 
         _worker_pool.submit(_process_and_commit, signal_payload, message_offsets)
         submitted = True
     except Exception as e:
-        payload_sample = payload[:500] if 'payload' in locals() else 'Decode failed'
+        payload_sample = payload[:500] if payload else 'Decode failed'
         logger.exception("Error processing Kafka message; routing to the DLQ",
                          payload_sample=payload_sample)
         # This branch is reached by anything the happy path can raise: a

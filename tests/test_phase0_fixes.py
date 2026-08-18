@@ -118,7 +118,7 @@ def test_semaphore_not_double_released_when_commit_raises_after_submit():
 
     with patch.object(kc, "consumer", fake_consumer), \
          patch.object(kc, "_worker_pool") as fake_pool, \
-         patch.object(kc, "get_casebook_storage") as fake_storage_factory:
+         patch("src.storage.factory.get_casebook_storage") as fake_storage_factory:
         fake_storage_factory.return_value.exists.return_value = False
         semaphore_release = MagicMock()
         with patch.object(kc._queue_semaphore, "release", semaphore_release):
@@ -147,7 +147,7 @@ def test_semaphore_released_once_when_submit_never_happens():
 
     with patch.object(kc, "consumer", fake_consumer), \
          patch.object(kc, "_worker_pool") as fake_pool, \
-         patch.object(kc, "get_casebook_storage") as fake_storage_factory:
+         patch("src.storage.factory.get_casebook_storage") as fake_storage_factory:
         fake_storage_factory.return_value.exists.return_value = True  # already terminal -> dedupe skip
         semaphore_release = MagicMock()
         with patch.object(kc._queue_semaphore, "release", semaphore_release):
@@ -188,7 +188,7 @@ def test_skip_path_records_only_this_message_offset():
     with patch.object(kc, "consumer", fake_consumer), \
          patch.object(kc, "_worker_pool") as fake_pool, \
          patch.object(kc, "_offset_tracker", kc.OffsetTracker()) as tracker, \
-         patch.object(kc, "get_casebook_storage"):
+         patch("src.storage.factory.get_casebook_storage"):
         kc._handle_one_message(tp, msg)
 
         fake_pool.submit.assert_not_called()
@@ -225,7 +225,7 @@ def test_dispatched_message_defers_its_commit_to_completion():
 
     with patch.object(kc, "consumer", fake_consumer), \
          patch.object(kc, "_worker_pool") as fake_pool, \
-         patch.object(kc, "get_casebook_storage") as fake_storage_factory:
+         patch("src.storage.factory.get_casebook_storage") as fake_storage_factory:
         fake_storage_factory.return_value.exists.return_value = False
         kc._handle_one_message(tp, msg)
 

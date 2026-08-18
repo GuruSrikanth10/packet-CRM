@@ -42,6 +42,25 @@ H_BACKOFF_TIMESTAMP = "retry_topic-backoff-timestamp"
 H_TYPE_ID = "__TypeId__"
 
 
+def decode_kafka_headers(raw_headers) -> dict:
+    """kafka-python hands back `[(str, bytes)]`; make it a plain str->str dict.
+
+    A duplicate key keeps the last value, matching Spring's own consumer-side
+    accessors. A non-UTF-8 value is replaced rather than raising: losing one
+    header must never cost us the whole message.
+    """
+    out = {}
+    for key, value in (raw_headers or []):
+        name = key.decode("utf-8", errors="replace") if isinstance(key, bytes) else str(key)
+        if value is None:
+            out[name] = None
+        elif isinstance(value, bytes):
+            out[name] = value.decode("utf-8", errors="replace")
+        else:
+            out[name] = str(value)
+    return out
+
+
 def decode_epoch_ms(value) -> Optional[int]:
     """Decode an epoch-millisecond header written in decimal *or* hex.
 

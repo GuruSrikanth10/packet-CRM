@@ -31,6 +31,7 @@ load_dotenv()
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from src.dlt.headers import decode_kafka_headers  # noqa: E402
 from src.log_pipeline import redaction  # noqa: E402
 
 #: Headers whose values are structural Kafka/Spring metadata -- offsets,
@@ -54,23 +55,10 @@ STRUCTURAL_HEADERS = frozenset({
 })
 
 
-def decode_headers(raw_headers) -> dict:
-    """kafka-python hands back [(str, bytes)]; make it a plain str->str dict.
-
-    A duplicate header key keeps the last value, which is what Spring's own
-    consumer-side accessors do. A non-UTF-8 value is replaced rather than
-    raising -- losing one header must never cost us the whole message.
-    """
-    out = {}
-    for key, value in (raw_headers or []):
-        name = key.decode("utf-8", errors="replace") if isinstance(key, bytes) else str(key)
-        if value is None:
-            out[name] = None
-        elif isinstance(value, bytes):
-            out[name] = value.decode("utf-8", errors="replace")
-        else:
-            out[name] = str(value)
-    return out
+#: Canonical implementation lives in `src.dlt.headers` so the consumer and this
+#: tool decode headers identically. Re-exported under the name this module has
+#: always used.
+decode_headers = decode_kafka_headers
 
 
 def redact_headers(headers: dict) -> dict:

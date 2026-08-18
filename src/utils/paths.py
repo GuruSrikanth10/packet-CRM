@@ -46,3 +46,9 @@ def casebook_dir(event_id: str) -> Path:
     reduced_logs.txt, the Kubernetes snapshot) that sit beside it.
     """
     return LOCAL_CASESHEETS_DIR / f"casebook_{event_id}"
+
+# DLT analysis consumers (DLT_PLAN.md Phase 4). Distinct files so all four
+# consumer roles can be co-located under start.py without clobbering each
+# other's liveness stamp.
+DLT_CONSUMER_HEARTBEAT_PATH = LOCAL_CHECKPOINTS_DIR / "dlt_consumer_heartbeat.txt"
+DLT_ANALYSIS_HEARTBEAT_PATH = LOCAL_CHECKPOINTS_DIR / "dlt_analysis_heartbeat.txt"

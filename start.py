@@ -9,6 +9,7 @@ silently stops receiving work (F12). Each consumer sets its own CONSUMER_ROLE
 before importing kafkaConsumer.py, so no special per-child environment is
 needed here to keep their topics, heartbeat files, and health ports apart.
 """
+import os
 import signal
 import subprocess
 import sys
@@ -73,7 +74,21 @@ def main():
     print("Starting the slow consumer (slow_consumer.py) -- analysis queue -> /analyze-rejection.")
     _children.append(("SlowConsumer", subprocess.Popen([sys.executable, "src/slow_consumer.py"])))
 
-    print("\nAll three services are running. Press Ctrl+C to stop them.")
+    # Off by default: a deployment with no dead-letter topic configured would
+    # otherwise start two consumers that fail to subscribe, and the supervisor
+    # would tear down the whole ecosystem when they exited (DLT_PLAN.md
+    # Phase 4).
+    if os.environ.get("DLT_ENABLED", "false").strip().lower() in ("true", "1", "yes"):
+        print("Starting the DLT consumer (dlt_consumer.py) -- dead-letter topic -> /fetch-dlt-logs.")
+        _children.append(("DltConsumer", subprocess.Popen([sys.executable, "src/dlt_consumer.py"])))
+
+        dlt_analysis = "src/dlt_analysis_consumer.py"
+        if os.path.exists(dlt_analysis):
+            print("Starting the DLT analysis consumer -- DLT queue -> /analyze-dlt.")
+            _children.append(("DltAnalysisConsumer",
+                              subprocess.Popen([sys.executable, dlt_analysis])))
+
+    print(f"\nAll {len(_children)} services are running. Press Ctrl+C to stop them.")
 
     try:
         # Wait on all three concurrently. Waiting on the API and only then on

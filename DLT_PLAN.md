@@ -562,7 +562,7 @@ called until Phase 8.
 | 1 | **Complete** | `src/dlt/headers.py`, `src/dlt/stacktrace.py`. 39 tests, including both trap regressions. Boilerplate-frame filter added during the phase -- see 5.1 step 4. |
 | 2 | **Complete** | `src/dlt/classify.py`, `src/dlt/registry.py`, fixture registry CSV. 36 tests. `dlt_sample.py` gained `--analyze`, which computes the Section 11 measurements from a captured corpus. |
 | 3 | **Complete** | `src/dlt/payload.py`, `src/dlt/identity.py`, `src/models/dlt_schemas.py`. 41 tests. Case-id sanitisation asserts the real invariant (no path separator), not the stricter one -- see the note in `test_path_traversal_cannot_survive_sanitisation`. |
-| 4 | Not started | |
+| 4 | **Complete** | `src/utils/message_adapters.py`, `src/dlt/case_storage.py`, `src/dlt_consumer.py`; `kafkaConsumer.py` gained the `dlt`/`dlt_analysis` roles and routes through the adapter. 30 tests. **Six existing tests were repointed** from `kc.get_casebook_storage` to `src.storage.factory.get_casebook_storage` -- the dedupe moved into `RejectionAdapter.should_skip`, so the old patch target no longer exists. Behaviour is unchanged; only the injection point moved. |
 | 5 | Not started | |
 | 6 | Not started | |
 | 7 | Not started | |
