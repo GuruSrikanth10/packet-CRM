@@ -201,7 +201,16 @@ Normalisation applies, in order:
    per JVM run), `$$SpringCGLIB$$0`, `<generated>`, `$$Lambda$1234/0x00007f...`.
    All present in the sample. Left in, they guarantee that no two occurrences
    ever fingerprint alike.
-4. **Truncate to `DLT_FINGERPRINT_FRAMES`** (default 5) from the top.
+4. **Drop exception plumbing** listed in `DLT_BOILERPLATE_FRAMES`. Added
+   during Phase 1 after running against the reference sample: the top
+   application frame of a `BusinessException` is
+   `CommonErrorFactory.instantiateException`, because that factory constructs
+   every business exception in the codebase. It is therefore identical across
+   all Class A failures -- it contributes nothing to the fingerprint, displaces
+   a frame that would, and makes the signature name the factory instead of the
+   code that failed. Inferred from one sample; Phase 0's corpus should confirm
+   it and reveal any siblings. Setting the variable empty disables the filter.
+5. **Truncate to `DLT_FINGERPRINT_FRAMES`** (default 5) from the top.
 
 **Fingerprint.**
 
@@ -497,6 +506,7 @@ All new. Added to `.env.example` in the phase that first reads them.
 | `DLT_ANALYSIS_TIMEOUT_SECONDS` | `300` | LLM budget |
 | `DLT_APP_PACKAGES` | `com.uidai.,in.gov.uidai.` | Frames kept during normalisation |
 | `DLT_FINGERPRINT_FRAMES` | `5` | Frames in the fingerprint |
+| `DLT_BOILERPLATE_FRAMES` | `in.gov.uidai.common.factory.CommonErrorFactory` | Exception-plumbing frames dropped before fingerprinting (5.1). Empty disables |
 | `DLT_CLASS_MAP` | (built-in) | JSON, exception FQCN prefix -> class |
 | `DLT_REFID_PATH` | (unset) | Dotted path to refId in the payload |
 | `DLT_REFID_KEYS` | `refId,ref_id,referenceId` | Recursive-search fallback keys |
@@ -547,8 +557,8 @@ called until Phase 8.
 
 | Phase | State | Notes |
 |---|---|---|
-| 0 | Not started | Data gate. Blocks Phase 4's defaults, unblocks nothing else. |
-| 1 | Not started | |
+| 0 | **Tooling ready, awaiting data** | `src/tools/dlt_sample.py` built and tested; the reference sample is committed as a fixture. Must be run against the live DLT from a host with broker access; results go in Section 11. |
+| 1 | **Complete** | `src/dlt/headers.py`, `src/dlt/stacktrace.py`. 39 tests, including both trap regressions. Boilerplate-frame filter added during the phase -- see 5.1 step 4. |
 | 2 | Not started | |
 | 3 | Not started | |
 | 4 | Not started | |
