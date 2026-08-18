@@ -155,13 +155,27 @@ def lookup_resident_database(uid: str, srn: str) -> str:
             
     return "Resident not found in the database."
 
+def get_error_description(error_code: str) -> str:
+    """Return the description for an errorReasonCode without Langchain wrapping."""
+    error_descriptions = {
+        "RESIDENT_UPDATE_REJECT_FOR_IDENTIFY_FAILURE": "The resident biometric update was rejected because the 1:N biometric identification check failed against the gallery. No non-rejected packet found for biometric update.",
+        "RESIDENT_BIOMETRIC_UPDATE_IDENTIFY_FAILURE": "The resident biometric update was rejected because the 1:N biometric identification check failed against the gallery. No matching uid for updation",
+        "RESIDENT_BIOMETRIC_UPDATE_FAILURE": "General or unhandled failure while processing the resident's biometric update.",
+        "RESIDENT_BIOMETRIC_QUALITY_CHECK_FAILED": "The biometric data provided during the update failed the automated backend quality assessment.",
+        "BIO_ABIS_RESPONSE_NON_FAIL_OR_SUCCESS": "The ABIS system returned an unexpected response code that was neither a standard success nor a standard failure.",
+        "ENU_BIO_NO_GALLERY_RECORD_AVAILABLE": "No existing baseline biometric gallery record could be found in ABIS to perform the required matching.",
+        "RESIDENT_BIO_PKT_RVERIFY_FAIL": "The backend verification of the resident's biometric packet structure/integrity failed.",
+        "RESIDENT_BIO_PKT_AUTH_FAIL": "Authentication of the biometric packet (e.g., verifying the digital signature or operator biometric auth) failed.",
+        "BIO_CONSISTENCY_CHECK_FAILED": "The captured biometrics are inconsistent (e.g., the fingerprints provided do not physically align or make sense contextually).",
+        "RESIDENT_MAN_DEDUP_DUPLICATE": "The resident's biometric data was identified as a duplicate(if update, then matching to a different UID). It can be update or enrolment",
+        "RESIDENT_MAN_DEDUP_REJECT_TD": "The resident's biometric data was identified as a duplicate(if update, then matching to a different UID) and a candidate given by from different UID came as True duplicate. It can be update or enrolment"
+    }
+    return error_descriptions.get(error_code, "Unknown error code.")
+
 @tool
 def lookup_error_code(error_code: str) -> str:
     """Lookup the meaning of an errorReasonCode (like RESIDENT_MAN_DEDUP_REJECT_TD)."""
-    mock_errors = {
-        "RESIDENT_MAN_DEDUP_REJECT_TD": "Manual deduplication rejected the packet due to a biometric anomaly.",
-    }
-    return mock_errors.get(error_code, "Unknown error code.")
+    return get_error_description(error_code)
 
 # Maps the payload's terse enrolmentType onto the vocabulary the DB rule's
 # `rule_data.statement.Condition.StringEquals.enrolmentType` actually uses.
