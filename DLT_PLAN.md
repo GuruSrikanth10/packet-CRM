@@ -566,7 +566,7 @@ called until Phase 8.
 | 5 | **Complete** | `src/dlt/window.py`, `src/api/dlt_routes.py`; `reduce_logs` gained `storage_key`, `window` and `storage`; DLT analysis-queue producer; DLT metrics. 25 tests. One existing stub in `test_phase_b_fixes.py` gained `**_kw` to absorb the new `storage=` argument. **Still gated on Phase 0 item 5** -- the refId-in-logs check is unverified. |
 | 6 | **Complete** | `src/dlt/corroborate.py`. 25 tests. Verdicts stay advisory and matching is deliberately generous (FQCN, simple name, or business code all count) -- a false CONTRADICTED is worse than a missed one. Open Question 2 is still open. |
 | 7 | **Complete** | `src/dlt/groups.py`, `src/dlt/reuse.py`. 35 tests, including the cost-model proof: 400 messages across 3 bugs yield 3 groups and 3 LLM calls. Real-corpus numbers still need Phase 0. |
-| 8 | Not started | |
+| 8 | **Complete** | `src/dlt/orchestrator.py`, `src/dlt/canned.py`, `src/models/dlt_synthesis.py`, three prompts, `POST /analyze-dlt`, `src/dlt_analysis_consumer.py`. 24 tests with a mocked LLM. Occurrence recording moved ahead of the reuse decision so a canned finding's count includes the case it describes. |
 | 9 | Not started | |
 
 ---
