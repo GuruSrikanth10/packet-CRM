@@ -87,6 +87,27 @@ HEARTBEAT_STALE_SECONDS = float(
     os.environ.get("HEARTBEAT_STALE_SECONDS", str(HEARTBEAT_INTERVAL_SECONDS * 6))
 )
 
+# How many times to attempt the atomic heartbeat swap before giving up on a
+# tick. `os.replace` is only unconditionally safe on POSIX: on Windows it
+# fails with ERROR_ACCESS_DENIED for as long as any other process holds the
+# destination open, and a file rewritten every few seconds under a synced or
+# indexed directory attracts exactly that (OneDrive, the search indexer, an
+# AV scan). Those holders release in milliseconds, so a couple of short
+# retries turn a burst of warnings into nothing at all.
+HEARTBEAT_WRITE_ATTEMPTS = max(1, int(os.environ.get("HEARTBEAT_WRITE_ATTEMPTS", "3")))
+HEARTBEAT_WRITE_BACKOFF_SECONDS = float(
+    os.environ.get("HEARTBEAT_WRITE_BACKOFF_SECONDS", "0.1")
+)
+
+# The stamp this process answers `is_healthy()` from while it owns the
+# heartbeat ticker. Liveness used to be read back off the disk the ticker had
+# just written, which made a locked, full, or read-only filesystem able to
+# fail a perfectly healthy consumer's own probe -- the F9 restart-under-load
+# failure arriving by a different route. None means no ticker runs here (the
+# API, an operator CLI, a test), and those still read the file, which is the
+# only signal available across processes.
+_last_heartbeat = None
+
 
 def _heartbeat_path() -> Path:
     return _HEARTBEAT_PATH
@@ -494,17 +515,43 @@ def _commit_ready_offsets():
 
 
 def _write_heartbeat(heartbeat_file: Path):
-    """Atomically stamp the heartbeat file.
+    """Atomically stamp the heartbeat file, retrying a transient lock.
 
     Atomic because /health reads this concurrently; a plain truncate-and-write
     can be read as an empty file mid-write.
+
+    Retried because that atomicity is exactly what Windows refuses while
+    another process holds the destination open -- see
+    HEARTBEAT_WRITE_ATTEMPTS. The whole write is redone per attempt, not just
+    the swap, since a failure in the temp write leaves nothing to swap.
+
+    Never raises: the ticker calls this in a bare loop, so an exception
+    escaping here would kill the heartbeat thread for the life of the
+    process. An exhausted retry is only a stale reading for cross-process
+    readers -- `is_healthy()` answers from memory in the process that ticks.
     """
-    try:
-        tmp_path = heartbeat_file.with_suffix(".tmp")
-        tmp_path.write_text(str(time.time()), encoding="utf-8")
-        os.replace(tmp_path, heartbeat_file)
-    except Exception as e:
-        logger.warning("Failed to write heartbeat", error=str(e))
+    tmp_path = heartbeat_file.with_suffix(".tmp")
+    last_error = None
+
+    for attempt in range(HEARTBEAT_WRITE_ATTEMPTS):
+        try:
+            tmp_path.write_text(str(time.time()), encoding="utf-8")
+            os.replace(tmp_path, heartbeat_file)
+            return
+        except Exception as e:
+            last_error = e
+
+        if attempt + 1 == HEARTBEAT_WRITE_ATTEMPTS:
+            break
+
+        # Back off before retrying, but abandon the write the moment a drain
+        # starts -- nothing reads a heartbeat from a consumer that is going
+        # away, and this runs on the shutdown path's critical timing.
+        if _shutdown.wait(HEARTBEAT_WRITE_BACKOFF_SECONDS * (attempt + 1)):
+            return
+
+    logger.warning("Failed to write heartbeat",
+                   error=str(last_error), attempts=HEARTBEAT_WRITE_ATTEMPTS)
 
 
 def _start_heartbeat_thread(heartbeat_file: Path) -> threading.Thread:
@@ -518,9 +565,19 @@ def _start_heartbeat_thread(heartbeat_file: Path) -> threading.Thread:
     restart a perfectly healthy pod and kill every in-flight packet (F9).
     """
     def _tick():
-        while not _shutdown.is_set():
-            _write_heartbeat(heartbeat_file)
-            _shutdown.wait(HEARTBEAT_INTERVAL_SECONDS)
+        global _last_heartbeat
+        try:
+            while not _shutdown.is_set():
+                # In memory first, disk second. The stamp is what liveness is
+                # actually answered from, so it must not be contingent on the
+                # write below succeeding.
+                _last_heartbeat = time.time()
+                _write_heartbeat(heartbeat_file)
+                _shutdown.wait(HEARTBEAT_INTERVAL_SECONDS)
+        finally:
+            # The ticker is gone, so memory is no longer authoritative for
+            # this process and must stop being trusted as though it were.
+            _last_heartbeat = None
 
     thread = threading.Thread(target=_tick, name="consumer-heartbeat", daemon=True)
     thread.start()
@@ -534,13 +591,23 @@ def is_healthy() -> bool:
     by reading the heartbeat file off its local disk, which works only when
     both processes share a filesystem -- in the split-pod deployment Phase F
     exists to enable, `consumer_alive` was permanently false (G8).
+
+    Answered from `_last_heartbeat` whenever this process runs the ticker, so
+    the answer no longer depends on reading back a file this same process
+    wrote seconds ago. Only callers with no ticker of their own fall through
+    to the file.
     """
     if _shutdown.is_set():
         return False
-    try:
-        stamp = float(_heartbeat_path().read_text(encoding="utf-8").strip())
-    except Exception:
-        return False
+
+    stamp = _last_heartbeat
+    if stamp is None:
+        # No ticker in this process, so the file is the only signal there is.
+        try:
+            stamp = float(_heartbeat_path().read_text(encoding="utf-8").strip())
+        except Exception:
+            return False
+
     return (time.time() - stamp) < HEARTBEAT_STALE_SECONDS
 
 

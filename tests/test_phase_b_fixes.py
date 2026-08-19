@@ -242,6 +242,87 @@ def test_heartbeat_thread_ticks_without_the_poll_loop(tmp_path, monkeypatch):
         kc._shutdown.clear()
 
 
+def _replace_failing_n_times(n, failures):
+    """Stand-in for os.replace that denies the first `n` heartbeat swaps.
+
+    Only heartbeat swaps: every other replace in the process (temp-file
+    writes elsewhere, logging) must keep working while this is installed.
+    """
+    import os as _os
+
+    real = _os.replace
+
+    def _fake(src, dst, *args, **kwargs):
+        if str(dst).endswith("consumer_heartbeat.txt") and len(failures) < n:
+            failures.append(str(dst))
+            raise PermissionError(5, "Access is denied")
+        return real(src, dst, *args, **kwargs)
+
+    return _fake
+
+
+def test_heartbeat_write_retries_a_transient_lock(tmp_path, monkeypatch):
+    """Windows denies os.replace while another process holds the destination
+    open (OneDrive, the indexer, an AV scan). Those holders release in
+    milliseconds, so the tick must not be lost to one."""
+    import os
+
+    heartbeat = tmp_path / "consumer_heartbeat.txt"
+    failures = []
+    monkeypatch.setattr(os, "replace", _replace_failing_n_times(2, failures))
+    monkeypatch.setattr(kc, "HEARTBEAT_WRITE_BACKOFF_SECONDS", 0.001)
+
+    kc._write_heartbeat(heartbeat)
+
+    assert len(failures) == 2, "both transient denials should have been hit"
+    assert float(heartbeat.read_text()) > 0, "the third attempt must land"
+    assert not (tmp_path / "consumer_heartbeat.tmp").exists()
+
+
+def test_heartbeat_write_never_raises_when_every_attempt_fails(tmp_path, monkeypatch):
+    """The ticker calls this in a bare loop: an exception escaping here kills
+    the heartbeat thread for the life of the process."""
+    import os
+
+    heartbeat = tmp_path / "consumer_heartbeat.txt"
+    monkeypatch.setattr(os, "replace", _replace_failing_n_times(99, []))
+    monkeypatch.setattr(kc, "HEARTBEAT_WRITE_BACKOFF_SECONDS", 0.001)
+
+    kc._write_heartbeat(heartbeat)  # must return, not raise
+
+    assert not heartbeat.exists()
+
+
+def test_liveness_survives_a_heartbeat_file_that_cannot_be_written(tmp_path, monkeypatch):
+    """The reason the stamp moved into memory: a locked, full, or read-only
+    filesystem must not make a running consumer report itself dead and earn a
+    liveness-probe restart that kills every in-flight packet."""
+    import os
+
+    heartbeat = tmp_path / "consumer_heartbeat.txt"
+    monkeypatch.setattr(os, "replace", _replace_failing_n_times(99, []))
+    monkeypatch.setattr(kc, "HEARTBEAT_WRITE_BACKOFF_SECONDS", 0.001)
+    monkeypatch.setattr(kc, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(kc, "_heartbeat_path", lambda: heartbeat)
+    kc._shutdown.clear()
+
+    try:
+        thread = kc._start_heartbeat_thread(heartbeat)
+        time.sleep(0.1)
+
+        assert not heartbeat.exists(), "the write is genuinely failing"
+        assert kc.is_healthy() is True, "liveness must not depend on the disk"
+    finally:
+        kc._shutdown.set()
+        thread.join(timeout=2)
+        kc._shutdown.clear()
+
+    # The ticker is gone, so memory stops being authoritative and the file --
+    # which was never written -- is all that is left.
+    assert kc._last_heartbeat is None
+    assert kc.is_healthy() is False
+
+
 # ======================================================================
 # F12 -- shutdown request stops the loop
 # ======================================================================

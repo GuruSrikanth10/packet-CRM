@@ -1,13 +1,3 @@
-# Every dependency is pinned.
-#
-# Roughly half of these used to float. F2 -- the most damaging bug in the
-# previous audit -- was caused by a langchain-core behaviour change (`@tool`
-# producing a non-callable StructuredTool), and langchain-core was pinned
-# while `langgraph`, the package that tracks it most closely, was not. A
-# floating dependency means a green CI run cannot be reproduced later, and a
-# transitive break arrives with no warning (G21).
-#
-# Versions below are the ones this suite is green against.
 
 # --- Core service ---
 fastapi==0.136.1
