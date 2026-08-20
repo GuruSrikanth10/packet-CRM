@@ -37,6 +37,7 @@ from src.dlt.stacktrace import (
 from src.dlt.window import derive_window
 from src.log_pipeline import redaction
 from src.log_pipeline.pipeline import reduce_logs
+from src.models.dlt_payload_schemas import summarise_payload
 from src.models.dlt_schemas import DltMessage
 from src.models.dlt_synthesis import DltFinding, apply_dlt_confidence_policy
 from src.storage.base import LOGS_FETCHED_STATUS, TERMINAL_STATUSES
@@ -53,6 +54,7 @@ router = APIRouter()
 HEADERS_ARTIFACT = "headers.json"
 TRACE_ARTIFACT = "trace.txt"
 PARSED_TRACE_ARTIFACT = "parsed_trace.json"
+PAYLOAD_SUMMARY_ARTIFACT = "payload_summary.txt"
 FETCHED_LOGS_ARTIFACT = "fetched_logs.txt"
 
 #: Bumped when the DLT casebook shape changes. Independent of the rejection
@@ -111,6 +113,19 @@ def _persist_evidence(storage, case_id: str, message: DltMessage,
         redaction.redact_text(json.dumps(failure, indent=2, ensure_ascii=False),
                               allowlist=allowlist).text)
 
+    # The payload used to be read for one identifier and then dropped. It is
+    # evidence: this sample's trace fails inside
+    # `filterCandidatesAndBuildRefIdUidMap -> getIndexMasterData`, and the
+    # candidates that loop iterates are in the payload. Summarised rather than
+    # dumped -- a bounded description is both a context budget and a redaction
+    # surface we have actually reasoned about.
+    summary = summarise_payload(message.payload,
+                                (message.headers or {}).get("__TypeId__"))
+    if summary:
+        storage.save_artifact(
+            case_id, PAYLOAD_SUMMARY_ARTIFACT,
+            redaction.redact_text(summary, allowlist=allowlist).text)
+
 
 @router.post("/fetch-dlt-logs", dependencies=[Depends(get_api_key), Depends(rate_limiter)])
 def fetch_dlt_logs(message: DltMessage):
@@ -139,6 +154,14 @@ def fetch_dlt_logs(message: DltMessage):
 
     gaps = []
     window = derive_window(headers)
+
+    # Two identifiers that should have been equal were not. The key still
+    # wins (see resolve_ref_id), but the log lane may now be searching for the
+    # wrong packet, so the finding must not be read as if it were clean.
+    if message.ref_id_mismatch:
+        gaps.append("REFID_KEY_PAYLOAD_MISMATCH")
+        log.warning("Record key and payload disagreed on the refId",
+                    record_key=message.record_key)
 
     if storage.artifact_exists(case_id, FETCHED_LOGS_ARTIFACT):
         log.info("Logs already fetched; reusing the persisted artifact")
@@ -228,7 +251,15 @@ def _casebook(message: DltMessage, headers, failure: dict, corroboration,
             "anchor_is_fallback": headers.anchor_is_fallback,
             "type_id": headers.type_id,
         },
-        "packet": {"ref_id": message.ref_id},
+        "packet": {
+            "ref_id": message.ref_id,
+            "ref_id_source": message.ref_id_source,
+            "record_key": message.record_key,
+            # Only set when the two sources disagreed; a null here means they
+            # agreed or only one of them spoke, not that the check was skipped.
+            "payload_ref_id_conflict": (message.payload_ref_id
+                                        if message.ref_id_mismatch else None),
+        },
         "failure": {
             "class": failure["failure_class"],
             "class_reason": failure["class_reason"],
@@ -303,6 +334,12 @@ def analyze_dlt(message: DltMessage):
     fingerprint = failure["fingerprint"]
 
     logs = storage.load_artifact(case_id, FETCHED_LOGS_ARTIFACT) or ""
+    # Re-derived from the payload on the queue message rather than read back
+    # from the artifact, for the same reason `build_failure` re-parses the
+    # trace: the derivation is pure, so recomputing it cannot drift, while a
+    # stored copy can.
+    payload_summary = summarise_payload(
+        message.payload, (message.headers or {}).get("__TypeId__"))
     corroboration = corroborate(logs, failure["root_fqcn"],
                                 failure["business_code"], failure["frames"])
     metrics.record_dlt_corroboration(corroboration.verdict.value)
@@ -335,7 +372,8 @@ def analyze_dlt(message: DltMessage):
     else:
         log.info("Running the DLT analysis lane", reason=decision.reason)
         finding, parse_error = orchestrator.investigate(
-            case_id, failure, corroboration, logs)
+            case_id, failure, corroboration, logs,
+            payload_summary=payload_summary)
         provenance = "agent"
         if finding is None:
             finding = DltFinding(

@@ -33,15 +33,39 @@ class DltMessage(BaseModel):
     #: value did not decode is kept rather than dropped.
     headers: Dict[str, Optional[str]] = Field(default_factory=dict)
 
-    #: The deserialised payload. `Any` rather than a schema: this is upstream's
-    #: contract, we only read an identifier out of it, and one payload shape we
-    #: failed to anticipate must not cost us the message.
+    #: The deserialised payload. Still `Any`, even though
+    #: `src/models/dlt_payload_schemas.py` now models the known shapes: those
+    #: models describe and locate, they do not gate. Validating here would turn
+    #: an upstream field addition into a rejected message, and the payload is
+    #: the one part of a DLT record whose evidence we can most afford to lose.
     payload: Optional[Any] = None
 
     #: Set only when the payload could not be parsed as JSON, so the raw text
     #: is still available for a human.
     payload_raw: Optional[str] = None
 
-    #: Log-correlation identifier extracted from the payload. None is a valid
-    #: state: the case proceeds header-only and skips the log lane.
+    #: The Kafka record key, verbatim. The 2026-08-20 sample is keyed on the
+    #: refId, which makes this the primary correlation source -- and the only
+    #: one that survives a payload we cannot deserialise. Carried raw as well
+    #: as resolved so a key we declined to use is still visible.
+    record_key: Optional[str] = None
+
+    #: Log-correlation identifier. None is a valid state: the case proceeds
+    #: header-only and skips the log lane.
     ref_id: Optional[str] = None
+
+    #: Which layer produced `ref_id`: "record_key", "configured_path",
+    #: "type_path", "search", or "none". The layers are not equally
+    #: trustworthy, and a case that fell through to the search should not look
+    #: identical to one read off the record key.
+    ref_id_source: str = "none"
+
+    #: What the payload said, independently of the key. Equal to `ref_id` in
+    #: the normal case; kept separately so a disagreement can be inspected
+    #: rather than merely flagged.
+    payload_ref_id: Optional[str] = None
+
+    #: True when the record key and the payload both carried an identifier and
+    #: they disagreed. The key wins; this is what makes the disagreement
+    #: visible instead of silently resolved.
+    ref_id_mismatch: bool = False

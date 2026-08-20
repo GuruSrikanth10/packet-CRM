@@ -42,6 +42,7 @@ class DltGraphState(TypedDict, total=False):
     failure: dict
     corroboration: dict
     logs: str
+    payload_summary: Optional[str]
     investigation: str
     reviewer_feedback: str
     retry_count: int
@@ -68,6 +69,13 @@ def _evidence_block(state: DltGraphState) -> str:
     )
     frames = "\n".join(f"  - {frame}" for frame in (failure.get("frames") or []))
 
+    # The payload is evidence, not just a place the refId lives. For the
+    # ABIS dedupe failures this lane sees most, the frames name a loop over
+    # matched candidates and the payload holds the candidates being looped
+    # over -- which is the difference between "a row was missing" and "a row
+    # was missing while resolving these specific candidates".
+    payload_summary = state.get("payload_summary") or "(no payload was captured)"
+
     registry = failure.get("registry_description")
     registry_line = (f"{registry}\n(This is the entire registry entry. It is one "
                      f"line. Do not extrapolate beyond it.)"
@@ -86,6 +94,7 @@ def _evidence_block(state: DltGraphState) -> str:
         f"### Exception chain (outermost first; the LAST entry is the root)\n"
         f"{chain or '  (none parsed)'}\n\n"
         f"### Application frames at the failure site\n{frames or '  (none)'}\n\n"
+        f"### Message payload\n{payload_summary}\n\n"
         f"### Corroboration\n"
         f"Verdict: {corroboration.get('verdict')}\n"
         f"Reason: {corroboration.get('reason')}\n"
@@ -258,12 +267,17 @@ def parse_finding(text: str):
 
 
 def investigate(case_id: str, failure: dict, corroboration: Corroboration,
-                logs: str) -> tuple:
-    """Run the analysis lane. Returns (finding, parse_error)."""
+                logs: str, payload_summary: Optional[str] = None) -> tuple:
+    """Run the analysis lane. Returns (finding, parse_error).
+
+    `payload_summary` defaults to None so a caller without one still works --
+    a header-only case has no payload to describe.
+    """
     agent = get_dlt_agent()
     result = agent.invoke({
         "case_id": case_id,
         "failure": failure,
+        "payload_summary": payload_summary,
         "corroboration": {
             "verdict": corroboration.verdict.value,
             "reason": corroboration.reason,

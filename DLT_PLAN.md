@@ -1,11 +1,17 @@
 # Packet-CRM: Dead-Letter Topic (DLT) Analysis -- Engineering Design
 
-Design date: 2026-08-18. Status: **Phases 1-9 implemented; Phase 0 outstanding.**
+Design date: 2026-08-18. Last revised 2026-08-20 against a second real sample.
+Status: **Phases 1-9 implemented; Phase 0 outstanding.**
 The code is complete and unit-tested against fixtures, but has never run
 against a real broker, cluster or registry. Phase 0 (the corpus capture and
 its five measurements) still has to be run from a host with Kafka access, and
 its item 5 -- confirming `enu-biometric` pod log lines carry `refId` -- remains
 a hard gate on the log lane being useful at all.
+
+The 2026-08-20 sample resolved Open Question 1 (the record key carries the
+refId), retired the single-payload-schema assumption, and added two traps to
+section 3: the payload's `event_id` is a different UUID from its `refId`, and
+its `eventTimestamp` is local time. See 3.3.
 
 **Nothing is enabled by default.** `DLT_ENABLED=false` keeps the consumers out
 of `start.py`, and the rejection pipeline is untouched.
@@ -84,18 +90,23 @@ Two reasons, and the second is the one that justifies the whole log lane:
 
 ## 3. Established facts
 
-These come from a real DLT header sample and from operator answers. Everything
-in the design rests on them; if one turns out to be wrong, the phase that
-depends on it is where it will surface.
+These come from two real DLT samples and from operator answers. Everything in
+the design rests on them; if one turns out to be wrong, the phase that depends
+on it is where it will surface.
+
+The second sample (2026-08-20, `tests/fixtures/dlt/reference_abis_mw_response.json`)
+is the first with a payload attached, and it moved three rows in this table.
+They are marked below.
 
 | Fact | Value | Source |
 |---|---|---|
 | DLT producer | Spring Kafka `DeadLetterPublishingRecoverer` + `@RetryableTopic` | header shape |
-| Topics consumed | One, for now | operator |
+| Topics consumed | **At least two.** `ENU.UPDATE.CHECKER.COMPLETION.V1` (group `enu-biodedup-cg`) and `ENU.MWARE.DEDUPE.PROCESS.COMPLETION.V1` (group `enu-biodedup-abismw-cg`) | both samples |
 | Service | `enu-biometric`, namespace `ankalan` | operator |
 | Retry-topic consumers | Same pods as the original consumer | operator |
-| Log correlation id | `refId` (the same identifier this project already calls `event_id`) | operator |
-| Payload schema | `EventMessage`, named by the `__TypeId__` header; single schema for now | operator |
+| Log correlation id | `refId` (the same identifier this project already calls `event_id` -- but **not** the payload field literally named `event_id`, see 3.3) | operator, sample 2 |
+| refId location | **The Kafka record key**, and again in the payload | sample 2 |
+| Payload schema | **Two confirmed**, named by `__TypeId__`: `com.uidai.enu.common.model.EventMessage` and `in.gov.uidai.uidabismiddlewaresb.kafka.model.EnrolmentEventResponse`. The single-schema assumption is retired | sample 2 |
 | Registry | BusinessException code -> one-line description | operator |
 | Volume | ~2,000 messages/day | operator |
 | Source access | None | operator |
@@ -129,6 +140,43 @@ against the sample: `int("01A009712548", 16) == 1786864805192`, byte-identical
 to `kafka_original-timestamp`, and `int("01A012AB41BF", 16)` decodes to
 `2026-08-18T02:20:08.511Z`, which matches the `TimestampedException` timestamp
 embedded in the trace text to the millisecond.
+
+Re-verified on sample 2, on a different topic: `int("01A0192B922D", 16)` is
+`2026-08-19T08:38:01.005Z`, matching that trace's `TimestampedException` to the
+millisecond, and sitting 43.0 hours after its `kafka_original-timestamp`. Trap
+2 is not an artefact of one sample.
+
+### 3.3 The record key, and the identifier that looks like one
+
+Sample 2 settles Open Question 1 and adds a trap of its own.
+
+**The DLT record is keyed on the `refId`.** `c5d21184-08f4-4c32-9e5e-5c108c33eb14`
+appears as the Kafka message key and again in the payload at
+`abisMWResponseNewSeda.refId` (and, duplicated, at
+`abisMWResponseNewSeda.abisResponses.referenceId`). The key is therefore the
+primary source and the payload the corroborating one, because the key survives
+a payload we cannot deserialise -- the exact case `DltAdapter` exists to keep
+alive. Before this, an undecodable payload cost the refId, the logs, and any
+possibility of corroboration, on a case whose stacktrace was perfectly intact.
+
+**Trap 3: the payload's `event_id` is not the `refId`.** The same payload
+carries a top-level `event_id` of `b733ab61-78c4-4aa9-b959-7216435c2544` -- a
+different UUID. This document has called refId "the same identifier this
+project already calls `event_id`" since section 3, so the field literally named
+`event_id` is precisely the one a reader would reach for. It correlates to
+nothing the service logs, and the failure mode is an empty log window, not an
+error. `_DENY_KEYS` in `src/dlt/payload.py` makes it unconfigurable.
+
+A third identifier class on the same payload: `candidateRefId` values under
+`abisResponses.abisResponse[].candidates.matchedCandidate[]`. Those are the
+refIds of *other* enrolments the biometric matcher returned. Correlating on one
+would pull an unrelated packet's log lines while missing this packet's
+entirely. Also denied.
+
+**Trap 4: the payload's `eventTimestamp` is local time.** Sample 2 reads
+`2026-08-17 19:07:47.552` where `kafka_original-timestamp` is `1786973867552` =
+`13:37:47.552Z`. The same instant, expressed at +05:30, with no offset written
+down. Never a log-window anchor; the headers carry real epoch millis.
 
 ### 3.2 Two traps that will silently destroy the system
 
@@ -253,19 +301,58 @@ a fetch that is certain to return nothing.
 Identifier matched against log lines: **`refId`**, not the case id. This
 requires a small change to `reduce_logs` -- see 5.5.
 
-### 5.3 Payload identifier extraction
+### 5.3 Identifier resolution
 
-`refId` lives inside the `EventMessage` payload; its exact path is Open
-Question 1. The extractor is built as:
+Four layers, first hit wins (`src/dlt/payload.py:resolve_ref_id`):
 
-1. A configurable dotted path, `DLT_REFID_PATH` (e.g. `packetMetaData.refId`).
-2. On miss, a bounded recursive search of the payload for keys in
-   `DLT_REFID_KEYS` (default `refId,ref_id,referenceId`), depth-capped.
-3. On miss, the case is still processed -- header-only. Logs are skipped and
-   corroboration is `UNVERIFIABLE`.
+1. **The Kafka record key.** Primary, per 3.3. Accepted only if it is shaped
+   like an identifier -- a key is whatever the producer chose, and feeding a
+   routing token like `ABIS1` to the log query returns nothing, or worse
+   another packet's lines.
+2. `DLT_REFID_PATH`, a global dotted-path override.
+3. The path registered for the payload's `__TypeId__`, from
+   `REFID_PATHS_BY_TYPE` in `src/models/dlt_payload_schemas.py` or the
+   `DLT_REFID_PATHS_BY_TYPE` env override.
+4. A bounded breadth-first search for `DLT_REFID_KEYS`, depth- and node-capped.
 
-Getting the path wrong is a config change, not a code change. Phase 0 supplies
-the real path.
+On total miss the case is still processed -- header-only. Logs are skipped and
+corroboration comes out `UNVERIFIABLE`. Losing the message would be worse than
+losing its logs.
+
+**Every result carries the layer it came from** (`ref_id_source` on the
+casebook). A refId that fell through to the search is a guess that happened to
+land; one read off the record key is the producer's own partitioning key. An
+operator asking "why did this case have no logs" needs to tell them apart.
+
+**A key/payload disagreement is surfaced, not resolved.** When both yield an
+identifier and they differ, the key wins -- it has no path to misconfigure --
+and the case gains a `REFID_KEY_PAYLOAD_MISMATCH` evidence gap. Silently
+picking one of two identifiers that should have been equal is how a stale
+configured path stays invisible for months.
+
+Adding a third payload schema stays config, not code.
+
+### 5.3.1 The payload as evidence
+
+Until sample 2 the payload was read for one identifier and then discarded. It
+is evidence in its own right. Sample 2's trace fails inside
+`filterCandidatesAndBuildRefIdUidMap -> getIndexMasterData`; the candidates
+that loop iterates are sitting in the payload. `summarise_payload` renders a
+bounded description -- request type, response status, per-ABIS candidate counts
+-- into the case artifacts and the analyst's evidence block.
+
+Two constraints on this, both load-bearing:
+
+* **Bounded.** A wide ABIS response must not push the stacktrace or the logs
+  out of the context window. Candidates are capped, and an unmodelled payload
+  gets a key listing rather than a verbatim dump -- which is a redaction
+  surface as much as a budget one.
+* **The narrative it feeds is reused.** Under the reuse policy a Class A
+  finding is stored per fingerprint and re-served to every later packet with
+  the same signature. A narrative naming *this* packet's candidate ids would
+  later be shown to an operator looking at a different packet, where it is
+  simply false. `DltInvestigatorAgent.md` states this as a hard limit: describe
+  the shape of the input, never its values.
 
 ### 5.4 Case identity and idempotency
 
@@ -912,6 +999,10 @@ collection. Phase 4 must not merge before Phase 0 confirms the payload shape.
 ### 11.2 Fingerprint cardinality
 ### 11.3 Stacktrace truncation
 ### 11.4 refId path in EventMessage
+Partly answered ahead of the corpus run: sample 2 shows the record key carries
+the refId, so `--analyze` now reports which of the four layers resolved each
+message and whether key and payload ever disagree. What the corpus still has to
+show is whether the key is populated on *every* message or only on this topic.
 ### 11.5 refId presence in pod log lines -- **hard gate on Phase 5**
 ### 11.6 Mis-cast examples found
 ### 11.7 DLT arrival lag
@@ -921,9 +1012,14 @@ collection. Phase 4 must not merge before Phase 0 confirms the payload shape.
 
 ## 12. Open questions
 
-1. **Where is `refId` in the `EventMessage` payload?** Blocks nothing --
-   `DLT_REFID_PATH` is config and the recursive fallback covers the common
-   shapes -- but a wrong default means silently empty logs. Answered by Phase 0.
+1. ~~**Where is `refId` in the `EventMessage` payload?**~~ **Answered
+   (2026-08-20), for `EnrolmentEventResponse`.** The DLT record is *keyed* on
+   the refId, and the payload repeats it at `abisMWResponseNewSeda.refId`. The
+   key is now the primary source, so this no longer depends on knowing any
+   payload path (3.3, 5.3). Still open for `EventMessage` specifically -- no
+   payload has been captured for that type, and no path is registered for it
+   rather than guessing one that would silently miss. It falls through to the
+   search, which reports `search` as its provenance.
 2. **Is there a real mis-cast example?** The corroboration check is designed
    against a hypothesis. Until one real case validates it, `CONTRADICTED`
    thresholds stay conservative and the verdict is advisory only.

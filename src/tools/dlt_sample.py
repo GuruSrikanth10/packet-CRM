@@ -32,6 +32,7 @@ load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from src.dlt.headers import decode_kafka_headers  # noqa: E402
+from src.dlt.payload import decode_key, key_as_ref_id, resolve_ref_id  # noqa: E402
 from src.log_pipeline import redaction  # noqa: E402
 
 #: Headers whose values are structural Kafka/Spring metadata -- offsets,
@@ -134,6 +135,10 @@ def capture(topic: str, brokers: list, limit: int, start_from: str, do_redact: b
                 except (ValueError, TypeError):
                     parsed = None
 
+            # The key is captured because the 2026-08-20 sample is keyed on
+            # the refId. Phase 0 item 5 asks whether the log lane can filter
+            # at all; if the key carries the refId corpus-wide, that question
+            # is answered without needing the payload to parse.
             captured.append({
                 "_source": {
                     "dlt_topic": topic,
@@ -142,6 +147,7 @@ def capture(topic: str, brokers: list, limit: int, start_from: str, do_redact: b
                     "dlt_timestamp": msg.timestamp,
                     "redacted": do_redact,
                 },
+                "key": decode_key(msg.key),
                 "headers": headers,
                 "payload": parsed,
                 "payload_raw": None if parsed is not None else raw_text,
@@ -211,6 +217,10 @@ def analyse(corpus_dir: Path) -> dict:
     refid_paths = {}
     lags_seconds = []
     total = 0
+    key_stats = {"present": 0, "usable": 0, "agrees_with_payload": 0,
+                 "disagrees_with_payload": 0, "key_only": 0, "payload_only": 0,
+                 "neither": 0}
+    refid_sources = {}
 
     for path in sorted(corpus_dir.glob("*.json")):
         if path.name.startswith("_"):
@@ -245,6 +255,29 @@ def analyse(corpus_dir: Path) -> dict:
         for found in _find_refid_paths(item.get("payload")):
             refid_paths[found] = refid_paths.get(found, 0) + 1
 
+        # Phase 0 item 5: does the record key carry the refId corpus-wide?
+        # Run through the same resolver the consumer uses, so what this reports
+        # is what production would actually do -- not a second opinion that
+        # could drift from it.
+        key = decode_key(item.get("key"))
+        extraction = resolve_ref_id(item.get("payload"), key=key,
+                                    type_id=headers.type_id)
+        refid_sources[extraction.source] = refid_sources.get(extraction.source, 0) + 1
+
+        if key:
+            key_stats["present"] += 1
+        if key_as_ref_id(key):
+            key_stats["usable"] += 1
+        if key_as_ref_id(key) and extraction.payload_ref_id:
+            key_stats["disagrees_with_payload" if extraction.mismatch
+                      else "agrees_with_payload"] += 1
+        elif key_as_ref_id(key):
+            key_stats["key_only"] += 1
+        elif extraction.payload_ref_id:
+            key_stats["payload_only"] += 1
+        else:
+            key_stats["neither"] += 1
+
         arrived = (item.get("_source") or {}).get("dlt_timestamp")
         if arrived and headers.last_attempt_ms:
             lags_seconds.append((arrived - headers.last_attempt_ms) / 1000.0)
@@ -264,6 +297,8 @@ def analyse(corpus_dir: Path) -> dict:
         "truncated_stacktraces": truncated,
         "missing_backoff_timestamp": missing_backoff,
         "refid_paths": dict(sorted(refid_paths.items(), key=lambda kv: -kv[1])),
+        "record_key": key_stats,
+        "refid_sources": dict(sorted(refid_sources.items(), key=lambda kv: -kv[1])),
         "arrival_lag_seconds": {
             "samples": len(lags_seconds),
             "min": round(min(lags_seconds), 1) if lags_seconds else None,
@@ -295,6 +330,24 @@ def print_analysis(report: dict) -> None:
 
     print(f"\nTruncated stacktraces (11.3): {report['truncated_stacktraces']}")
     print(f"Missing backoff timestamp:    {report['missing_backoff_timestamp']}")
+
+    keys = report["record_key"]
+    print(f"\nrefId resolution across the corpus ({report['messages']} messages):")
+    for source, count in report["refid_sources"].items():
+        print(f"  {count:5d}  {source}")
+    print(f"  record key present: {keys['present']}, "
+          f"usable as a refId: {keys['usable']}")
+    print(f"  key and payload agree: {keys['agrees_with_payload']}, "
+          f"disagree: {keys['disagrees_with_payload']}")
+    print(f"  key only: {keys['key_only']}, payload only: {keys['payload_only']}, "
+          f"no identifier at all: {keys['neither']}")
+    if keys["disagrees_with_payload"]:
+        print("  -> DISAGREEMENTS FOUND. The configured payload path is likely")
+        print("     wrong for at least one __TypeId__. Inspect before trusting")
+        print("     the log lane on those types.")
+    if keys["neither"]:
+        print(f"  -> {keys['neither']} message(s) have no correlation id at all;")
+        print("     those cases run header-only and cannot be corroborated.")
 
     print("\nrefId paths found in payloads (11.4):")
     if report["refid_paths"]:

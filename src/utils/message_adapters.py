@@ -142,10 +142,15 @@ class DltAdapter:
     The important departure from `RejectionAdapter`: **an unparseable payload
     is not poison here.** A DLT message's evidence lives in its headers -- the
     stacktrace, the coordinates, the timestamps -- so a payload we cannot
-    decode costs us the `refId` and nothing else. The case still proceeds
-    header-only and simply skips the log lane. Discarding it would throw away
-    a complete stacktrace because a field we only read one identifier out of
-    failed to parse.
+    decode costs us at most the `refId`. The case still proceeds header-only
+    and simply skips the log lane. Discarding it would throw away a complete
+    stacktrace because a field we only read one identifier out of failed to
+    parse.
+
+    "At most", now, because the record key is read too. The 2026-08-20 sample
+    is keyed on the refId, so an undecodable payload no longer costs the log
+    lane at all -- the case keeps its correlation id and its logs, and only
+    loses the payload summary.
     """
 
     role = "dlt"
@@ -153,7 +158,7 @@ class DltAdapter:
     def parse(self, msg) -> ParseResult:
         from src.dlt.headers import decode_kafka_headers, parse_headers
         from src.dlt.identity import derive_case_id
-        from src.dlt.payload import extract_ref_id
+        from src.dlt.payload import decode_key, resolve_ref_id
         from src.models.dlt_schemas import DltMessage
 
         raw_text = None
@@ -163,10 +168,11 @@ class DltAdapter:
             try:
                 payload = json.loads(raw_text)
             except (ValueError, TypeError):
-                payload = None  # headers still carry the evidence
+                payload = None  # headers and the key still carry the evidence
 
         headers = decode_kafka_headers(msg.headers)
         parsed_headers = parse_headers(headers)
+        record_key = decode_key(getattr(msg, "key", None))
 
         # Prefer the original record's coordinates: they are what make the id
         # idempotent across a redrive. Fall back to the DLT record's own, which
@@ -181,13 +187,28 @@ class DltAdapter:
             return ParseResult(raw_text=raw_text or "",
                                error="Could not derive a case id from the record")
 
+        # `__TypeId__` selects the payload path to try; the key is tried first
+        # regardless, so an unregistered type still resolves (DLT_PLAN.md 5.3).
+        extraction = resolve_ref_id(payload, key=record_key,
+                                    type_id=parsed_headers.type_id)
+        if extraction.mismatch:
+            logger.warning(
+                "Record key and payload disagree on the refId; using the key",
+                case_id=case_id, record_key=record_key,
+                payload_ref_id=extraction.payload_ref_id,
+                type_id=parsed_headers.type_id)
+
         try:
             message = DltMessage(
                 case_id=case_id,
                 headers=headers,
                 payload=payload,
                 payload_raw=None if payload is not None else raw_text,
-                ref_id=extract_ref_id(payload),
+                record_key=record_key,
+                ref_id=extraction.ref_id,
+                ref_id_source=extraction.source,
+                payload_ref_id=extraction.payload_ref_id,
+                ref_id_mismatch=extraction.mismatch,
             )
         except Exception as validation_err:
             logger.error("DLT message failed validation", case_id=case_id,

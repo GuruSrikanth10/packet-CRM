@@ -69,9 +69,12 @@ def seed_logs(case_id, text):
     case_storage.get_dlt_storage().save_artifact(case_id, FETCHED_LOGS_ARTIFACT, text)
 
 
-def stub_llm(monkeypatch, finding: DltFinding, calls: list):
-    def fake(case_id, failure, corroboration, logs):
+def stub_llm(monkeypatch, finding: DltFinding, calls: list,
+             seen_summaries: list = None):
+    def fake(case_id, failure, corroboration, logs, payload_summary=None):
         calls.append(case_id)
+        if seen_summaries is not None:
+            seen_summaries.append(payload_summary)
         return finding, None
 
     monkeypatch.setattr(dlt_routes.orchestrator, "investigate", fake)
