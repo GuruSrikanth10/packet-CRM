@@ -395,6 +395,13 @@ def get_agent():
             
         res = _counted("log_filter", invoke_filter)
         filtered_logs = res["messages"][-1].content
+        
+        try:
+            get_casebook_storage().save_artifact(event_id, "filtered_logs.txt", filtered_logs)
+            log.info("Persisted filtered logs to local artifact for testing", artifact="filtered_logs.txt")
+        except Exception as e:
+            log.warning("Failed to persist filtered logs artifact", error=str(e))
+            
         log.info("Log Filter node finished")
         return {"logs": filtered_logs}
 
