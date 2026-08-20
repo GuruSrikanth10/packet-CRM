@@ -1,4 +1,4 @@
-# Packet-CRM: Dead-Letter Topic (DLT) Analysis -- Engineering Design
+ # Packet-CRM: Dead-Letter Topic (DLT) Analysis -- Engineering Design
 
 Design date: 2026-08-18. Last revised 2026-08-20 against a second real sample.
 Status: **Phases 1-9 implemented; Phase 0 outstanding.**
@@ -73,7 +73,13 @@ Two reasons, and the second is the one that justifies the whole log lane:
 
 ## 2. Non-goals
 
-- **No remediation.** No replay, no redrive, no writes to any upstream service.
+- **No remediation, with one narrow, opt-in exception (2026-08-20).**
+  `src/dlt/auto_replay.py` lets `/analyze-dlt` call `queue_for_replay` on a
+  finding whose action is `REDRIVE_AFTER_RECOVERY` and whose confidence
+  clears `DLT_REPLAY_CONFIDENCE_THRESHOLD` -- off by default
+  (`DLT_AUTO_REPLAY_ENABLED=false`). Everything else stated in this section
+  still holds: no source access, no database access, no writes to any
+  upstream service beyond that one tool call. See section 5.9.
 - **No source-code analysis.** `com.uidai.enu.biometric` is not accessible.
   Class B failures (Section 4) are enriched and routed, never diagnosed.
 - **No database access.** We cannot confirm why a row is missing, only that the
@@ -507,6 +513,61 @@ DLT-specific ceilings applied *after* the model's own score:
 
 Ceilings compose by taking the minimum.
 
+### 5.9 Auto-replay (2026-08-20)
+
+`src/dlt/auto_replay.py`. The one deliberate exception to section 2's
+no-remediation stance, added because a real remediation mechanism exists
+downstream that this system had no way to know about: a Temporal workflow
+that repairs the DB inconsistency behind codes like
+`INDEX_MASTER_DATA_NOT_FOUND` when it sees them on the retry/DLT topics, after
+which the packet has a real chance of succeeding on redrive.
+
+Runs after `apply_dlt_confidence_policy`, in `analyze_dlt`, on the **final**
+finding -- ceilings and reuse decay already applied. Every condition is
+independently sufficient to withhold replay, and every one is named in the
+casebook's `replay.reason`, whether or not replay was attempted:
+
+1. `DLT_AUTO_REPLAY_ENABLED` must be `true` (default `false`).
+2. `finding.action` must be in the replay-worthy set --
+   `REDRIVE_AFTER_RECOVERY` by default, via `DLT_REPLAY_ACTIONS`.
+   `DATA_FIX_REQUIRED` (Class A's typical action) is deliberately excluded: a
+   data-not-found packet's row is still missing after a replay, since
+   nothing about the row changed just because time passed.
+3. `finding.confidence` must be present and at or above
+   `DLT_REPLAY_CONFIDENCE_THRESHOLD` (default 0.55). `canned.py` never
+   attaches a confidence to a Class B/C/U finding -- "no model produced
+   this" -- so a canned `REDRIVE_AFTER_RECOVERY` (Class C's fixed treatment)
+   can never clear this and never auto-replays. Only an LLM-synthesised (or
+   group-reused) finding carries a real number.
+4. The case must have a `refId` to identify the packet with.
+
+In practice this means the LLM-driven mis-cast path is what actually
+qualifies: `DltSynthesisAgent.md` instructs the model to choose
+`REDRIVE_AFTER_RECOVERY` specifically when corroboration is `CONTRADICTED` and
+the logs point at a transient fault instead of the declared business
+exception -- and `CONTRADICTED` is capped at `DLT_CONTRADICTED_CEILING` (0.6)
+regardless of what the model reports. The default threshold (0.55) sits just
+under that ceiling on purpose: any higher and the feature could never fire at
+all, since nothing can exceed a ceiling that has already been applied.
+
+**Two independent switches, not one.** Passing the gate above calls
+`queue_for_replay` -- the same tool the rejection flow's synthesis agent
+already uses (`src/tools/tool_registry.py`) -- but that tool's own
+`ENABLE_AUTO_REPLAY` switch still decides what happens next: `true` posts
+straight to the OIS `/forceReplay` endpoint, `false` (the safer default)
+appends to `pending_replays.jsonl` for a human to approve via
+`approve_replays.py`. `DLT_AUTO_REPLAY_ENABLED=true` with `ENABLE_AUTO_REPLAY`
+left off means "let the DLT lane nominate packets, but still make a human
+press the button" -- the posture worth reaching for first.
+
+**Not yet confirmed against the live endpoint.** The rejection flow always
+calls `queue_for_replay` with `id=eventId`; a DLT case has no eventId, only
+`refId`. `idType`/`category`/`priority`/`fromSedaStart` are placeholders
+(`DLT_REPLAY_ID_TYPE` etc.), not values confirmed against OIS's actual
+contract for a DLT-originated redrive. A `queue_for_replay` failure is
+exception-shielded -- it degrades the casebook's `replay` block, never costs
+the casebook itself.
+
 ---
 
 ## 6. Architecture
@@ -618,6 +679,7 @@ finding: {narrative, discrepancy | null, recommendation, action}
 confidence: {score, ceilings_applied: [...], abstained}
 provenance: {source: agent|group_reuse|canned, group_fingerprint,
              prompt_fingerprint, recommendation_state}
+replay: {attempted, reason, queued, result}  # 5.9, always present
 ```
 
 `action` vocabulary for this flow (not the rejection one):
@@ -659,6 +721,10 @@ All new. Added to `.env.example` in the phase that first reads them.
 | `DLT_REGISTRY_MISS_CEILING` | `0.5` | Ceiling when a Class A code is unknown |
 | `DLT_REUSE_DECAY` | `0.95` | Multiplier on a reused confidence |
 | `DLT_HEALTH_PORT` / `DLT_ANALYSIS_HEALTH_PORT` | (unset) | Per-role health servers |
+| `DLT_AUTO_REPLAY_ENABLED` | `false` | Master switch, section 5.9 |
+| `DLT_REPLAY_CONFIDENCE_THRESHOLD` | `0.55` | Minimum confidence to auto-replay |
+| `DLT_REPLAY_ACTIONS` | `REDRIVE_AFTER_RECOVERY` | Actions that qualify as "replay is the fix" |
+| `DLT_REPLAY_ID_TYPE` / `DLT_REPLAY_OPERATOR_NAME` / `DLT_REPLAY_CATEGORY` / `DLT_REPLAY_PRIORITY` / `DLT_REPLAY_FROM_SEDA_START` | see `.env.example` | `queue_for_replay` arguments; unconfirmed against the live OIS contract |
 
 ---
 

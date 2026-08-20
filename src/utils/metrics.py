@@ -183,6 +183,12 @@ DLT_WINDOW_AGE_HOURS = _histogram(
     buckets=(0.5, 1, 2, 4, 8, 12, 24, 48, 96),
 )
 
+DLT_AUTO_REPLAY = _counter(
+    "packetcrm_dlt_auto_replay_total",
+    "Auto-replay outcomes: not_attempted (gate declined), queued, or failed.",
+    ("outcome",),
+)
+
 
 def record_dlt_case(failure_class: str) -> None:
     if DLT_CASES is not None:
@@ -207,6 +213,11 @@ def record_dlt_registry_miss() -> None:
 def record_dlt_window_age(age_seconds: float) -> None:
     if DLT_WINDOW_AGE_HOURS is not None:
         DLT_WINDOW_AGE_HOURS.observe(max(0.0, age_seconds) / 3600.0)
+
+
+def record_dlt_auto_replay(outcome: str) -> None:
+    if DLT_AUTO_REPLAY is not None:
+        DLT_AUTO_REPLAY.labels(outcome=outcome).inc()
 
 
 BREAKER_STATE = _gauge(

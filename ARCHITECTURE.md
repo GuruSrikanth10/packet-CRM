@@ -606,7 +606,8 @@ packet-CRM/
 │   │   ├── reuse.py                # Whether a message needs the LLM at all
 │   │   ├── canned.py               # Fixed treatments for Class B/C/U (no LLM)
 │   │   ├── orchestrator.py         # DLT analysis lane: Investigate -> Review -> Synthesise
-│   │   └── case_storage.py         # DLT case + group storage, separate from casebooks
+│   │   ├── case_storage.py         # DLT case + group storage, separate from casebooks
+│   │   └── auto_replay.py          # Opt-in auto-replay gate on a high-confidence redrive finding
 │   ├── models/
 │   │   ├── schemas.py              # Strict Pydantic data validation schemas
 │   │   ├── synthesis.py            # Rejection finding contract + confidence policy
@@ -1012,7 +1013,8 @@ A **parallel flow** to the rejection pipeline, specified in full in
 `DLT_PLAN.md`. It consumes a Spring `@RetryableTopic` dead-letter topic,
 fingerprints the failure from its stack trace, checks that trace against the
 service's own pod logs, and writes an advisory casebook. **It does not
-remediate** -- no replay, no redrive, no writes to any upstream system.
+remediate**, with one narrow, opt-in exception (point 8 below) -- otherwise no
+replay, no redrive, no writes to any upstream system.
 
 It shares this system's log pipeline, storage abstraction, consumer
 scaffolding and confidence policy. It shares neither `MessagePayload`, the
@@ -1023,7 +1025,7 @@ dlt_consumer.py  -> POST /fetch-dlt-logs  -> dlt-analysis-queue
                  -> dlt_analysis_consumer.py -> POST /analyze-dlt -> casebook
 ```
 
-Seven things are worth knowing without reading the whole plan:
+Eight things are worth knowing without reading the whole plan:
 
 1. **The root cause is the last `Caused by:`, never the headers.**
    `kafka_exception-cause-fqcn` carries a Spring/JDK wrapper that is identical
@@ -1069,6 +1071,21 @@ Seven things are worth knowing without reading the whole plan:
 7. **Nothing is enabled by default.** `DLT_ENABLED=false` keeps the consumers
    out of `start.py`.
 
+8. **Auto-replay is opt-in and gated on the final, ceiling-capped confidence.**
+   `src/dlt/auto_replay.py` lets `/analyze-dlt` call `queue_for_replay` (the
+   same tool the rejection flow's synthesis agent uses) when a finding's
+   action is `REDRIVE_AFTER_RECOVERY` and its confidence clears
+   `DLT_REPLAY_CONFIDENCE_THRESHOLD` (default 0.55) -- off by default via
+   `DLT_AUTO_REPLAY_ENABLED`. Canned Class B/C/U findings never qualify:
+   `canned.py` attaches no confidence to them ("no model produced this"), so a
+   missing score never reads as a passing one. In practice this fires on the
+   mis-cast path -- corroboration came back `CONTRADICTED`, the LLM concluded
+   the declared exception wasn't the real story -- and 0.55 sits just under
+   the 0.6 `CONTRADICTED` ceiling on purpose, since a higher default would
+   make the feature permanently inert. `queue_for_replay`'s own
+   `ENABLE_AUTO_REPLAY` switch still governs what happens once called:
+   straight to OIS, or queued for human approval via `approve_replays.py`.
+
 Operator entry points:
 
 ```bash
@@ -1088,6 +1105,15 @@ remains a hard gate on the log lane being useful at all.
 
 This section records where the running code diverges from the design intent above.
 It is maintained deliberately so the document stays a truthful source of truth.
+
+**Update 2026-08-20:** DLT gained an opt-in auto-replay path
+(`src/dlt/auto_replay.py`, section 4.4 point 8; `DLT_AUTO_REPLAY_ENABLED`,
+default `false`). One open item: `queue_for_replay`'s `idType`, `category`,
+`priority` and `fromSedaStart` arguments are placeholders for a DLT-originated
+redrive -- the rejection flow always calls the tool with `id=eventId`, and a
+DLT case has no eventId, only `refId`. These have not been confirmed against
+the live OIS `/forceReplay` contract; treat `DLT_AUTO_REPLAY_ENABLED=true`
+together with `ENABLE_AUTO_REPLAY=true` as unverified until they are.
 
 **Update 2026-08-17:** Log fetching and LLM analysis are decoupled into two
 Kafka topics, two consumer processes, and two API routes (section 3.11), so

@@ -23,7 +23,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends
 
 from src.api.routes import get_api_key, rate_limiter
-from src.dlt import canned, groups, orchestrator, registry, reuse
+from src.dlt import auto_replay, canned, groups, orchestrator, registry, reuse
 from src.dlt.case_storage import get_dlt_storage
 from src.dlt.corroborate import corroborate
 from src.dlt.classify import classify
@@ -244,7 +244,8 @@ def fetch_dlt_logs(message: DltMessage):
 
 def _casebook(message: DltMessage, headers, failure: dict, corroboration,
               finding, decision, group: Optional[dict], gaps: list,
-              window_description: Optional[str], provenance_source: str) -> dict:
+              window_description: Optional[str], provenance_source: str,
+              replay: Optional[dict] = None) -> dict:
     """Assemble the terminal casebook. See DLT_PLAN.md 7.1."""
     return {
         "schema_version": DLT_CASEBOOK_SCHEMA_VERSION,
@@ -312,6 +313,14 @@ def _casebook(message: DltMessage, headers, failure: dict, corroboration,
             "group_occurrences": (group or {}).get("occurrence_count"),
             "recommendation_state": groups.STATE_DRAFT,
         },
+        # See src/dlt/auto_replay.py for the gate. `replay` is always present
+        # once analysis has run -- "not attempted, and here is why" is exactly
+        # as much a part of the casebook as "attempted, and here is what
+        # happened", so a human reading this later never has to guess whether
+        # replay was even considered.
+        "replay": replay or {"attempted": False,
+                              "reason": "replay gate not evaluated",
+                              "queued": False, "result": None},
         "packet_status": {"status": _terminal_status(finding)},
     }
 
@@ -415,9 +424,21 @@ def analyze_dlt(message: DltMessage):
         group = groups.attach_recommendation(fingerprint, finding.model_dump(),
                                              state=groups.STATE_DRAFT)
 
+    # Evaluated on the FINAL finding -- after ceilings, after reuse decay --
+    # so a confidence the ceilings already capped is what gets checked, never
+    # the model's raw, uncapped number.
+    replay = auto_replay.maybe_replay(case_id, message.ref_id, finding)
+    metrics.record_dlt_auto_replay(
+        "queued" if replay["queued"] else
+        "failed" if replay["attempted"] else "not_attempted")
+    if replay["attempted"]:
+        log.info("DLT auto-replay evaluated", queued=replay["queued"],
+                 reason=replay["reason"])
+
     casebook = _casebook(message, headers, failure, corroboration, finding,
                          decision, group, message.model_dump().get("evidence_gaps") or [],
-                         message.model_dump().get("log_window"), provenance)
+                         message.model_dump().get("log_window"), provenance,
+                         replay=replay)
     if parse_error:
         casebook["finding"]["parse_error"] = parse_error
 
@@ -431,4 +452,6 @@ def analyze_dlt(message: DltMessage):
     return {"status": "processed", "case_id": case_id,
             "action": finding.action, "confidence": finding.confidence,
             "corroboration": corroboration.verdict.value,
-            "decision": decision.decision.value}
+            "decision": decision.decision.value,
+            "replay_attempted": replay["attempted"],
+            "replay_queued": replay["queued"]}
