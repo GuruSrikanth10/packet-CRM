@@ -11,6 +11,7 @@ from kafka.structs import OffsetAndMetadata
 from pathlib import Path
 from .env import get_required_env
 from src.storage.factory import get_casebook_storage
+from src.utils.atomic import replace_with_retry
 from src.utils.logging_config import get_logger
 from src.utils.paths import CONSUMER_HEARTBEAT_PATH, SLOW_CONSUMER_HEARTBEAT_PATH
 
@@ -88,12 +89,10 @@ HEARTBEAT_STALE_SECONDS = float(
 )
 
 # How many times to attempt the atomic heartbeat swap before giving up on a
-# tick. `os.replace` is only unconditionally safe on POSIX: on Windows it
-# fails with ERROR_ACCESS_DENIED for as long as any other process holds the
-# destination open, and a file rewritten every few seconds under a synced or
-# indexed directory attracts exactly that (OneDrive, the search indexer, an
-# AV scan). Those holders release in milliseconds, so a couple of short
-# retries turn a burst of warnings into nothing at all.
+# tick. See src/utils/atomic.py for why the swap needs retrying at all. The
+# heartbeat keeps its own budget rather than the shared default: a tick comes
+# round again in HEARTBEAT_INTERVAL_SECONDS anyway, so it should spend less
+# time waiting than a write nobody repeats.
 HEARTBEAT_WRITE_ATTEMPTS = max(1, int(os.environ.get("HEARTBEAT_WRITE_ATTEMPTS", "3")))
 HEARTBEAT_WRITE_BACKOFF_SECONDS = float(
     os.environ.get("HEARTBEAT_WRITE_BACKOFF_SECONDS", "0.1")
@@ -518,40 +517,28 @@ def _write_heartbeat(heartbeat_file: Path):
     """Atomically stamp the heartbeat file, retrying a transient lock.
 
     Atomic because /health reads this concurrently; a plain truncate-and-write
-    can be read as an empty file mid-write.
+    can be read as an empty file mid-write. Retried because that atomicity is
+    exactly what Windows refuses while another process holds the destination
+    open -- see src/utils/atomic.py. `_shutdown` is passed as the abort so a
+    drain does not wait out the backoff.
 
-    Retried because that atomicity is exactly what Windows refuses while
-    another process holds the destination open -- see
-    HEARTBEAT_WRITE_ATTEMPTS. The whole write is redone per attempt, not just
-    the swap, since a failure in the temp write leaves nothing to swap.
-
-    Never raises: the ticker calls this in a bare loop, so an exception
+    The one caller of `replace_with_retry` that swallows the final failure,
+    and deliberately: the ticker calls this in a bare loop, so an exception
     escaping here would kill the heartbeat thread for the life of the
-    process. An exhausted retry is only a stale reading for cross-process
-    readers -- `is_healthy()` answers from memory in the process that ticks.
+    process. Dropping a tick costs nothing anyway -- it is only a stale
+    reading for cross-process readers, since `is_healthy()` answers from
+    memory in the process that ticks.
     """
     tmp_path = heartbeat_file.with_suffix(".tmp")
-    last_error = None
-
-    for attempt in range(HEARTBEAT_WRITE_ATTEMPTS):
-        try:
-            tmp_path.write_text(str(time.time()), encoding="utf-8")
-            os.replace(tmp_path, heartbeat_file)
-            return
-        except Exception as e:
-            last_error = e
-
-        if attempt + 1 == HEARTBEAT_WRITE_ATTEMPTS:
-            break
-
-        # Back off before retrying, but abandon the write the moment a drain
-        # starts -- nothing reads a heartbeat from a consumer that is going
-        # away, and this runs on the shutdown path's critical timing.
-        if _shutdown.wait(HEARTBEAT_WRITE_BACKOFF_SECONDS * (attempt + 1)):
-            return
-
-    logger.warning("Failed to write heartbeat",
-                   error=str(last_error), attempts=HEARTBEAT_WRITE_ATTEMPTS)
+    try:
+        tmp_path.write_text(str(time.time()), encoding="utf-8")
+        replace_with_retry(tmp_path, heartbeat_file,
+                           attempts=HEARTBEAT_WRITE_ATTEMPTS,
+                           backoff=HEARTBEAT_WRITE_BACKOFF_SECONDS,
+                           abort=_shutdown)
+    except Exception as e:
+        logger.warning("Failed to write heartbeat",
+                       error=str(e), attempts=HEARTBEAT_WRITE_ATTEMPTS)
 
 
 def _start_heartbeat_thread(heartbeat_file: Path) -> threading.Thread:

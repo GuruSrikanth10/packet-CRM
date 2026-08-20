@@ -6,6 +6,7 @@ import threading
 from typing import Optional
 from cachetools import TTLCache
 from pathlib import Path
+from src.utils.atomic import replace_with_retry
 from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -174,7 +175,7 @@ def write_draft_runbook(reason_code: str, enrolment_type: str, data: dict):
     tmp_path = target_path.with_suffix(".json.tmp")
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, target_path)
+    replace_with_retry(tmp_path, target_path)
 
 def list_draft_runbooks() -> list[Path]:
     """Return all draft runbook paths."""
@@ -197,7 +198,7 @@ def promote_draft_to_final(draft_path: Path, data: dict):
     
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, final_path)
+    replace_with_retry(tmp_path, final_path)
     
     # Invalidate cache. Built through the same normalizer get_runbook() reads
     # from, so a draft carrying "e" invalidates the "E" key lookups use (F13).
