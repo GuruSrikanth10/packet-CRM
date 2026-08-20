@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from typing import Optional
 from filelock import FileLock
+from src.utils.atomic import replace_with_retry
 from src.storage.base import (
     CASEBOOK_SCHEMA_VERSION,
     CasebookStorage,
@@ -58,7 +59,7 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
         with FileLock(str(lock_path), timeout=10):
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(casebook, f, indent=4, ensure_ascii=False)
-            os.replace(tmp_path, final_path)
+            replace_with_retry(tmp_path, final_path)
 
     def save_terminal(self, event_id: str, casebook: dict) -> None:
         """Write casebook.json then status.json for one terminal outcome.
@@ -130,7 +131,7 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
         with FileLock(str(lock_path), timeout=10):
             with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(content)
-            os.replace(tmp_path, final_path)
+            replace_with_retry(tmp_path, final_path)
 
         return str(final_path)
 

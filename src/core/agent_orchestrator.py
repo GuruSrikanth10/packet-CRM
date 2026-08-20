@@ -13,6 +13,7 @@ from src.tools.tool_registry import (
     get_tool_by_name,
     lookup_rule_for,
     lookup_rule_text,
+    get_error_description,
 )
 from src.storage.factory import get_casebook_storage
 from src.models.synthesis import (
@@ -425,9 +426,17 @@ def get_agent():
                 packet_type = payload.get("packetMetaData", {}).get("enrolmentType", "")
                 try:
                     db_rule = lookup_rule_text(reason_code, packet_type)
+                    # If db_rule is empty or indicates failure, fallback to hardcoded description
+                    if db_rule.startswith("Rule not found") or db_rule == "[]":
+                        fallback_desc = get_error_description(reason_code)
+                        if fallback_desc != "Unknown error code.":
+                            db_rule += f"\n\nSystem Error Description: {fallback_desc}"
                 except Exception as e:
                     log.warning("Rule lookup failed", error=f"{type(e).__name__}: {e}")
                     db_rule = f"Rule lookup failed for reason code {reason_code}: {e}"
+                    fallback_desc = get_error_description(reason_code)
+                    if fallback_desc != "Unknown error code.":
+                        db_rule += f"\n\nSystem Error Description: {fallback_desc}"
             else:
                 db_rule = "No errorReasonCode found in payload."
 

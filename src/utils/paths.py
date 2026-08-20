@@ -9,7 +9,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
-LOCAL_CHECKPOINTS_DIR = REPO_ROOT / "local_checkpoints"
+# Overridable for the same reason LOCAL_CASESHEETS_DIR is: the default sits
+# inside the repo, and a checkout under a synced or indexed directory
+# (Windows `Documents`/OneDrive) means an external process holds handles on
+# files this one rewrites every few seconds. Point it at plain local disk to
+# take those holders out of the picture entirely.
+LOCAL_CHECKPOINTS_DIR = Path(
+    os.environ.get("LOCAL_CHECKPOINTS_DIR", REPO_ROOT / "local_checkpoints")
+)
 CHECKPOINT_DB_PATH = LOCAL_CHECKPOINTS_DIR / "checkpoints.db"
 
 # The consumer's liveness stamp. Independently re-derived in kafkaConsumer.py
