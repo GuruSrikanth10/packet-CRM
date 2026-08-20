@@ -202,6 +202,7 @@ def analyse(corpus_dir: Path) -> dict:
     Needs no broker. Fills DLT_PLAN.md section 11 items 1, 2, 3, 4 and 7.
     """
     from src.dlt.classify import classify
+    from src.dlt import registry
     from src.dlt.headers import parse_headers
     from src.dlt.stacktrace import (
         build_signature,
@@ -233,7 +234,10 @@ def analyse(corpus_dir: Path) -> dict:
 
         headers = parse_headers(item.get("headers"))
         trace = parse_stacktrace(headers.stacktrace)
-        result = classify(trace, headers.exception_message)
+        # Same hook production uses, so this report cannot drift from what the
+        # consumers will actually decide.
+        result = classify(trace, headers.exception_message,
+                          code_class=registry.class_for)
 
         classes[result.failure_class.value] += 1
         if trace.truncated:

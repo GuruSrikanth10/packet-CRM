@@ -107,7 +107,7 @@ They are marked below.
 | Log correlation id | `refId` (the same identifier this project already calls `event_id` -- but **not** the payload field literally named `event_id`, see 3.3) | operator, sample 2 |
 | refId location | **The Kafka record key**, and again in the payload | sample 2 |
 | Payload schema | **Two confirmed**, named by `__TypeId__`: `com.uidai.enu.common.model.EventMessage` and `in.gov.uidai.uidabismiddlewaresb.kafka.model.EnrolmentEventResponse`. The single-schema assumption is retired | sample 2 |
-| Registry | BusinessException code -> one-line description | operator |
+| Registry | **760 published reject codes**, from the `BusinessReasonCode` Java source: code -> description + declared category. 489 `BUSINESS_VALIDATION_ERROR`, 198 `TECHNICAL_EXCEPTION`, 7 `BUSINESS_EXCEPTION`, 56 inferred, 10 uncategorised | source drop, 2026-08-20 |
 | Volume | ~2,000 messages/day | operator |
 | Source access | None | operator |
 | Database access | None | operator |
@@ -353,6 +353,48 @@ Two constraints on this, both load-bearing:
   later be shown to an operator looking at a different packet, where it is
   simply false. `DltInvestigatorAgent.md` states this as a hard limit: describe
   the shape of the input, never its values.
+
+### 5.3.2 The reason-code catalog
+
+`BusinessReasonCode implements IRejectCode`. Every one of the 760 published
+codes can therefore arrive inside a `BusinessException` -- and **198 of them are
+declared `TECHNICAL_EXCEPTION` at source**.
+
+That breaks the assumption section 4 was built on. On the exception type alone,
+`BusinessException: [KAFKA_PRODUCER_EXCEPTION]` and
+`BusinessException: [INDEX_MASTER_DATA_NOT_FOUND]` are the same shape. Both
+classify as A, both go to the analysis lane, and the first comes back with a
+business narrative about a Kafka publish error whose entire treatment is
+"redrive once the broker recovers". The catalog is what separates them:
+`registry.class_for` is passed into `classify()` as its `code_class` hook and
+moves such a case to Class C, where the canned treatment already says exactly
+that -- with no LLM call.
+
+The override is one-directional by construction. It moves A to C, never the
+reverse, and **never to B**: a code defect is identified by its exception type,
+never by a reject code, so no data file can route cases into the "no diagnosis
+possible" lane.
+
+**Declared vs inferred.** The Java file holds two structures. The
+`BusinessReasonCode` enum declares a category per entry. The id-keyed
+`bioDedupReasonCodes` map declares none, so the category assigned to those 69
+entries is *inferred* from the numeric id range (`17xxx` business, `37xxx`
+technical, `12xxx` data access). Every row records which it is, and a canned
+finding built on an inference says so and calls itself provisional. The
+inference is corroborated, not proven: three codes appear in both structures,
+and all three are declared `TECHNICAL_EXCEPTION` in the enum, matching what the
+`37xxx` rule predicts.
+
+Ten `23xxx` codes are left uncategorised on purpose. They sit under no section
+header and mix business rejects with technical processing failures; since
+`classify()` acts on this file, a guess there is worse than silence.
+
+`reason_codes.csv` is the artifact the running system reads and the thing that
+is committed. The Java source is its *input*, not a runtime dependency, and is
+not kept in the repo -- drop the next version in as `reason_codes.txt` and run
+`python -m src.tools.parse_reason_codes`. When the source is present a test
+asserts the stored CSV still matches it, so drift fails the suite; when it is
+absent that test skips and the catalog tests carry on against the CSV.
 
 ### 5.4 Case identity and idempotency
 

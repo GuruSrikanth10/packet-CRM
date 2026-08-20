@@ -14,7 +14,22 @@ An unrecognised exception is **U, never B**. Silently defaulting to B would
 route genuinely unknown failures into the cheapest lane and quietly stop
 looking at them.
 
-Pure functions, no I/O.
+**The reason-code catalog can move a case from A to C.** `BusinessReasonCode
+implements IRejectCode`, so all 760 published reject codes can arrive inside a
+`BusinessException` -- and 198 of them are declared `TECHNICAL_EXCEPTION` at
+source. On the exception type alone, `BusinessException:
+[KAFKA_PRODUCER_EXCEPTION]` is indistinguishable from
+`BusinessException: [INDEX_MASTER_DATA_NOT_FOUND]`; both read as Class A, go to
+the expensive lane, and come back with a business narrative. The first is a
+Kafka publish error whose entire treatment is "redrive once the broker
+recovers". `code_class` is the hook that tells them apart.
+
+The catalog only ever moves A to C, never the reverse, and never to B: a code
+defect is identified by its *exception type*, never by a reject code.
+
+Pure functions, no I/O -- the catalog is read by the caller and passed in as
+`code_class`, so this module stays a pure function of its arguments and the
+file read stays at the boundary that already does it.
 """
 import json
 import os
@@ -189,20 +204,61 @@ def _lookup_class(fqcn: str) -> Optional[str]:
     return best[1] if best else None
 
 
+def reason_code_classification_enabled() -> bool:
+    """Whether a catalog category may override the trace-based class."""
+    raw = os.environ.get("DLT_REASON_CODE_CLASSIFY", "").strip().lower()
+    return raw not in ("false", "0", "no", "off")
+
+
+def _catalog_class(code: Optional[str], code_class) -> Optional[str]:
+    """What the catalog says about `code`, or None.
+
+    None for every failure mode -- no hook, no code, unknown code, catalog
+    absent, feature disabled -- so the stacktrace-based classification stands
+    exactly as it did before the catalog existed.
+    """
+    if not code or code_class is None or not reason_code_classification_enabled():
+        return None
+    try:
+        return code_class(code)
+    except Exception as exc:
+        # A catalog fault must degrade a finding, not lose the message.
+        logger.warning("Reason-code lookup failed; classifying from the "
+                       "stacktrace alone", code=code, error=str(exc))
+        return None
+
+
 def classify(trace: ParsedTrace,
-             exception_message: Optional[str] = None) -> Classification:
+             exception_message: Optional[str] = None,
+             code_class=None) -> Classification:
     """Assign a failure class to a parsed trace.
 
     Total: every input yields a `Classification`, never an exception.
     `exception_message` is the `kafka_exception-message` header, used as a
     fallback source for the business code.
+
+    `code_class` is an optional callable `code -> Optional[str]` returning the
+    failure class the reason-code catalog asserts for a business code --
+    `src.dlt.registry.class_for` in production. Omitting it gives exactly the
+    pre-catalog behaviour, which is what keeps this a pure function and keeps
+    every existing caller working unchanged.
     """
     root = trace.root
     if root is None or not root.fqcn:
         code = extract_business_code(exception_message)
         if code:
             # The trace was unusable but Spring's concatenated message still
-            # carries the code -- enough to treat this as a business error.
+            # carries the code -- enough to treat this as a business error,
+            # unless the catalog says the code is a technical fault.
+            if _catalog_class(code, code_class) == "C":
+                return Classification(
+                    failure_class=FailureClass.TECHNICAL,
+                    root_fqcn="",
+                    business_code=code,
+                    reason=f"stacktrace unparseable; code {code} recovered from "
+                           f"the kafka_exception-message header and declared a "
+                           f"technical fault by the reason-code catalog",
+                )
             return Classification(
                 failure_class=FailureClass.BUSINESS,
                 root_fqcn="",
@@ -222,6 +278,17 @@ def classify(trace: ParsedTrace,
     if is_business_exception(fqcn):
         code = extract_business_code(root.message, exception_message)
         if code:
+            # The exception type says "business"; the catalog knows better for
+            # the 198 codes declared TECHNICAL_EXCEPTION at source. Their
+            # treatment is a redrive, and Class C reaches that without an LLM.
+            if _catalog_class(code, code_class) == "C":
+                return Classification(
+                    failure_class=FailureClass.TECHNICAL,
+                    root_fqcn=fqcn,
+                    business_code=code,
+                    reason=f"raised as a business exception, but the reason-code "
+                           f"catalog declares {code} a technical fault",
+                )
             return Classification(
                 failure_class=FailureClass.BUSINESS,
                 root_fqcn=fqcn,

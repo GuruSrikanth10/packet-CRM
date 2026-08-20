@@ -561,6 +561,10 @@ packet-CRM/
 ├── local_run.py                    # CLI: POST a local packet JSON to the running API
 ├── test_payload.py                 # Static Pydantic validation smoke test
 ├── rules.csv                       # Rules export used by check_drift.py
+├── reason_codes.csv                # 760 reject codes -> description, category, failure class
+│                                   #   (generated from the BusinessReasonCode Java source by
+│                                   #    src/tools/parse_reason_codes.py; the .txt source is an
+│                                   #    input, not a runtime dependency, and is not kept here)
 ├── tests/
 │   ├── test_resilience.py          # Resilience/idempotency/DLQ regression tests
 │   ├── test_phase0_fixes.py        # Phase 0 correctness regression tests
@@ -581,20 +585,43 @@ packet-CRM/
 │   └── test_k8s_retry.py           # Kubernetes HTTP retry logic tests
 ├── src/
 │   ├── main_api.py                 # FastAPI entry point (uvicorn, port 8000)
-│   ├── fast_consumer.py            # Fast consumer entry point: rejections -> /fetch-logs
 │   ├── slow_consumer.py            # Slow consumer entry point: analysis queue -> /analyze-rejection
+│   ├── dlt_consumer.py             # DLT consumer entry point: dead-letter topic -> /fetch-dlt-logs
+│   ├── dlt_analysis_consumer.py    # DLT analysis entry point: DLT queue -> /analyze-dlt
 │   ├── api/
-│   │   └── routes.py               # REST endpoints (/fetch-logs, /analyze-rejection, /process-rejection, /health, /ready)
+│   │   ├── routes.py               # REST endpoints (/fetch-logs, /analyze-rejection, /process-rejection, /health, /ready)
+│   │   └── dlt_routes.py           # DLT endpoints (/fetch-dlt-logs, /analyze-dlt)
 │   ├── core/
 │   │   └── agent_orchestrator.py   # LangGraph StateGraph build + LLM provisioning
+│   ├── dlt/                        # Dead-letter topic analysis (parallel flow; see DLT_PLAN.md)
+│   │   ├── headers.py              # Spring DLT header contract, hex epoch decoding
+│   │   ├── stacktrace.py           # `Caused by:` chain parsing, frames, fingerprint
+│   │   ├── classify.py             # Failure taxonomy A/B/C/U (pure; takes a catalog hook)
+│   │   ├── registry.py             # Reason-code catalog: description, category, failure class
+│   │   ├── identity.py             # case_id = dlt-{topic}-{partition}-{offset}
+│   │   ├── payload.py              # refId resolution: key -> configured -> per-type -> search
+│   │   ├── window.py               # Log window anchored on the last attempt
+│   │   ├── corroborate.py          # Trace-vs-log check; the mis-cast detector
+│   │   ├── groups.py               # Per-fingerprint occurrence records + recommendations
+│   │   ├── reuse.py                # Whether a message needs the LLM at all
+│   │   ├── canned.py               # Fixed treatments for Class B/C/U (no LLM)
+│   │   ├── orchestrator.py         # DLT analysis lane: Investigate -> Review -> Synthesise
+│   │   └── case_storage.py         # DLT case + group storage, separate from casebooks
 │   ├── models/
-│   │   └── schemas.py              # Strict Pydantic data validation schemas
+│   │   ├── schemas.py              # Strict Pydantic data validation schemas
+│   │   ├── synthesis.py            # Rejection finding contract + confidence policy
+│   │   ├── dlt_schemas.py          # DltMessage: the DLT wire model
+│   │   ├── dlt_payload_schemas.py  # EnrolmentEventResponse payload models + refId path registry
+│   │   └── dlt_synthesis.py        # DltFinding contract + DLT confidence ceilings
 │   ├── prompts/
 │   │   ├── LogFilterAgent.md       # Log Filter agent context window sanitization instructions
 │   │   ├── InvestigatorAgent.md    # Investigator context and instructions
 │   │   ├── ReviewerAgent.md        # Reviewer context and validation logic
 │   │   ├── SynthesisAgent.md       # Synthesis output contract (strict JSON keys)
-│   │   └── RunbookGenerator.md     # LLM prompt for generic runbook template generation
+│   │   ├── RunbookGenerator.md     # LLM prompt for generic runbook template generation
+│   │   ├── DltInvestigatorAgent.md # DLT investigator: trace vs logs, and what it may not invent
+│   │   ├── DltReviewerAgent.md     # DLT reviewer: approval rule
+│   │   └── DltSynthesisAgent.md    # DLT finding output contract
 │   ├── runbooks/
 │   │   ├── draft/                  # LLM-generated runbook drafts (pending human review)
 │   │   └── final/                  # Human-approved runbook templates (served online)
@@ -615,7 +642,10 @@ packet-CRM/
 │   │   ├── es_diagnostic.py        # CLI: Elasticsearch connectivity and query diagnostics
 │   │   ├── fetch_pod_logs.py       # CLI: Direct Kubernetes pod log retrieval
 │   │   ├── build_runbooks.py       # CLI: Mine casebooks to draft generic runbook templates
-│   │   └── promote_runbooks.py     # CLI: Human-gate review and promotion of runbook drafts
+│   │   ├── promote_runbooks.py     # CLI: Human-gate review and promotion of runbook drafts
+│   │   ├── dlt_report.py           # CLI: read DLT output (--top, --group, --case, --unreviewed)
+│   │   ├── dlt_sample.py           # CLI: capture/analyse a real DLT corpus (Phase 0 gate)
+│   │   └── parse_reason_codes.py   # CLI: BusinessReasonCode Java source -> reason_codes.csv
 │   ├── log_pipeline/
 │   │   ├── config.py               # Pipeline constants and tunables
 │   │   ├── types.py                # Canonical LogRecord TypedDict and shared types
@@ -644,7 +674,10 @@ packet-CRM/
 │       ├── paths.py                # Centralized path constants (CHECKPOINT_DB_PATH, etc.)
 │       ├── config_validator.py     # Fail-fast boot-time configuration validation
 │       ├── logging_config.py       # structlog JSON logging setup
-│       ├── kafkaConsumer.py        # Background topic polling + bounded worker pool (CONSUMER_ROLE=fast|slow)
+│       ├── kafkaConsumer.py        # Background topic polling + bounded worker pool (CONSUMER_ROLE=fast|slow|dlt|dlt_analysis)
+│       ├── message_adapters.py     # Per-role record handling: rejection payload vs DLT case
+│       ├── atomic.py               # Atomic file replace with retry (Windows os.replace)
+│       ├── metrics.py              # Counters for the DLT lane and LLM usage
 │       ├── llm_utils.py            # LLM factory (local OpenAI-compatible / Mistral / HF)
 │       ├── resilience.py           # tenacity retries + pybreaker circuit breakers
 │       ├── dlq_publisher.py        # Dead Letter Queue producer
@@ -990,25 +1023,64 @@ dlt_consumer.py  -> POST /fetch-dlt-logs  -> dlt-analysis-queue
                  -> dlt_analysis_consumer.py -> POST /analyze-dlt -> casebook
 ```
 
-Four things are worth knowing without reading the whole plan:
+Seven things are worth knowing without reading the whole plan:
 
 1. **The root cause is the last `Caused by:`, never the headers.**
    `kafka_exception-cause-fqcn` carries a Spring/JDK wrapper that is identical
    for every failure in every consumer in the organisation.
 
 2. **The log window is anchored on `retry_topic-backoff-timestamp`**, not
-   `kafka_original-timestamp`. In the reference sample those are 43 hours
-   apart, so the wrong anchor searches a stale window and finds nothing.
+   `kafka_original-timestamp`. In both real samples those are 43 hours apart,
+   so the wrong anchor searches a stale window and finds nothing. The header is
+   hex-encoded epoch millis, and decodes to the same instant the
+   `TimestampedException` in the trace names.
 
 3. **A cached recommendation is never served blind.** Logs are fetched and
    corroborated on every message; only the LLM call is skipped. That keeps the
    mis-cast detector -- the system's highest-value output -- live on every
    occurrence.
 
-4. **Nothing is enabled by default.** `DLT_ENABLED=false` keeps the consumers
+4. **The refId comes from the Kafka record key first.** The record is keyed on
+   it, and the key survives a payload we cannot deserialise -- which is exactly
+   the case the DLT adapter exists to keep alive. Four layers are tried (key,
+   configured path, path registered for the payload's `__TypeId__`, bounded
+   search) and the casebook records which one answered, because a value that
+   fell through to the search is a guess that landed and one read off the key
+   is not. A key/payload disagreement is surfaced as an evidence gap, never
+   silently resolved.
+
+5. **`event_id` on the payload is not the `refId`.** They are different UUIDs.
+   This project's own vocabulary calls refId "the event id", so the field
+   literally named `event_id` is the one you would reach for -- and it fails as
+   an empty log window rather than an error. It is denylisted, along with
+   `candidateRefId`, which belongs to a different enrolment entirely.
+
+6. **The reason-code catalog can move a case out of the expensive lane.**
+   `BusinessReasonCode implements IRejectCode`, so all 760 published reject
+   codes can arrive inside a `BusinessException` -- and 198 are declared
+   `TECHNICAL_EXCEPTION` at source. Without the catalog,
+   `BusinessException: [KAFKA_PRODUCER_EXCEPTION]` reads as a business failure
+   and costs an LLM call to reach the answer "redrive once the broker
+   recovers". `registry.class_for` moves it to Class C, where the canned
+   treatment already says that. The override is one-directional: A to C only,
+   never the reverse and never to B, since a code defect is identified by its
+   exception type rather than by a reject code.
+
+7. **Nothing is enabled by default.** `DLT_ENABLED=false` keeps the consumers
    out of `start.py`.
 
-Operator entry point: `python -m src.tools.dlt_report --top`.
+Operator entry points:
+
+```bash
+python -m src.tools.dlt_report --top          # what is failing most
+python -m src.tools.dlt_sample --analyze <d>  # corpus measurements (Phase 0)
+python -m src.tools.parse_reason_codes        # regenerate reason_codes.csv
+```
+
+**Status.** Phases 1-9 are implemented and unit-tested against fixtures; Phase 0
+-- the corpus capture and its measurements -- has never been run against a real
+broker or cluster. Whether `enu-biometric` pod log lines actually carry `refId`
+remains a hard gate on the log lane being useful at all.
 
 ---
 

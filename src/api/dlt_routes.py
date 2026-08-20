@@ -70,10 +70,14 @@ def build_failure(headers, exception_message: Optional[str]) -> dict:
     than trusting a summary carried across a topic.
     """
     trace = parse_stacktrace(headers.stacktrace)
-    result = classify(trace, exception_message)
+    # `registry.class_for` lets a code declared TECHNICAL_EXCEPTION at source
+    # be classified C even though it arrived wrapped in a BusinessException.
+    # The lookup is cached on the catalog's mtime, so this costs one `stat`.
+    result = classify(trace, exception_message, code_class=registry.class_for)
     frames = normalise_frames(trace.root_frames)
     root_fqcn = trace.root.fqcn if trace.root else None
     code = result.business_code or ""
+    entry = registry.lookup_entry(result.business_code)
 
     return {
         "failure_class": result.failure_class.value,
@@ -81,7 +85,13 @@ def build_failure(headers, exception_message: Optional[str]) -> dict:
         "root_fqcn": root_fqcn,
         "root_message": trace.root.message if trace.root else "",
         "business_code": result.business_code,
-        "registry_description": registry.lookup(result.business_code),
+        "registry_description": entry.description if entry else None,
+        "registry_category": entry.category if entry else None,
+        # "declared" or "inferred". A category the Java source stated and one
+        # derived from a numeric id range are not the same evidence, and a
+        # casebook that could not tell them apart would hide that.
+        "registry_category_source": entry.category_source if entry else None,
+        "registry_stage": entry.stage if entry else None,
         "fingerprint": compute_fingerprint(root_fqcn, frames, code),
         "signature": build_signature(root_fqcn, frames, code),
         "frames": list(frames),
@@ -266,6 +276,9 @@ def _casebook(message: DltMessage, headers, failure: dict, corroboration,
             "root_fqcn": failure["root_fqcn"],
             "business_code": failure["business_code"],
             "registry_description": failure["registry_description"],
+            "registry_category": failure.get("registry_category"),
+            "registry_category_source": failure.get("registry_category_source"),
+            "registry_stage": failure.get("registry_stage"),
             "signature": failure["signature"],
             "fingerprint": failure["fingerprint"],
             "frames": failure["frames"],

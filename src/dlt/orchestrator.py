@@ -77,8 +77,12 @@ def _evidence_block(state: DltGraphState) -> str:
     payload_summary = state.get("payload_summary") or "(no payload was captured)"
 
     registry = failure.get("registry_description")
-    registry_line = (f"{registry}\n(This is the entire registry entry. It is one "
-                     f"line. Do not extrapolate beyond it.)"
+    category = failure.get("registry_category")
+    category_line = (f"\nCategory: {category}"
+                     f" ({failure.get('registry_category_source') or 'unknown provenance'})"
+                     if category else "")
+    registry_line = (f"{registry}{category_line}\n(This is the entire registry "
+                     f"entry. It is one line. Do not extrapolate beyond it.)"
                      if registry else
                      "(No registry entry exists for this code.)")
 

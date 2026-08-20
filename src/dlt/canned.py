@@ -30,6 +30,37 @@ def _seen_summary(group: Optional[dict]) -> str:
     return f"{count} {plural} of this signature recorded{when}."
 
 
+def _catalog_note(failure: dict) -> str:
+    """Explain a reclassification the exception type alone would contradict.
+
+    A reader looking at `BusinessException[KAFKA_PRODUCER_EXCEPTION]` filed as a
+    technical fault will reasonably ask why, since the exception says
+    "business". The answer is that the organisation's own reject-code source
+    declares the code technical -- so say it, name where it came from, and let
+    the reader disagree if the catalog is wrong.
+    """
+    code = failure.get("business_code")
+    category = failure.get("registry_category")
+    if not code or category != "TECHNICAL_EXCEPTION":
+        return ""
+
+    origin = failure.get("registry_category_source")
+    provenance = {
+        "declared": "declared as such in the BusinessReasonCode source",
+        "inferred": ("inferred from its numeric id range -- weaker evidence "
+                     "than a declared category, so treat this classification "
+                     "as provisional"),
+    }.get(origin, "categorised by the reason-code catalog")
+
+    description = failure.get("registry_description")
+    detail = f' ("{description}")' if description else ""
+
+    return (f"\n\nThis was raised as a business exception, but the reason code "
+            f"{code}{detail} is a technical fault: {provenance}. It is treated "
+            f"as Class C for that reason, which is why no per-packet "
+            f"investigation was run.")
+
+
 def build(failure_class: str,
           failure: dict,
           corroboration,
@@ -43,6 +74,7 @@ def build(failure_class: str,
             f"Technical fault: {signature}. The root exception is a transient "
             f"or infrastructure-level failure, not an application defect. "
             f"Spring exhausted its retries before the dependency recovered. {seen}"
+            f"{_catalog_note(failure)}"
         )
         recommendation = (
             "Confirm the dependency named in the trace is healthy, then redrive "
