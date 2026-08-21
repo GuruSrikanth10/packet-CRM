@@ -33,3 +33,7 @@ tests/fixtures/dlt/corpus/
 # lane with no error anywhere to say why. Published error codes, not operator
 # data, so unlike rules.csv it belongs in git.
 !reason_codes.csv
+
+# Timestamped .env backups. `.env` is ignored; its backups were not, so one
+# `git add -A` would have published every secret in them.
+.env.bak*
