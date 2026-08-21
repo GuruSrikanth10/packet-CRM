@@ -80,9 +80,10 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
             },
         }, filename="status.json")
 
-    def terminal_status(self, event_id: str) -> Optional[str]:
+    def terminal_status(self, event_id: str,
+                        filenames: tuple = ("status.json", "casebook.json")) -> Optional[str]:
         """Return the terminal status found in either file, or None."""
-        for filename in ("status.json", "casebook.json"):
+        for filename in filenames:
             data = self.load(event_id, filename=filename)
             if not data:
                 continue

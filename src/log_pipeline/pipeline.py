@@ -10,6 +10,7 @@ Flow:
     -> Normal path:  Stage 3 (cluster) -> Stage 4 (guardrails) -> format, return
 """
 import os
+import threading
 from typing import Optional
 
 from src.log_pipeline import redaction
@@ -27,14 +28,21 @@ logger = get_logger(__name__)
 
 
 _cached_catalog = None
+# TemplateCatalog() reads and parses the catalog JSON, so racing callers each
+# paid for a full parse and all but one result was discarded.
+_catalog_lock = threading.Lock()
 
 
 def _get_catalog() -> TemplateCatalog:
     """Return a module-level cached catalog instance."""
     global _cached_catalog
-    if _cached_catalog is None:
-        _cached_catalog = TemplateCatalog()
-    return _cached_catalog
+    if _cached_catalog is not None:
+        return _cached_catalog
+
+    with _catalog_lock:
+        if _cached_catalog is None:
+            _cached_catalog = TemplateCatalog()
+        return _cached_catalog
 
 
 def _default_window() -> TimeWindow:

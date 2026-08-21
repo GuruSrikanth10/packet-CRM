@@ -1,6 +1,7 @@
 import os
 import json
 import contextvars
+import threading
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -91,6 +92,15 @@ class GraphState(TypedDict):
 
 _agent = None
 
+#: Guards the lazy build below. Two concurrent first-callers each built a full
+#: graph -- two LLM clients, four react agents, and two `get_checkpointer()`
+#: calls, the second of which opens another connection and re-runs setup()'s
+#: DDL. This was masked while `get_agent()` ran on the event loop, which
+#: serialised it; moving the call off the loop removes that accidental
+#: protection, so the lock has to be real. Same shape as
+#: `core/checkpointer.py` and `sources/k8s/client.py`.
+_agent_lock = threading.Lock()
+
 #: Hash of the prompts and policy the cached graph was built from.
 #: Written into every casebook so an accuracy movement can be attributed to a
 #: prompt change rather than merely coinciding with one. The rule side of this
@@ -140,9 +150,23 @@ def prompt_fingerprint() -> str:
 
 def get_agent():
     global _agent, _prompt_fingerprint
+
+    # Fast path without the lock: once built, `_agent` never changes, and an
+    # unsynchronised read of an already-published reference is safe.
     if _agent is not None:
         logger.info("Returning the cached agent graph")
         return _agent
+
+    with _agent_lock:
+        # Re-check: another thread may have built it while we waited.
+        if _agent is not None:
+            return _agent
+        return _build_agent()
+
+
+def _build_agent():
+    """Construct the graph. Caller must hold `_agent_lock`."""
+    global _agent, _prompt_fingerprint
 
     logger.info("Building the agent graph")
     base_dir = os.path.dirname(os.path.dirname(__file__))

@@ -21,6 +21,11 @@ logger = get_logger(__name__)
 
 _DB_CACHE = None
 _LIVE_DB_ENGINE = None
+# One lock for all three lazy globals below. They are built once and read from
+# every agent thread; racing `get_live_db_engine` in particular created a
+# second SQLAlchemy pool (10 + 20 overflow) that was then leaked, because only
+# one of the two engines ever got published to `_LIVE_DB_ENGINE`.
+_lazy_globals_lock = threading.Lock()
 # (target_col, {reason_code_str: [row_positions]}) built once from _DB_CACHE,
 # or (None, {}) if the DB is empty/has no recognizable reason-code column.
 # Avoids an O(n) astype(str)-and-compare scan of the whole table on every
@@ -56,7 +61,12 @@ def _is_uncacheable_result(result: str) -> bool:
 
 def get_live_db_engine():
     global _LIVE_DB_ENGINE
-    if _LIVE_DB_ENGINE is None:
+    if _LIVE_DB_ENGINE is not None:
+        return _LIVE_DB_ENGINE
+
+    with _lazy_globals_lock:
+        if _LIVE_DB_ENGINE is not None:
+            return _LIVE_DB_ENGINE
         db_user = get_required_env("DB_USERNAME", "su01")
         db_pass = get_required_env("DB_PASSWORD", "su01")
         db_host = get_required_env("DB_HOST", "localhost")
@@ -72,7 +82,7 @@ def get_live_db_engine():
             pool_pre_ping=True,
             pool_recycle=3600,
         )
-    return _LIVE_DB_ENGINE
+        return _LIVE_DB_ENGINE
 
 def _load_mock_db():
     global _DB_CACHE

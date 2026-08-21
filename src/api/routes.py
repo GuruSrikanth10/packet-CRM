@@ -198,6 +198,26 @@ def _packet_metrics(resolution_source: str = "agent"):
         )
 
 
+async def _off_loop(fn, *args, **kwargs):
+    """Run one blocking storage or network call off the event loop.
+
+    `_investigate_packet` is `async def`, and the LLM call is correctly handed
+    to `_agent_invoke_executor`. Everything AROUND it was not: two casebook
+    loads, `get_agent()`, `agent.get_state()`, an IN_PROGRESS write, an S3
+    upload of the whole log body, and two more storage round-trips on the way
+    out -- roughly eight filesystem or S3 operations per packet, all executed
+    directly on the single event-loop thread.
+
+    That loop also serves /health, /ready, /metrics, the `get_api_key` and
+    `rate_limiter` dependencies, and the dispatch of /fetch-logs. Under
+    CASEBOOK_STORAGE_BACKEND=s3 this reproduced exactly the head-of-line
+    blocking that the dedicated executor was introduced to remove (2.6): the
+    LLM call no longer blocked the loop, but the eight S3 calls surrounding it
+    did.
+    """
+    return await asyncio.to_thread(functools.partial(fn, *args, **kwargs))
+
+
 def _get_agent_invoke_timeout_seconds() -> float:
     """Server-side budget for a single agent.invoke() call.
 
@@ -592,8 +612,8 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
     event_id = str(signal.eventId).strip()
 
     storage = get_casebook_storage()
-    existing_casebook = storage.load(event_id, filename="casebook.json")
-    existing_status = storage.load(event_id, filename="status.json")
+    existing_casebook = await _off_loop(storage.load, event_id, filename="casebook.json")
+    existing_status = await _off_loop(storage.load, event_id, filename="status.json")
 
     # Check terminal short-circuit before provisioning the agent or touching
     # the checkpoint DB -- an already-terminal packet has no business paying
@@ -604,9 +624,12 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
             logger.bind(event_id=event_id).info("Skipping event; a terminal casebook already exists", recorded_status=status)
             return {"status": "already_processed", "event_id": event_id}
 
-    agent = get_agent()
+    # get_agent() on its first call reads five prompt files, builds two LLM
+    # clients and four react agents, and opens the checkpoint store (running
+    # Postgres DDL). get_state() is a checkpoint-store read on every call.
+    agent = await _off_loop(get_agent)
     config = {"configurable": {"thread_id": event_id}}
-    state = agent.get_state(config)
+    state = await _off_loop(agent.get_state, config)
     has_active_checkpoint = bool(state and getattr(state, "next", None))
 
     if existing_status:
@@ -631,7 +654,7 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
                 return {"status": "already_processing", "event_id": event_id}
 
     # Write IN_PROGRESS stub before invoking graph to status.json
-    storage.save(event_id, {
+    await _off_loop(storage.save, event_id, {
         "packet_metadata": {"eid": event_id, "started_at": time.time()},
         "packet_status": {"status": "IN_PROGRESS"}
     }, filename="status.json")
@@ -674,7 +697,7 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
             # Both files move together, so the consumer (and any later
             # redelivery) sees the same verdict whichever one it reads (F4).
             outcome["status"] = "FAILED_TIMEOUT"
-            storage.save_terminal(event_id, {
+            await _off_loop(storage.save_terminal, event_id, {
                 "packet_metadata": {"eid": event_id},
                 "packet_status": {"status": "FAILED_TIMEOUT"},
                 "resolution": {"synthesis": f"Investigation exceeded the server-side budget of {agent_invoke_timeout_seconds}s."}
@@ -684,14 +707,15 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
         import traceback
         error_msg = traceback.format_exc()
         log.error("Unhandled exception during agent processing", exc_info=True, state="DLQ")
-        publish_to_dlq(signal_dict, error_msg)
+        # A Kafka produce with acks="all" and a flush() -- a network round trip.
+        await _off_loop(publish_to_dlq, signal_dict, error_msg)
 
         # Mark as DLQ in storage so it doesn't get re-run on redelivery. Both
         # files must move to a terminal status together -- leaving
         # status.json at IN_PROGRESS here previously left it stuck forever,
         # since only casebook.json was written (1.5).
         outcome["status"] = "DLQ"
-        storage.save_terminal(event_id, {
+        await _off_loop(storage.save_terminal, event_id, {
             "packet_metadata": {"eid": event_id},
             "packet_status": {"status": "DLQ"},
             "resolution": {"synthesis": f"Failed with {type(e).__name__}: {str(e)}"}
@@ -751,7 +775,9 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
     if not raw_logs or raw_logs == "Log fetching disabled.":
         processed_logs = {"path": "No logs found", "gaps": None}
     else:
-        uploaded_url = upload_logs_to_s3(event_id, raw_logs)
+        # The largest single blocking call in this function: a PUT of the
+        # entire log body, previously issued from the event loop.
+        uploaded_url = await _off_loop(upload_logs_to_s3, event_id, raw_logs)
         if uploaded_url:
             path_str = uploaded_url
         else:
@@ -853,7 +879,13 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
     # before this slow LLM call finally returned (0.8). Checks BOTH files:
     # the consumer's timeout handler used to write only casebook.json while
     # this guard read only status.json, so it never fired (F4).
-    current_status = storage.terminal_status(event_id)
+    # status.json only: both PROTECTED_TERMINAL_STATUSES are written by
+    # save_terminal, which always writes casebook.json first and status.json
+    # second -- so status.json carrying the verdict is implied by casebook.json
+    # carrying it, and reading both here doubled the round trips on a guard
+    # that runs for every packet.
+    current_status = await _off_loop(storage.terminal_status, event_id,
+                                     filenames=("status.json",))
     if current_status in PROTECTED_TERMINAL_STATUSES:
         log.warning(
             "Discarding late result; a terminal status was already recorded by another actor",
@@ -865,7 +897,7 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
 
     # casebook.json and status.json reach the terminal status together, so a
     # crash between them can't leave status.json stuck at IN_PROGRESS.
-    storage.save_terminal(event_id, casebook_data)
+    await _off_loop(storage.save_terminal, event_id, casebook_data)
 
     final_status = casebook_data["packet_status"]["status"]
     resolution_source = casebook_data["resolution"]["source"] or "agent"

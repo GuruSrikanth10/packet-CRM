@@ -117,8 +117,9 @@ class S3CasebookStorage(CasebookStorage):
             return (data.get("packet_status") or {}).get("status") in TERMINAL_STATUSES
         return True
 
-    def terminal_status(self, event_id: str) -> Optional[str]:
-        for filename in ("status.json", "casebook.json"):
+    def terminal_status(self, event_id: str,
+                        filenames: tuple = ("status.json", "casebook.json")) -> Optional[str]:
+        for filename in filenames:
             data = self.load(event_id, filename=filename)
             if not data:
                 continue
