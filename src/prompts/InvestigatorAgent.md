@@ -58,6 +58,12 @@ Gap types you may see:
   **absence of ERROR lines below tells you nothing at all**.
 - `SOURCE_FALLBACK` -- a log source returned nothing and another was used;
   the trace may reflect a different, less complete view than intended.
+- `SERVICE_UNAVAILABLE` -- one of the services this packet passes through
+  could not be searched at all. The named service contributed **nothing** to
+  this trace, so you cannot conclude anything about what happened inside it.
+  If the failure you are explaining could plausibly have originated there,
+  say so and recommend that a human check that service directly, rather than
+  attributing the failure to a service that merely happens to be visible.
 
 When no banner is present, treat the trace as a complete view of the
 requested window and reason normally.

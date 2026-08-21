@@ -22,6 +22,29 @@ substring against the pod name instead. `PodMatchSpec` supports both, with
 name-substring as the default because it is the mode actually proven to work
 here; label selection remains available as an explicit per-service opt-in via
 `K8S_SERVICE_MAP` for services known to be labelled reliably.
+
+**Multi-service discovery (2026-08-21).** A refId travels through several
+services, so the logs that explain a failure are rarely all in one of them.
+`K8S_APP_NAMES` (falling back to `ES_APP_NAMES`, so one list can drive both
+sources) lists every service to search; each resolves its own namespace and
+match spec through `resolve_service`, and the results are merged.
+
+Three things make the merge non-trivial, and all three are handled here:
+
+* **Overlapping match specs double-count.** `name_contains` is a substring
+  test, so `enu-biometric` and `enu-biometric-abis-mw-consumer` both match the
+  pod `enu-biometric-abis-mw-consumer-dcdr-...`. Reading it twice would
+  duplicate every line it contributed, inflating the evidence and the token
+  bill. Targets are deduped on (namespace, pod, container).
+
+* **One bad service must not sink the fetch.** A service whose namespace is
+  unreadable, or whose pod list is denied, yields a `SERVICE_UNAVAILABLE` gap
+  while the others still return logs. Only a total failure -- nothing
+  searchable anywhere -- is reported as `ok=False`.
+
+* **A cap must not starve a service.** Pods are merged round-robin across
+  services rather than concatenated, so truncation trims each service's tail
+  evenly instead of dropping whichever service happened to be configured last.
 """
 import json
 import os
@@ -41,6 +64,9 @@ logger = get_logger(__name__)
 SKIPPED_PHASES = frozenset({"Pending"})
 
 DEFAULT_SIDECAR_DENYLIST = "istio-proxy,linkerd-proxy,vault-agent"
+
+#: Used when neither K8S_APP_NAMES, ES_APP_NAMES nor K8S_DEFAULT_APP is set.
+DEFAULT_APP = "enu-biometric"
 
 MATCH_MODE_LABEL = "label"
 MATCH_MODE_NAME_CONTAINS = "name_contains"
@@ -75,6 +101,20 @@ class PodTarget:
     restart_count: int = 0
     phase: str = "Unknown"
     start_time: Optional[datetime] = None
+    #: Which configured service this pod was matched for. Defaults to "" so
+    #: every existing construction stays valid; carried so a multi-service
+    #: fetch can say which hop a pod belongs to.
+    app: str = ""
+
+    @property
+    def pod_key(self) -> tuple:
+        """Identifies the pod, ignoring the container. Two services matching
+        the same pod must not read it twice."""
+        return (self.namespace, self.pod_name)
+
+    @property
+    def target_key(self) -> tuple:
+        return (self.namespace, self.pod_name, self.container)
 
     @property
     def restarted(self) -> bool:
@@ -91,6 +131,11 @@ class DiscoveryResult:
     truncated: bool = False
     ok: bool = True
     reason: Optional[str] = None
+    #: Services that were searched successfully, and those that could not be.
+    #: A caller comparing the two knows which hops of the packet's journey are
+    #: actually represented in the logs it is about to reason over.
+    services_searched: list = field(default_factory=list)
+    services_failed: list = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -149,6 +194,53 @@ def _max_pods() -> int:
         return max(1, int(os.environ.get("K8S_MAX_PODS", "20")))
     except ValueError:
         return 20
+
+
+def _max_total_pods() -> int:
+    """Ceiling on distinct pods across ALL services. 0 disables it.
+
+    Disabled by default so adding this knob changes nothing: `K8S_MAX_PODS`
+    still bounds each service individually, and the real fan-out cost is
+    already bounded by `K8S_FETCH_CONCURRENCY` and
+    `K8S_TOTAL_FETCH_TIMEOUT_SECONDS`. It exists for the operator who would
+    rather cap the total than reason about per-service caps times the number
+    of services.
+    """
+    try:
+        return max(0, int(os.environ.get("K8S_MAX_TOTAL_PODS", "0")))
+    except ValueError:
+        return 0
+
+
+def app_names() -> list:
+    """Every service to search, in configured order.
+
+    `K8S_APP_NAMES` first, then `ES_APP_NAMES`. The fallback is deliberate:
+    the two sources want the same list of services, and asking an operator to
+    maintain that list twice is asking for the two to drift -- at which point
+    Kubernetes and Elasticsearch would quietly search different parts of the
+    packet's journey. `K8S_APP_NAMES` exists only for when they genuinely must
+    differ, because a pod-name substring and an Elasticsearch
+    `application_name` value are not always the same string.
+
+    Falls back to a single `K8S_DEFAULT_APP`, which is exactly the pre-2026-08-21
+    behaviour for anyone who sets neither list.
+    """
+    for var in ("K8S_APP_NAMES", "ES_APP_NAMES"):
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            continue
+        names, seen = [], set()
+        for name in (n.strip() for n in raw.split(",")):
+            # Deduped here as well as on targets: a repeated name would
+            # otherwise list the same namespace twice for no reason.
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        if names:
+            return names
+
+    return [os.environ.get("K8S_DEFAULT_APP") or DEFAULT_APP]
 
 
 # ======================================================================
@@ -269,10 +361,18 @@ def _list_pods(namespace: str, match_spec: PodMatchSpec, request_timeout: float)
     return pods
 
 
-def discover_targets(namespace: Optional[str] = None,
-                     app: Optional[str] = None) -> DiscoveryResult:
-    """Find every (pod, container) to read for this service."""
+def discover_for_service(app: Optional[str] = None,
+                         namespace: Optional[str] = None,
+                         verified: Optional[dict] = None) -> DiscoveryResult:
+    """Find every (pod, container) to read for ONE service.
+
+    `verified` is a namespace -> (ok, reason) cache shared across the services
+    in a single `discover_targets` call. Several services usually share one
+    namespace, and re-reading it once per service would multiply the RBAC
+    round-trips for no new information.
+    """
     resolved_namespace, match_spec = resolve_service(app=app, namespace=namespace)
+    service_label = app or os.environ.get("K8S_DEFAULT_APP") or DEFAULT_APP
 
     if not resolved_namespace:
         return DiscoveryResult(
@@ -292,7 +392,12 @@ def discover_targets(namespace: Optional[str] = None,
     # ServiceAccount has no cluster-wide access, so a 403/404 here is
     # reported distinctly rather than surfacing as a confusing failure from
     # the pod list call that follows.
-    ns_ok, ns_reason = _verify_namespace(resolved_namespace, request_timeout)
+    if verified is not None and resolved_namespace in verified:
+        ns_ok, ns_reason = verified[resolved_namespace]
+    else:
+        ns_ok, ns_reason = _verify_namespace(resolved_namespace, request_timeout)
+        if verified is not None:
+            verified[resolved_namespace] = (ns_ok, ns_reason)
     if not ns_ok:
         return DiscoveryResult(
             ok=False,
@@ -370,10 +475,12 @@ def discover_targets(namespace: Optional[str] = None,
                 restart_count=_restart_count(pod, container),
                 phase=phase,
                 start_time=_start_time(pod),
+                app=service_label,
             ))
 
     logger.info(
         "Kubernetes pods discovered",
+        app=service_label,
         namespace=resolved_namespace,
         match_mode=match_spec.mode,
         match_value=match_spec.value,
@@ -386,6 +493,7 @@ def discover_targets(namespace: Optional[str] = None,
     if not targets:
         logger.warning(
             "No pods matched; check the namespace and the match spec",
+            app=service_label,
             namespace=resolved_namespace,
             match_mode=match_spec.mode,
             match_value=match_spec.value,
@@ -397,4 +505,149 @@ def discover_targets(namespace: Optional[str] = None,
         pods_seen=pods_seen,
         pods_skipped_pending=skipped_pending,
         truncated=truncated,
+        services_searched=[service_label],
+    )
+
+
+# ======================================================================
+# Multi-service fan-out
+# ======================================================================
+
+def _merge_round_robin(per_service: list, total_cap: int) -> tuple:
+    """Interleave each service's pods, deduped, honouring a total pod cap.
+
+    Round-robin rather than concatenation so that a cap trims every service's
+    tail evenly. Concatenating would silently drop whichever service happened
+    to be configured last -- and "this service contributed nothing" is
+    indistinguishable, in the final logs, from "this service logged nothing",
+    which is exactly the confusion the gap types exist to prevent.
+
+    Containers of one pod stay together: the unit being capped and deduped is
+    the pod, not the (pod, container) pair.
+    """
+    grouped = []
+    for result in per_service:
+        by_pod = {}
+        for target in result.targets:
+            by_pod.setdefault(target.pod_key, []).append(target)
+        grouped.append(list(by_pod.values()))
+
+    merged, seen_pods, duplicates = [], set(), 0
+    capped = False
+    index = 0
+    while any(index < len(groups) for groups in grouped):
+        for groups in grouped:
+            if index >= len(groups):
+                continue
+            pod_targets = groups[index]
+            key = pod_targets[0].pod_key
+            if key in seen_pods:
+                # Two services' match specs cover the same pod. Substring
+                # matching makes this the normal case, not an edge one.
+                duplicates += 1
+                continue
+            if total_cap and len(seen_pods) >= total_cap:
+                capped = True
+                break
+            seen_pods.add(key)
+            merged.extend(pod_targets)
+        if capped:
+            break
+        index += 1
+
+    return merged, duplicates, capped, len(seen_pods)
+
+
+def discover_targets(namespace: Optional[str] = None,
+                     app: Optional[str] = None) -> DiscoveryResult:
+    """Find every (pod, container) to read, across every configured service.
+
+    Passing `app` explicitly searches only that service -- the operator CLI
+    and the single-service callers rely on this. With `app` unset, every name
+    in `app_names()` is searched and the results merged; when that list holds
+    one entry (the default), this is byte-for-byte the old behaviour.
+
+    A service that cannot be searched degrades the result instead of failing
+    it: the packet's other hops are still worth reading, and the missing hop
+    is named in a `SERVICE_UNAVAILABLE` gap rather than left to be inferred
+    from an absence. Only when nothing at all is searchable does this report
+    `ok=False`.
+    """
+    services = [app] if app is not None else app_names()
+
+    verified: dict = {}
+    per_service, gaps, searched, failed = [], [], [], []
+    first_failure = None
+
+    for service in services:
+        result = discover_for_service(app=service, namespace=namespace,
+                                      verified=verified)
+        if not result.ok:
+            failed.append(service)
+            if first_failure is None:
+                first_failure = result.reason
+            gaps.append(EvidenceGap(
+                GapType.SERVICE_UNAVAILABLE,
+                f"service '{service}' could not be searched: "
+                f"{result.reason}. Any part of this packet's journey through "
+                f"it is missing from these logs.",
+                {"app": service, "reason": result.reason},
+            ))
+            logger.warning("Service discovery failed; continuing with the rest",
+                           app=service, reason=result.reason)
+            continue
+
+        per_service.append(result)
+        searched.extend(result.services_searched or [service])
+        gaps.extend(result.gaps)
+
+    if not per_service:
+        # Nothing was searchable anywhere. Reports the first concrete reason
+        # captured above rather than a generic one -- it is almost always the
+        # same misconfiguration for every service (no namespace, no client).
+        # Deliberately NOT re-running discovery to recover a reason: that
+        # would re-issue the very API calls that just failed.
+        return DiscoveryResult(
+            ok=False,
+            reason=first_failure or "no service could be searched",
+            gaps=gaps,
+            services_failed=failed,
+        )
+
+    targets, duplicates, capped, pod_count = _merge_round_robin(
+        per_service, _max_total_pods())
+
+    if duplicates:
+        logger.info(
+            "Overlapping match specs; deduped pods across services",
+            duplicate_pods=duplicates, services=searched,
+            hint="a name_contains value is a prefix of another service's pods",
+        )
+
+    truncated = any(r.truncated for r in per_service) or capped
+    if capped:
+        logger.warning("Total pod fan-out capped across services",
+                       cap=_max_total_pods(), services=searched)
+        gaps.append(EvidenceGap(
+            GapType.TRUNCATED,
+            f"pods from {len(searched)} services were capped at "
+            f"{_max_total_pods()} in total (K8S_MAX_TOTAL_PODS).",
+            {"cap": _max_total_pods(), "services": list(searched)},
+        ))
+
+    if len(services) > 1:
+        logger.info(
+            "Multi-service discovery complete",
+            services_searched=searched, services_failed=failed,
+            pods=pod_count, targets=len(targets),
+        )
+
+    return DiscoveryResult(
+        targets=targets,
+        gaps=gaps,
+        pods_seen=sum(r.pods_seen for r in per_service),
+        pods_skipped_pending=sum(r.pods_skipped_pending for r in per_service),
+        truncated=truncated,
+        services_searched=searched,
+        services_failed=failed,
     )

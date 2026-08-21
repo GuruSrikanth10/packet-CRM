@@ -54,6 +54,14 @@ class GapType(str, Enum):
     LEVEL_PARSE_DEGRADED = "LEVEL_PARSE_DEGRADED"
     SOURCE_FALLBACK = "SOURCE_FALLBACK"
 
+    #: One of several configured services could not be searched at all -- its
+    #: namespace was unreadable, or its pod list was denied. The other
+    #: services still returned logs, so the fetch is degraded rather than
+    #: failed, and this names exactly which part of the packet's journey is
+    #: missing. Without it a multi-service fetch would look complete while
+    #: silently omitting a whole hop.
+    SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
+
 
 @dataclass(frozen=True)
 class EvidenceGap:

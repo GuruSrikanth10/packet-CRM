@@ -134,6 +134,11 @@ class KubernetesLogSource:
             pods_failed=outcome.pods_failed,
             latency_ms=round(latency_ms, 1),
             gap_count=len(collected),
+            # Which hops of the packet's journey these logs actually cover.
+            # A count of matched lines means little without knowing whether
+            # every service was reachable when they were collected.
+            services_searched=found.services_searched,
+            services_failed=found.services_failed,
         )
 
         # Only a successful fetch is snapshotted: caching a failure would

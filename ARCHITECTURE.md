@@ -579,6 +579,7 @@ packet-CRM/
 │   ├── test_es_diagnostic.py       # ES diagnostic tool tests
 │   ├── test_fetch_pod_logs_cli.py  # fetch_pod_logs CLI tests
 │   ├── test_k8s_discovery.py       # Kubernetes pod/namespace discovery tests
+│   ├── test_k8s_multi_service.py   # Multi-service fan-out, dedupe, partial failure
 │   ├── test_k8s_gaps.py            # Kubernetes evidence gap detection tests
 │   ├── test_k8s_parser.py          # Kubernetes log line parser tests
 │   ├── test_k8s_retrieval.py       # Kubernetes pod log retrieval tests
@@ -663,7 +664,7 @@ packet-CRM/
 │   │       └── k8s/                # Kubernetes pod log source
 │   │           ├── source.py       # KubernetesLogSource entry point
 │   │           ├── client.py       # HTTP client for Kubernetes API
-│   │           ├── discovery.py    # Pod/namespace auto-discovery
+│   │           ├── discovery.py    # Pod/namespace discovery, multi-service fan-out
 │   │           ├── retrieval.py    # Pod log fan-out and retrieval
 │   │           ├── parser.py       # Raw log line parser
 │   │           ├── gaps.py         # Evidence gap detection
@@ -821,6 +822,8 @@ Fallback triggers when a source fails OR returns no records. Sources are never m
 The `KubernetesLogSource` (`sources/k8s/source.py`) ties together five internal modules:
 
 1. **Discovery** (`discovery.py`): Verifies the namespace with a targeted `read_namespace` pre-flight (the ServiceAccount cannot list namespaces or pods cluster-wide), then lists pods within it -- by default a client-side name-substring match (`PodMatchSpec`, `K8S_SERVICE_MAP`), or a server-side label selector where an app opts in -- filters out sidecars (`istio-proxy`, `linkerd-proxy`, `vault-agent`), skips `Pending` pods, and caps the target list at `K8S_MAX_PODS` (default 20). Reports `TRUNCATED_PODS` evidence gaps when the cap is reached.
+
+   **Multi-service (2026-08-21).** A refId passes through several services, so `K8S_APP_NAMES` -- falling back to `ES_APP_NAMES`, so one list drives both sources -- names every service to search. Each resolves its own namespace and match spec, and the results are merged. Three properties make the merge safe: pods are **deduped** on (namespace, pod, container), because `name_contains` is a substring test and `enu-biometric` therefore also matches `enu-biometric-abis-mw-consumer`'s pods -- reading such a pod once per matching service would duplicate every line it contributed; a service that cannot be searched **degrades rather than fails**, yielding a `SERVICE_UNAVAILABLE` gap while the others still return logs, so an unreachable hop is announced instead of being mistaken for a silent one; and `K8S_MAX_PODS` applies **per service** with merging done round-robin, so adding a service never shrinks another's representation and the optional `K8S_MAX_TOTAL_PODS` ceiling trims every service evenly rather than dropping whichever was configured last.
 2. **Retrieval** (`retrieval.py`): Reads logs for each discovered `(pod, container)` pair using a concurrent `ThreadPoolExecutor` fan-out. Streams logs line-by-line (`_preload_content=False`) to avoid buffering hundreds of megabytes. Requests kubelet timestamps (`timestamps=True`) for reliable cross-pod ordering. Also reads `previous=True` logs for restarted containers so pre-crash evidence is not lost. The entire fan-out is bounded by a wall-clock deadline (`K8S_TOTAL_FETCH_TIMEOUT_SECONDS`), enforced with `as_completed(timeout=...)` plus an explicit `shutdown(wait=False, cancel_futures=True)` -- a `with ThreadPoolExecutor(...)` block would call `shutdown(wait=True)` on exit and wait for every slow pod regardless of the deadline.
 3. **Parser** (`parser.py`): Splits each line into a kubelet RFC3339Nano timestamp and a body, then extracts a structured `LogRecord` with `level`, `message`, and `app_name`. Tracks parse statistics (`ParseStats`) so degradation can be detected.
 4. **Filtering** (`filtering.py`): Applies client-side identifier matching (the kubelet API has no server-side grep). Matches by `eventId`, `refId`, and any extra identifiers. Uses a `KeepAllSelector` fallback when no identifier is available.

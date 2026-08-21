@@ -36,6 +36,10 @@ def _isolate_k8s_env(monkeypatch):
         "K8S_FIXTURE_DIR", "K8S_SERVICE_MAP", "K8S_DEFAULT_NAMESPACE",
         "K8S_DEFAULT_APP", "K8S_MAX_PODS", "K8S_SIDECAR_DENYLIST",
         "KUBECONFIG_PATH", "K8S_CONTEXT", "K8S_VERIFY_SSL", "K8S_CA_CERT_PATH",
+        # ES_APP_NAMES is cleared here too, not just K8S_APP_NAMES: since
+        # 2026-08-21 the Kubernetes source falls back to it, so a stray value
+        # from another test would silently change which services are searched.
+        "K8S_APP_NAMES", "ES_APP_NAMES", "K8S_MAX_TOTAL_PODS",
     ):
         monkeypatch.delenv(var, raising=False)
     k8s_client_module.reset_client()
