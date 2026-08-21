@@ -11,15 +11,41 @@ three tests that passed in CI, because the CI job sets `LOG_SOURCE=elastic`
 and nothing else. A developer seeing red tests they cannot attribute learns to
 stop reading the suite.
 
-The fixture is session-scoped and autouse, so it runs before any test module
-imports production code. It only clears variables that select a *deployment
-shape* -- a backend, a source chain, a feature flag. Tunables (timeouts, caps,
-thresholds) are left alone: tests that care about those set them explicitly
-via monkeypatch, and clearing them here would only mask a missing setenv.
+Two mechanisms, and both are needed:
+
+* `load_dotenv` is stubbed out at conftest import, so no later import can
+  re-read `.env`. This is the one that actually closes the hole -- see the
+  comment on the stub below.
+* A session-scoped autouse fixture clears anything the parent shell exported
+  and installs the CI defaults.
+
+The fixture only clears variables that select a *deployment shape* -- a
+backend, a source chain, a feature flag. Tunables (timeouts, caps, thresholds)
+are left alone: tests that care about those set them explicitly via
+monkeypatch, and clearing them here would only mask a missing setenv.
 """
 import os
 
+import dotenv
 import pytest
+
+# ---------------------------------------------------------------------------
+# Neutralise `.env` loading for the whole session.
+# ---------------------------------------------------------------------------
+# Popping the variables in a fixture is NOT sufficient on its own. Several
+# modules call `load_dotenv()` at *import* time -- `src/utils/env.py` and every
+# consumer entrypoint -- and a test module importing one of them mid-session
+# re-reads `.env` and puts every value straight back. Since the fixture had
+# already popped them, `load_dotenv`'s "don't override what is already set"
+# behaviour does not save us: it sees them as unset and sets them.
+#
+# This runs at conftest import, which pytest does before it imports any test
+# module, and therefore before any production module is imported. From here on
+# `load_dotenv()` is a no-op everywhere.
+#
+# CI has no `.env`, so this makes local runs behave the way CI already does
+# rather than changing what CI does.
+dotenv.load_dotenv = lambda *args, **kwargs: False
 
 #: Variables whose value must come from the test, never from a developer's
 #: `.env`. Each one selects a backend, a source, or a feature -- i.e. changes
