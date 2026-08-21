@@ -110,6 +110,24 @@ class CasebookStorage(Protocol):
         """Is this artifact present?"""
         ...
 
+    def update_json(self, event_id: str, filename: str, mutate) -> dict:
+        """Atomic read-modify-write of one JSON document.
+
+        `mutate` receives the current document (or None when absent) and
+        returns the document to store. It may be called more than once and
+        must therefore be free of side effects.
+
+        This exists because a read-modify-write built out of `load()` and
+        `save()` is only atomic where the backend can make it so, and the two
+        backends make it so by completely different means -- a lock locally, a
+        conditional write on S3. Callers that need the guarantee (the DLT
+        group counters, which are incremented by several analysis pods at
+        once) must not have to know which backend they are talking to.
+
+        Returns the stored document.
+        """
+        ...
+
     def list_events(self) -> list:
         """Every event id this store holds a casebook directory for.
 

@@ -35,11 +35,9 @@ def analyze_dlt(message):
 
 @pytest.fixture(autouse=True)
 def _isolated_store(tmp_path, monkeypatch):
-    # `case_storage` does `from src.utils.paths import LOCAL_CASESHEETS_DIR`,
-    # binding the value into its own namespace -- so patching `utils.paths`
-    # alone leaves it pointing at the real repo directory and every test in
-    # this file shares one store.
-    monkeypatch.setattr(case_storage, "LOCAL_CASESHEETS_DIR", tmp_path)
+    # `storage.factory._build_scoped` imports LOCAL_CASESHEETS_DIR at call
+    # time, so patching the canonical definition reaches every scoped root.
+    monkeypatch.setattr("src.utils.paths.LOCAL_CASESHEETS_DIR", tmp_path)
     case_storage.reset_cache()
     yield
     case_storage.reset_cache()

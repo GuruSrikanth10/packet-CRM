@@ -150,6 +150,39 @@ class LocalFilesystemCasebookStorage(CasebookStorage):
     def artifact_exists(self, event_id: str, filename: str) -> bool:
         return (self._resolve_dir(event_id) / filename).exists()
 
+    def update_json(self, event_id: str, filename: str, mutate) -> dict:
+        """Read-modify-write under the file's own lock.
+
+        The same `FileLock` that `save()` takes, held across the read AND the
+        write rather than once for each -- which is the whole point. filelock
+        coordinates processes on a shared filesystem, so this is safe for
+        several processes on one host; it is NOT safe across hosts, which is
+        what the S3 backend's conditional write is for.
+        """
+        target_dir = self._get_dir(event_id)
+        final_path = target_dir / filename
+        tmp_path = target_dir / f"{filename}.tmp"
+        lock_path = target_dir / f"{filename}.lock"
+
+        with FileLock(str(lock_path), timeout=10):
+            current = None
+            if final_path.exists():
+                try:
+                    with open(final_path, "r", encoding="utf-8") as f:
+                        current = json.load(f)
+                except Exception:
+                    current = None
+
+            updated = mutate(current)
+            if "schema_version" not in updated:
+                updated["schema_version"] = CASEBOOK_SCHEMA_VERSION
+
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(updated, f, indent=4, ensure_ascii=False)
+            replace_with_retry(tmp_path, final_path)
+
+        return updated
+
     def list_events(self) -> list:
         if not self.base_dir.exists():
             return []

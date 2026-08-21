@@ -49,8 +49,9 @@ def _isolate(monkeypatch, tmp_path):
                 "SYNTHESIS_GAP_CONFIDENCE_CEILING", "DLT_AUTO_REPLAY_ENABLED",
                 "DLT_REPLAY_CONFIDENCE_THRESHOLD", "CASEBOOK_STORAGE_BACKEND"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr("src.dlt.case_storage.LOCAL_CASESHEETS_DIR", tmp_path)
-    monkeypatch.setattr("src.dlt.groups.LOCAL_CHECKPOINTS_DIR", tmp_path / "ckpt")
+    monkeypatch.setattr("src.utils.paths.LOCAL_CASESHEETS_DIR", tmp_path)
+    # No group-lock directory to isolate any more: group updates go through
+    # CasebookStorage.update_json, whose atomicity lives in the backend.
     monkeypatch.setenv("DLT_REGISTRY_PATH", "tests/fixtures/dlt/business_errors.csv")
     case_storage.reset_cache()
     from src.dlt import registry

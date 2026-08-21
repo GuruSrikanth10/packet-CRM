@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import threading
 from typing import Optional
 import pandas as pd
@@ -517,29 +518,59 @@ def queue_for_replay(id: str, idType: str, priority: int, operatorName: str, cat
             logger.error("Auto-replay failed", packet_id=id, error=f"{type(e).__name__}: {e}")
             return f"Failed to replay packet {id} directly: {e}"
     else:
-        # Append to pending queue
-        import json
-        from filelock import FileLock
-        from datetime import datetime
-        
-        base_dir = os.path.dirname(os.path.dirname(__file__))
-        queue_file = os.path.join(base_dir, "db", "pending_replays.jsonl")
-        os.makedirs(os.path.dirname(queue_file), exist_ok=True)
-        lock_file = queue_file + ".lock"
-        
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "payload": payload
-        }
-        
-        try:
-            with FileLock(lock_file, timeout=10):
-                with open(queue_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry) + "\n")
-            return f"Successfully queued packet {id} for human review before replay."
-        except Exception as e:
-            logger.error("Failed to queue replay", packet_id=id, error=f"{type(e).__name__}: {e}")
-            return f"Failed to queue packet {id}: {e}"
+        return _queue_pending_replay(id, payload)
+
+
+#: Storage root holding replays awaiting human approval, one document per
+#: packet id. Read by src/tools/approve_replays.py.
+PENDING_REPLAY_ROOT = "pending_replays"
+PENDING_REPLAY_FILENAME = "pending_replay.json"
+
+
+def _queue_pending_replay(packet_id: str, payload: dict) -> str:
+    """Record a replay awaiting human approval.
+
+    Goes through CasebookStorage rather than appending to a local
+    `pending_replays.jsonl`. That file lived on whichever pod ran the packet,
+    so under CASEBOOK_STORAGE_BACKEND=s3 with more than one replica the queue
+    was fragmented: an operator running `approve_replays.py` saw only the
+    entries their own pod happened to have written, and the rest were
+    invisible indefinitely. Enabling DLT_AUTO_REPLAY_ENABLED makes that worse,
+    since that path nominates packets without anyone watching.
+
+    One document per packet id rather than one shared append-only file, which
+    also removes the append-under-lock contention entirely: two pods queueing
+    different packets no longer touch the same object.
+    """
+    from datetime import datetime, timezone
+
+    from src.models.schemas import EVENT_ID_PATTERN
+    from src.storage.factory import get_scoped_storage
+
+    # The id is interpolated into a storage path. It reaches here from the
+    # Synthesis agent's tool call or from auto_replay's refId, so it carries
+    # the same guard eventId does (0.11).
+    key = str(packet_id).strip()
+    if not re.fullmatch(EVENT_ID_PATTERN, key):
+        logger.error("Refusing to queue a replay under an unusable id",
+                     packet_id=packet_id)
+        return (f"Failed to queue packet {packet_id}: the id is not a valid "
+                f"storage key.")
+
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "payload": payload,
+        "status": "pending",
+    }
+
+    try:
+        get_scoped_storage(PENDING_REPLAY_ROOT).save(
+            key, entry, filename=PENDING_REPLAY_FILENAME)
+        return f"Successfully queued packet {packet_id} for human review before replay."
+    except Exception as e:
+        logger.error("Failed to queue replay", packet_id=packet_id,
+                     error=f"{type(e).__name__}: {e}")
+        return f"Failed to queue packet {packet_id}: {e}"
 
 _TOOLS_MAP = {
     "lookup_resident_database": lookup_resident_database,
