@@ -50,6 +50,37 @@ _agent_invoke_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=_MAX_CONCURRENT_INVESTIGATIONS, thread_name_prefix="agent-invoke"
 )
 
+# Bounded executors owned by OTHER modules that the shutdown drain must also
+# tear down. `dlt_routes` registers its sibling analysis pool here rather than
+# routes.py importing it, which would be a cycle.
+#
+# Registered as zero-argument GETTERS, not as executor references. A list of
+# references is captured at import time, so swapping the owning module's
+# attribute -- which is how a caller substitutes a throwaway pool instead of
+# tearing down the one the whole process shares -- would be silently ignored
+# and the real pool shut down anyway. A getter resolves the attribute at drain
+# time, so the substitution is honoured.
+#
+# `_agent_invoke_executor` is not in here; the drain names it directly, which
+# resolves the global at call time for the same reason.
+_extra_executor_getters = []
+
+
+def register_executor(getter) -> None:
+    """Have `drain_and_shutdown` tear down whatever `getter()` returns.
+
+    Pass a callable, not an executor -- see `_extra_executor_getters`.
+    """
+    if not callable(getter):
+        raise TypeError(
+            "register_executor expects a zero-argument callable returning the "
+            "executor, so a substituted module attribute is honoured at drain "
+            "time rather than a stale reference being shut down."
+        )
+    if getter not in _extra_executor_getters:
+        _extra_executor_getters.append(getter)
+
+
 # Set on SIGTERM so /ready starts failing and the orchestrator stops routing
 # new work here while in-flight investigations finish (G9).
 _draining = threading.Event()
@@ -117,8 +148,18 @@ def drain_and_shutdown() -> None:
                              event_id=event_id,
                              error=f"{type(e).__name__}: {e}")
 
-    _agent_invoke_executor.shutdown(wait=False, cancel_futures=True)
-    logger.info("API shutdown complete")
+    # Both resolved at call time, so a substituted attribute is honoured.
+    executors = [_agent_invoke_executor]
+    for getter in _extra_executor_getters:
+        try:
+            executors.append(getter())
+        except Exception as e:
+            logger.warning("Could not resolve a registered executor",
+                           error=f"{type(e).__name__}: {e}")
+
+    for executor in executors:
+        executor.shutdown(wait=False, cancel_futures=True)
+    logger.info("API shutdown complete", executors=len(executors))
 
 # Kafka producer health, cached so a burst of /ready probes (an orchestrator
 # typically polls this every few seconds) doesn't each attempt a fresh

@@ -177,11 +177,19 @@ def test_shutdown_marks_abandoned_investigations(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "get_casebook_storage", lambda: store)
     monkeypatch.setattr(routes, "API_SHUTDOWN_DRAIN_SECONDS", 0.1)
 
-    # Throwaway executor: drain_and_shutdown() shuts down whatever it is
-    # given, and the real one is module-level and shared by every other test
-    # in the suite -- shutting it down here would break all of them with
+    # Throwaway executors: drain_and_shutdown() shuts down whatever it is
+    # given, and the real ones are module-level and shared by every other test
+    # in the suite -- shutting them down here would break all of them with
     # "cannot schedule new futures after shutdown".
+    #
+    # BOTH pools, because the drain now also tears down the DLT analysis lane's
+    # sibling executor. Both are resolved by attribute at drain time precisely
+    # so this substitution works; see routes._extra_executor_getters.
+    from src.api import dlt_routes
+
     monkeypatch.setattr(routes, "_agent_invoke_executor",
+                        concurrent.futures.ThreadPoolExecutor(max_workers=1))
+    monkeypatch.setattr(dlt_routes, "_dlt_invoke_executor",
                         concurrent.futures.ThreadPoolExecutor(max_workers=1))
 
     store.save("stuck", {
