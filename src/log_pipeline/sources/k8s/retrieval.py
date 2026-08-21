@@ -476,6 +476,20 @@ def read_all(targets: list, window: TimeWindow,
         _merge_stats(outcome.stats, result.stats)
 
     outcome.records.sort(key=_ordering_key)
+
+    # Apply the window's upper bound. The kubelet API has no "until", so this
+    # is the only place it can happen -- and it happens after the merge so a
+    # record is judged once rather than once per pod. Records whose timestamp
+    # cannot be read are kept (see TimeWindow.excludes).
+    if window.until is not None:
+        before = len(outcome.records)
+        outcome.records = [r for r in outcome.records
+                           if not window.excludes(r.get("timestamp"))]
+        dropped = before - len(outcome.records)
+        if dropped:
+            logger.info("Trimmed records past the window's upper bound",
+                        dropped=dropped, until=window.until.isoformat())
+
     return outcome
 
 

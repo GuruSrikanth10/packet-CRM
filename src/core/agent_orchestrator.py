@@ -574,6 +574,18 @@ def _build_agent():
         event_id = state.get("payload", {}).get("eventId", "unknown")
         logger.bind(event_id=event_id).info("Generating escalation casebook", state="ESCALATING")
 
+        # Observed here as well as in synthesis_node. This node is reached
+        # exactly when retry_count >= MAX_INVESTIGATION_RETRIES -- the packets
+        # with the MOST Reviewer rejections -- and recording only the
+        # successful path gave the histogram a hard ceiling at max_retries - 1
+        # and hid the tail it exists to measure.
+        #
+        # `retry_count`, NOT `retry_count - 1`. The histogram counts Reviewer
+        # REJECTIONS, and `retry_count` counts reviews. On the synthesis path
+        # the final review approved, so rejections are one fewer than reviews.
+        # On this path every review rejected, so they are equal.
+        metrics.INVESTIGATOR_RETRIES.observe(max(0, state.get("retry_count", 0)))
+
         # We manually construct a fake synthesis payload that forces the routes.py to mark it NEEDS_MANUAL_REVIEW
         investigation = state.get("investigation", "")
         feedback = state.get("reviewer_feedback", "")
@@ -668,6 +680,11 @@ def _build_agent():
         log.info("Synthesis finished")
         # How many Reviewer rejections this packet needed. A rising
         # distribution is the earliest signal of prompt or model regression.
+        #
+        # Minus one because reaching synthesis means the LAST review approved:
+        # `retry_count` counts reviews, and one of them was not a rejection.
+        # escalate_node observes `retry_count` undecremented, for the mirror
+        # reason -- see there.
         metrics.INVESTIGATOR_RETRIES.observe(max(0, state.get("retry_count", 1) - 1))
         
         # Shadow comparison. The verdict is RETURNED, not just logged.

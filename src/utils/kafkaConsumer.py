@@ -432,6 +432,12 @@ def _handle_one_message(tp, msg):
     submitted = False
     signal_payload = None
     payload = None
+    # Set once the poison-pill branch has handed this message to the DLQ, so
+    # the outer handler does not publish it a second time when the FIRST
+    # publish is what raised. The duplicate was harmless -- the first attempt
+    # had failed -- but it logged two failures for one message and doubled the
+    # work against a broker already known to be unreachable.
+    dlq_attempted = False
 
     # Track only this message's offset, never the whole polled batch -- a bare
     # consumer.commit() advances past every message in the batch, including
@@ -446,6 +452,7 @@ def _handle_one_message(tp, msg):
         payload = parsed.raw_text
         if parsed.is_poison:
             from src.utils.dlq_publisher import publish_to_dlq
+            dlq_attempted = True
             publish_to_dlq(parsed.raw_text, parsed.error or "Message failed validation")
             _record_completion(message_offsets)
             return
@@ -476,15 +483,28 @@ def _handle_one_message(tp, msg):
         # get_casebook_storage() failure, a decode fault. Every one of them
         # used to leave this offset dispatched forever and freeze the
         # partition's commit floor (G1).
-        try:
-            _dlq_and_abandon(
-                signal_payload if signal_payload is not None else payload_sample,
-                f"Consumer-side processing failed: {type(e).__name__}: {e}",
-                message_offsets,
-            )
-        except Exception as dlq_error:
-            logger.error("DLQ publish failed; holding the offset uncommitted",
-                         error=f"{type(dlq_error).__name__}: {dlq_error}")
+        if dlq_attempted:
+            # The poison-pill publish above is what raised. Republishing would
+            # only fail the same way against the same broker.
+            #
+            # The offset is deliberately left dispatched: it is neither
+            # completed nor abandoned, so the partition's commit floor stays
+            # put. That is the same trade `_dlq_and_abandon` makes and the
+            # module docstring states -- a commit stall is bad, but advancing
+            # past a message that now exists nowhere at all is worse.
+            logger.error("DLQ publish failed for a poison pill; "
+                         "holding the offset uncommitted",
+                         error=f"{type(e).__name__}: {e}")
+        else:
+            try:
+                _dlq_and_abandon(
+                    signal_payload if signal_payload is not None else payload_sample,
+                    f"Consumer-side processing failed: {type(e).__name__}: {e}",
+                    message_offsets,
+                )
+            except Exception as dlq_error:
+                logger.error("DLQ publish failed; holding the offset uncommitted",
+                             error=f"{type(dlq_error).__name__}: {dlq_error}")
     finally:
         if not submitted:
             _queue_semaphore.release()
