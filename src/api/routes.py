@@ -2,6 +2,7 @@ import os
 import re
 import time
 import hmac
+import collections
 import asyncio
 import contextlib
 import functools
@@ -87,8 +88,13 @@ _draining = threading.Event()
 
 # Event ids currently inside agent.invoke(), so a shutdown can mark whatever
 # it could not finish rather than leaving IN_PROGRESS stubs behind.
+#
+# A Counter, not a set. The same event_id can legitimately be in flight twice
+# -- a redelivery that slips past the dedupe guard -- and with a set the first
+# invocation to finish `discard`ed the id while the second was still running,
+# so the drain no longer knew about it and left an IN_PROGRESS stub behind.
 _in_flight_lock = threading.Lock()
-_in_flight_events: set = set()
+_in_flight_events: collections.Counter = collections.Counter()
 
 # How long the API waits for in-flight investigations on shutdown. Kept under
 # a typical terminationGracePeriodSeconds so the drain completes before
@@ -97,8 +103,29 @@ API_SHUTDOWN_DRAIN_SECONDS = float(os.environ.get("API_SHUTDOWN_DRAIN_SECONDS", 
 
 
 def _in_flight_investigations() -> int:
+    """How many investigations are running, counting duplicates separately."""
     with _in_flight_lock:
-        return len(_in_flight_events)
+        return sum(_in_flight_events.values())
+
+
+def begin_draining() -> None:
+    """Start failing readiness NOW, without waiting for the lifespan hook.
+
+    `drain_and_shutdown` also sets `_draining`, but it only runs from uvicorn's
+    lifespan *shutdown*, which fires after uvicorn has already closed the
+    listening socket. By then no orchestrator can reach /ready at all, so the
+    "fail readiness, then drain" sequence the docstrings describe never
+    actually happened -- readiness failed by connection refusal instead, which
+    works by accident and tells the orchestrator nothing.
+
+    Installed as a SIGTERM handler by main_api.py so there is a real window in
+    which the pod answers 503 on /ready while still serving the requests it
+    already accepted.
+    """
+    if not _draining.is_set():
+        _draining.set()
+        logger.info("API marked draining on signal",
+                    in_flight=_in_flight_investigations())
 
 
 def drain_and_shutdown() -> None:
@@ -112,6 +139,8 @@ def drain_and_shutdown() -> None:
     MAX_IN_PROGRESS_AGE_SECONDS -- 30 minutes by default. A rolling deploy
     stalled every in-flight packet for half an hour (G9).
     """
+    # Usually already set by `begin_draining` on SIGTERM; set here too so a
+    # shutdown that arrives by another route still stops readiness.
     _draining.set()
     logger.info("API draining", in_flight=_in_flight_investigations(),
                 budget_seconds=API_SHUTDOWN_DRAIN_SECONDS)
@@ -124,7 +153,7 @@ def drain_and_shutdown() -> None:
     # abandoned rather than stopped. Its status.json must not be left at
     # IN_PROGRESS or the packet is unreprocessable until it goes stale.
     with _in_flight_lock:
-        stragglers = set(_in_flight_events)
+        stragglers = set(_in_flight_events)  # Counter iterates its keys
 
     if stragglers:
         logger.warning("Marking investigations abandoned at shutdown",
@@ -199,12 +228,16 @@ def _tracked_in_flight(event_id: str):
     timeout, DLQ, exception -- deregisters.
     """
     with _in_flight_lock:
-        _in_flight_events.add(event_id)
+        _in_flight_events[event_id] += 1
     try:
         yield
     finally:
         with _in_flight_lock:
-            _in_flight_events.discard(event_id)
+            # Decrement, never discard: a concurrent duplicate of this id is
+            # still running and must stay visible to the drain.
+            _in_flight_events[event_id] -= 1
+            if _in_flight_events[event_id] <= 0:
+                del _in_flight_events[event_id]
 
 
 @contextlib.contextmanager

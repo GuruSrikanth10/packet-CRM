@@ -725,6 +725,34 @@ def _drain_and_commit():
     logger.info("Consumer shutdown complete")
 
 
+#: How long a single `_queue_semaphore.acquire()` attempt waits before the
+#: loop re-checks `_shutdown`. Short enough that a SIGTERM is observed
+#: promptly, long enough that a busy pool is not a spin.
+SLOT_ACQUIRE_POLL_SECONDS = float(os.environ.get("SLOT_ACQUIRE_POLL_SECONDS", "1"))
+
+
+def _acquire_slot() -> bool:
+    """Take a worker slot, or return False because a shutdown began.
+
+    The bare `_queue_semaphore.acquire()` this replaces took no timeout. With
+    every worker busy -- exactly the sustained load the semaphore exists to
+    manage -- the poll loop parked here indefinitely, and a thread already
+    inside `acquire()` never observes `_shutdown`. It waited for a worker to
+    finish, which for the slow consumer is up to PACKET_TIMEOUT_SECONDS (300s).
+
+    SHUTDOWN_DRAIN_SECONDS is 25s and a typical terminationGracePeriodSeconds
+    is 30s, so the pod was SIGKILLed long before `_drain_and_commit` ran: the
+    F12 drain was inert under precisely the conditions it was written for.
+
+    Declining to dispatch is safe. The offset is never committed, so Kafka
+    redelivers the message to whoever takes the partition next.
+    """
+    while not _shutdown.is_set():
+        if _queue_semaphore.acquire(timeout=SLOT_ACQUIRE_POLL_SECONDS):
+            return True
+    return False
+
+
 def consume_forever():
     global consumer
     if consumer is None:
@@ -763,13 +791,16 @@ def consume_forever():
                 continue
 
             for tp, messages in records.items():
+                if _shutdown.is_set():
+                    break
                 for msg in messages:
                     if _shutdown.is_set():
                         # Stop taking new work; anything not dispatched simply
                         # isn't committed and will be redelivered.
                         break
                     # Block if the pool is full BEFORE parsing (backpressure).
-                    _queue_semaphore.acquire()
+                    if not _acquire_slot():
+                        break
                     _handle_one_message(tp, msg)
     finally:
         _drain_and_commit()

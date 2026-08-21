@@ -198,14 +198,16 @@ def test_shutdown_marks_abandoned_investigations(tmp_path, monkeypatch):
     }, filename="status.json")
 
     with routes._in_flight_lock:
-        routes._in_flight_events.add("stuck")
+        # A Counter now, so a duplicate in-flight id stays visible to the
+        # drain until BOTH invocations have finished.
+        routes._in_flight_events["stuck"] += 1
 
     try:
         routes.drain_and_shutdown()
     finally:
         routes._draining.clear()
         with routes._in_flight_lock:
-            routes._in_flight_events.discard("stuck")
+            routes._in_flight_events.pop("stuck", None)
 
     assert store.terminal_status("stuck") == "FAILED_SHUTDOWN"
 
